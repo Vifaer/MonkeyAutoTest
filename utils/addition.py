@@ -12,7 +12,7 @@ from libs import SendMail
 
 
 def get_project_json(sfile="conf/project.json"):
-    with open(sfile) as json_file:
+    with open(sfile, 'r', encoding='utf-8') as json_file:
         try:
             prj_json = json.load(json_file)
         except Exception as e:
@@ -80,10 +80,24 @@ def monkey_test(sn, package, prj_info, need_uninstall, throttle, count, rcpt_lis
 
 
 def send_log(prj_info, device, package, rcpt_list, anr_cnt, crash_cnt, att_list):
+    # 检查邮件配置是否有效
+    mail_sender = SendMail()
+    if not mail_sender.is_mail_configured():
+        logging.info("邮件配置无效，将测试结果保存到日志文件")
+
+        # 保存测试结果到日志文件
+        if mail_sender.save_test_report_to_log(prj_info, device, package, anr_cnt, crash_cnt, att_list):
+            logging.info("测试报告已保存到logs目录")
+        else:
+            logging.error("保存测试报告失败")
+
+        return
+
     # 如果没有anr和crash，则不发邮件
     if anr_cnt == 0 and crash_cnt == 0:
         logging.info("No anr or crash, won't send mail")
         return
+
     prj_name = prj_info["name"]
     subject = u"%s Monkey测试异常提醒" % prj_name
     content = "<table border='1' cellspacing='0' cellpadding='0'>" \
@@ -98,7 +112,7 @@ def send_log(prj_info, device, package, rcpt_list, anr_cnt, crash_cnt, att_list)
               + "<tr><td width='30%%'><b>发现CRASH次数</b></td><td width='70%%'>{}</td>".format(crash_cnt) \
               + "</table>" \
               + "<br/><p>具体日志见附件</p>"
-    status, reason = SendMail().send_mail(rcpt_list, subject, content, att_list=att_list)
+    status, reason = mail_sender.send_mail(rcpt_list, subject, content, att_list=att_list)
     if status:
         logging.info("Succeed in sending mails")
     else:

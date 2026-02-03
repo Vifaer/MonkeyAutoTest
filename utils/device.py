@@ -19,29 +19,49 @@ class Device:
         self.__set_device_info()
 
     def __set_device_info(self):
-        # 获取本机所有设备名
+        """从 adb devices 输出中解析设备信息，初始化基本属性。
+
+        注意：旧实现依赖正则 `(.+?)\\s+device\\n`，在 `adb devices -l` 输出包含
+        `device product:...` 时会解析失败，导致即使设备在线也被认为不存在。
+        这里改为按行解析，匹配第二列等于 'device' 的 SN，更加健壮。
+        """
         rst = timeout_command.run("adb devices")
-        sn_list = re.findall(r"(.+?)\s+device\n", rst)
+        sn_list = []
+        if isinstance(rst, str):
+            for line in rst.splitlines():
+                line = line.strip()
+                if not line or line.lower().startswith("list of devices"):
+                    continue
+                parts = line.split()
+                # 典型行：<sn>  device [product:... model:...]
+                if len(parts) >= 2 and parts[1] == "device":
+                    sn_list.append(parts[0])
+
         # 判断device是否存在
         if self.sn not in sn_list:
-            logging.error("device [{}] not found".format(self.sn))
-            sys.exit(-1)
-        # 获取系统版本号
+            msg = f"device [{self.sn}] not found"
+            logging.error(msg)
+            # 在库代码中不直接 sys.exit，以便由上层（CLI / GUI / pytest）决定如何处理
+            raise RuntimeError(msg)
+        # 获取系统版本号（兼容 Android 12/13/14 等纯数字版本）
         cmd = "adb -s {} shell getprop ro.build.version.release".format(self.sn)
         rst = timeout_command.run(cmd)
         if rst is None:
             logging.warning("[device_info] time out: {}".format(cmd))
-        elif "error" in rst:
+        elif isinstance(rst, str) and "error" in rst.lower():
             logging.warning("[device_info] cannot execute: {}".format(cmd))
             logging.warning("[device_info] result: {}".format(rst))
         else:
             try:
-                os_version = re.findall(r"\d.\d.\d|\d.\d|[A-Z]", rst)[0]
+                text = (rst or "").strip()
+                m = re.search(r"\d+(?:\.\d+){0,2}", text)
+                os_version = m.group(0) if m else text.split()[0]
                 self.os = os_version
             except Exception as e:
                 logging.warning("[device_info] failed to regex os from {}. {}".format(rst, e))
         # 获取分辨率
-        cmd = "adb -s {} shell dumpsys window | grep init".format(self.sn)
+        # Windows 下不要依赖 `| grep`；优先用 `wm size`，再兜底 dumpsys
+        cmd = "adb -s {} shell wm size".format(self.sn)
         rst = timeout_command.run(cmd)
         if rst is None:
             logging.warning("[device_info] time out: {}".format(cmd))
@@ -50,10 +70,22 @@ class Device:
             logging.warning("[device_info] result: {}".format(rst))
         else:
             try:
-                screen = re.findall(r"init=(\d{3,4}x\d{3,4})", rst)[0]
-                self.screen = screen
+                # Physical size: 1920x1080 或 Override size: ...
+                m = re.search(r"(Physical size|Override size):\s*(\d{3,5}x\d{3,5})", rst)
+                if m:
+                    self.screen = m.group(2)
             except Exception as e:
                 logging.warning("[device_info] failed to regex screen from {}. {}".format(rst, e))
+        if not self.screen:
+            try:
+                cmd = "adb -s {} shell dumpsys display".format(self.sn)
+                rst = timeout_command.run(cmd)
+                if rst:
+                    m = re.search(r"mBaseDisplayInfo.*?real\s+(\d+)\s+x\s+(\d+)", rst)
+                    if m:
+                        self.screen = f"{m.group(1)}x{m.group(2)}"
+            except Exception:
+                pass
         # 获取设备名
         cmd = "adb -s {} shell getprop ro.product.model".format(self.sn)
         rst = timeout_command.run(cmd)
@@ -70,21 +102,52 @@ class Device:
                 logging.warning("[device_info] failed to get model. {}".format(e))
 
     def install(self, package):
-        # 安装包
-        cmd = "adb -s {} install -r {}".format(self.sn, package.path)
-        rst = timeout_command.run(cmd, 600)
-        if rst is None:
-            logging.error("[install] failed to install, the command is: {}".format(cmd))
-            sys.exit(-1)
-        elif "Success" in rst:
-            logging.info("[install] succeeded in installing {}".format(package.name))
-        elif "Failure" in rst:
+        """
+        安装 APK 到设备。
+        日志输出遵循统一规范，方便追踪推送与安装过程：
+        1) 开始推送/安装提示（包含设备SN、包名、文件路径与大小）；
+        2) 安装完成后的成功确认；
+        3) 失败场景下记录 ADB 返回的具体错误原因。
+        """
+        apk_path = getattr(package, "path", "") or ""
+        pkg_name = getattr(package, "name", "") or ""
+
+        # 1) 推送/安装开始提示
+        size_str = "unknown"
+        if apk_path and os.path.exists(apk_path):
             try:
-                key = re.findall(r"Failure \[(.+?)\]", rst)[0]
+                size_bytes = os.path.getsize(apk_path)
+                size_mb = size_bytes / (1024 * 1024)
+                size_str = f"{size_mb:.2f} MB"
+            except Exception as e:
+                logging.debug(f"[install] failed to get apk size for {apk_path}: {e}")
+        logging.info(f"[install] start installing APK on device {self.sn} "
+                     f"(package={pkg_name}, path={apk_path or 'N/A'}, size={size_str})")
+        logging.info("[install] pushing APK to device via adb install -r（该过程可能耗时较长，请耐心等待）")
+
+        # 2) 调用 adb install -r（内部会完成推送 + 安装）
+        cmd = "adb -s {} install -r {}".format(self.sn, apk_path)
+        rst = timeout_command.run(cmd, 600)
+
+        # 3) 结果判定与详细日志
+        if rst is None:
+            logging.error(f"[install] failed to install {pkg_name} on {self.sn}: adb 超时（命令: {cmd}）")
+            sys.exit(-1)
+
+        text = (rst or "").strip()
+        if "Success" in text:
+            logging.info(f"[install] succeeded in installing {pkg_name} on {self.sn}")
+        elif "Failure" in text or "Error" in text or "error" in text.lower():
+            try:
+                key = re.findall(r"Failure \[(.+?)\]", text)[0]
             except Exception as e:
                 logging.debug(e)
-                key = "NULL"
-            logging.error("[install] failed to install {}, reason: {}".format(package.name, key))
+                key = "UNKNOWN"
+            logging.error(f"[install] failed to install {pkg_name} on {self.sn}, reason: {key}, adb output: {text}")
+            sys.exit(-1)
+        else:
+            # 非典型输出：既没有 Success/Failure，也不为空；记录全文，视为失败
+            logging.error(f"[install] unexpected adb output when installing {pkg_name} on {self.sn}: {text}")
             sys.exit(-1)
 
     def uninstall(self, package):

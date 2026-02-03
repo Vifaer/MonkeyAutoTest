@@ -1,0 +1,37 @@
+{
+  "theme": "pulse",
+  "adb_path": "D:/softwares/platform-tools/adb.exe",
+  "app_source": "installed",
+  "package_name": "com.cei.llm.data",
+  "prj_ver": "",
+  "device_sn": "7ff80600",
+  "apk_path": "",
+  "email": "",
+  "test_mode": "modular",
+  "modules": {
+    "system_robustness": true,
+    "exception_recovery": false,
+    "performance_response": false,
+    "performance_resource": false,
+    "performance_all": false
+  },
+  "duration": "1",
+  "duration_unit": "分钟",
+  "network_method": "pc_proxy",
+  "multi_devices": "7ff80600",
+  "baseline_establish": true,
+  "baseline_compare": false,
+  "no_mock_server": false,
+  "no_network_proxy": false,
+  "mock_server": {
+    "mode": "mitmproxy",
+    "host": "127.0.0.1",
+    "port": "8080",
+    "rules_path": "conf\\mock_rules.json"
+  },
+  "traditional_monkey": {
+    "throttle": "700",
+    "count": "10000",
+    "uninstall": false
+  }
+}

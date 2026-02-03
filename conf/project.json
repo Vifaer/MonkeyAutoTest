@@ -1,8 +1,136 @@
 {
   "ver1": {
-    "name": "Sample App 1"
+    "name": "Sample App 1",
+    "auto_get_apk": false,
+    "apk_source": {
+      "type": "http",
+      "url": "https://github.com/example/app/releases/download/v1.0/app-v1.0.apk"
+    }
   },
   "ver2": {
-    "name": "Sample App 2"
+    "name": "Sample App 2",
+    "auto_get_apk": true,
+    "apk_source": {
+      "type": "jenkins",
+      "url": "http://jenkins.example.com/job/app-v2/lastSuccessfulBuild/artifact/app-debug.apk",
+      "auth": {
+        "username": "jenkins_user",
+        "password": "jenkins_api_token"
+      }
+    }
+  },
+  "stability_test": {
+    "name": "车载端侧应用稳定性测试",
+    "auto_get_apk": false,
+    "modular_config": {
+      "enabled_modules": [
+        "system_robustness",
+        "exception_recovery",
+        "performance_all"
+      ],
+      "module_dependencies": {
+        "system_robustness": [],
+        "exception_recovery": ["mock_server"],
+        "performance_response": [],
+        "performance_resource": [],
+        "performance_all": []
+      }
+    },
+    "stability_config": {
+      "long_stress": {
+        "duration_hours": 12,
+        "throttle": 700,
+        "event_count": 100000
+      },
+      "performance": {
+        "sample_interval": 30,
+        "monitor_duration": 3600,
+        "cold_start_threshold": 3.0,
+        "response_delay_threshold": 1.5,
+        "cpu_foreground_threshold": 30.0,
+        "cpu_background_threshold": 1.0
+      },
+      "exception_recovery": {
+        "network_disconnect_duration": 30,
+        "weak_network_duration": 60,
+        "mock_server_enabled": true,
+        "network_proxy_enabled": true
+      }
+    }
+  },
+  "response_only_test": {
+    "name": "仅响应性能测试",
+    "auto_get_apk": false,
+    "modular_config": {
+      "enabled_modules": ["performance_response"],
+      "module_dependencies": {
+        "performance_response": []
+      }
+    },
+    "stability_config": {
+      "performance": {
+        "sample_interval": 30,
+        "monitor_duration": 1800,
+        "cold_start_threshold": 3.0,
+        "response_delay_threshold": 1.5,
+        "cpu_foreground_threshold": 30.0,
+        "cpu_background_threshold": 1.0
+      }
+    }
+  },
+  "resource_only_test": {
+    "name": "仅资源消耗测试",
+    "auto_get_apk": false,
+    "modular_config": {
+      "enabled_modules": ["performance_resource"],
+      "module_dependencies": {
+        "performance_resource": []
+      }
+    },
+    "stability_config": {
+      "performance": {
+        "sample_interval": 30,
+        "monitor_duration": 3600,
+        "cold_start_threshold": 3.0,
+        "response_delay_threshold": 1.5,
+        "cpu_foreground_threshold": 30.0,
+        "cpu_background_threshold": 1.0
+      }
+    }
+  },
+  "robustness_only_test": {
+    "name": "仅系统健壮性测试",
+    "auto_get_apk": false,
+    "modular_config": {
+      "enabled_modules": ["system_robustness"],
+      "module_dependencies": {
+        "system_robustness": []
+      }
+    },
+    "stability_config": {
+      "long_stress": {
+        "duration_hours": 12,
+        "throttle": 700,
+        "event_count": 100000
+      }
+    }
+  },
+  "recovery_only_test": {
+    "name": "仅异常恢复测试",
+    "auto_get_apk": false,
+    "modular_config": {
+      "enabled_modules": ["exception_recovery"],
+      "module_dependencies": {
+        "exception_recovery": ["mock_server"]
+      }
+    },
+    "stability_config": {
+      "exception_recovery": {
+        "network_disconnect_duration": 30,
+        "weak_network_duration": 60,
+        "mock_server_enabled": true,
+        "network_proxy_enabled": true
+      }
+    }
   }
 }

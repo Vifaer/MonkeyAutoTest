@@ -1,0 +1,49 @@
+{
+  "metadata": {
+    "version": "v1.0.0",
+    "established_at": "2026-01-23T16:03:43.125362",
+    "baseline_manager_version": "1.0.0"
+  },
+  "performance_metrics": {
+    "cold_start_time": {
+      "average": 2.5,
+      "min": 2.0,
+      "max": 3.2,
+      "pass_rate": 0.9
+    },
+    "response_delay": {
+      "average": 1.2,
+      "min": 0.8,
+      "max": 1.8,
+      "pass_rate": 0.95
+    },
+    "resource_usage": {
+      "cpu_foreground_avg": 25.0,
+      "cpu_foreground_peak": 35.0,
+      "cpu_background_avg": 0.8,
+      "cpu_background_peak": 1.2,
+      "memory_pss_avg": 120.0,
+      "memory_pss_peak": 150.0,
+      "memory_leak_detected": false
+    }
+  },
+  "stability_metrics": {
+    "system_robustness": {
+      "crashes": 0,
+      "anrs": 1,
+      "test_duration_hours": 12
+    },
+    "exception_recovery": {
+      "network_disconnect_tests": 1,
+      "weak_network_tests": 1,
+      "data_exception_tests": 1
+    }
+  },
+  "thresholds": {
+    "cold_start_time_max": 3.0,
+    "response_delay_max": 1.5,
+    "cpu_foreground_max": 30.0,
+    "cpu_background_max": 1.0,
+    "memory_growth_threshold": 10.0
+  }
+}

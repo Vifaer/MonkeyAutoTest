@@ -6,3 +6,11 @@ apks/*
 !apks/wifimanager-debug.apk
 logs/*
 history_logs/*
+.tmp/
+backup_before_cleanup/
+__pycache__/
+**/__pycache__/
+*.pyc
+build/
+dist/
+*.log

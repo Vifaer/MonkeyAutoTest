@@ -97,7 +97,7 @@ class DeviceLog:
         return anr_store
 
     def check(self, package):
-        with open(self.log_path, "r") as fp:
+        with open(self.log_path, "r", encoding='utf-8', errors='ignore') as fp:
             # 判断文件行是否为anr或crash，如果是则做相关处理
             is_anr = 0
             is_crash = False
@@ -122,7 +122,7 @@ class DeviceLog:
                         # 去掉多余的traces
                         anr_info = self.__remove_excess_traces(anr_info)
                         # 存成文件
-                        with open("{}/anr_{}_{}.txt".format(self.anr_dir, self.sn, anr_cnt), "w") as anr_fp:
+                        with open("{}/anr_{}_{}.txt".format(self.anr_dir, self.sn, anr_cnt), "w", encoding='utf-8') as anr_fp:
                             for anr_line in anr_info:
                                 anr_fp.write(anr_line)
                         # 清空
@@ -135,7 +135,7 @@ class DeviceLog:
                     crash_info.append(line)
                 if is_crash and line.strip() == "//":
                     # 存成文件
-                    with open("{}/crash_{}_{}.txt".format(self.crash_dir, self.sn, crash_cnt), "w") as crash_fp:
+                    with open("{}/crash_{}_{}.txt".format(self.crash_dir, self.sn, crash_cnt), "w", encoding='utf-8') as crash_fp:
                         for crash_line in crash_info:
                             crash_fp.write(crash_line)
                     # 清空
