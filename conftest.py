@@ -20,6 +20,13 @@ if str(project_root) not in sys.path:
 from utils import Device, Package, DeviceLog
 from utils.config_io import read_json
 
+# 响应监控默认配置（广播/TTS 压力测试共用，发送后立即开始监控）
+DEFAULT_RESPONSE_MONITOR = {
+    'max_wait_for_appear': 6,
+    'check_interval': 0.1,
+    'max_wait_for_disappear': 300,
+}
+
 
 # ==================== pytest 配置钩子 ====================
 
@@ -81,7 +88,8 @@ def test_config(pytestconfig):
         'long_stress': {
             'duration_hours': 12,
             'throttle': 700,
-            'event_count': 100000
+            # 移除默认 event_count，改为根据时长动态计算
+            # 'event_count': 100000  # 已移除，改为根据时长计算
         },
         'performance': {
             'sample_interval': 30,
@@ -89,7 +97,8 @@ def test_config(pytestconfig):
             'cold_start_threshold': 3.0,
             'response_delay_threshold': 1.5,
             'cpu_foreground_threshold': 30.0,
-            'cpu_background_threshold': 1.0
+            'cpu_background_threshold': 1.0,
+            'clickable_elements': ['AI Power', '智能体广场', '对话收藏']  # 默认可点击元素列表
         },
         'exception_recovery': {
             'network_disconnect_duration': 30,
@@ -147,6 +156,86 @@ def test_config(pytestconfig):
         mock_server_cfg = gui_config['mock_server']
         if isinstance(mock_server_cfg, dict):
             default_config['mock_server'].update(mock_server_cfg)
+
+    # 4) 合并 GUI 配置中的性能监控设置
+    if isinstance(gui_config, dict) and 'performance_monitor' in gui_config:
+        perf_monitor_cfg = gui_config['performance_monitor']
+        if isinstance(perf_monitor_cfg, dict):
+            # 解析可点击元素列表（逗号分隔的字符串）
+            clickable_elements_str = perf_monitor_cfg.get('clickable_elements', '')
+            if clickable_elements_str:
+                try:
+                    # 分割字符串，去除空白，过滤空字符串
+                    elements = [e.strip() for e in str(clickable_elements_str).split(',') if e.strip()]
+                    if elements:
+                        default_config['performance']['clickable_elements'] = elements
+                        logging.info(f"从GUI配置加载可点击元素: {elements}")
+                except Exception as e:
+                    logging.warning(f"解析可点击元素列表失败: {e}")
+
+    # 5) 合并 GUI 配置中的 monkey_mask 设置（稳定性测试可操作区域遮罩）
+    #    conf/test_ui_config.json 中为：
+    #    "monkey_mask": {"top": "30.0", "bottom": "30.0", "left": "30.0", "right": "30.0"}
+    if isinstance(gui_config, dict) and 'monkey_mask' in gui_config:
+        mm_cfg = gui_config['monkey_mask']
+        if isinstance(mm_cfg, dict):
+            try:
+                # 直接将 dict 写入 long_stress.monkey_mask，具体解析/容错交给 ExtendedMonkeyTest._get_safe_touch_region
+                if 'long_stress' not in default_config or not isinstance(default_config['long_stress'], dict):
+                    default_config['long_stress'] = {}
+                default_config['long_stress']['monkey_mask'] = mm_cfg
+                logging.info(f"从GUI配置加载 Monkey 遮罩区域设置: {mm_cfg}")
+            except Exception as e:
+                logging.warning(f"合并 Monkey 遮罩区域配置失败: {e}")
+
+    # 6) 直接使用 Fallback 事件注入：优先 pytest 参数，其次 GUI 持久化配置
+    use_fallback_opt = False
+    try:
+        use_fallback_opt = pytestconfig.getoption("--use-fallback-only", default=False)
+    except Exception:
+        pass
+    if use_fallback_opt:
+        if 'long_stress' not in default_config or not isinstance(default_config['long_stress'], dict):
+            default_config['long_stress'] = {}
+        default_config['long_stress']['use_fallback_only'] = True
+        logging.info("已从 pytest 参数启用：直接使用 Fallback 事件注入")
+    elif isinstance(gui_config, dict) and gui_config.get('use_fallback_only', False):
+        if 'long_stress' not in default_config or not isinstance(default_config['long_stress'], dict):
+            default_config['long_stress'] = {}
+        default_config['long_stress']['use_fallback_only'] = True
+        logging.info("已从 GUI 配置启用：直接使用 Fallback 事件注入")
+
+    # 7) 合并广播/TTS 压力测试配置（含 response_monitor）
+    dur_hours = default_config.get('long_stress', {}).get('duration_hours', 12)
+    rm_merged = dict(DEFAULT_RESPONSE_MONITOR)
+    if isinstance(gui_config, dict) and isinstance(gui_config.get('response_monitor'), dict):
+        for k, v in gui_config['response_monitor'].items():
+            # 已移除 detection_pattern（UI 正则模式已废弃，仅 logcat 模式）
+            if k == 'detection_pattern':
+                continue
+            if v is not None:
+                rm_merged[k] = v
+    if isinstance(gui_config, dict) and 'broadcast_stress' in gui_config:
+        bc = gui_config['broadcast_stress']
+        if isinstance(bc, dict):
+            default_config['broadcast_stress'] = {
+                'duration_hours': dur_hours,
+                'interval_seconds': 30,
+                'broadcast_action': 'com.cei.llm.INPUT_HINT_TO_LLM',
+                'hints': bc.get('hints', ['介绍一下白居易', '讲个笑话']),
+                'hints_file': (bc.get('hints_file') or '').strip(),
+                'response_monitor': rm_merged,
+            }
+    if isinstance(gui_config, dict) and 'tts_stress' in gui_config:
+        tts = gui_config['tts_stress']
+        if isinstance(tts, dict):
+            default_config['tts_stress'] = {
+                'duration_hours': dur_hours,
+                'interval_seconds': 30,
+                'texts': tts.get('texts', ['打开设置', '介绍一下北京']),
+                'texts_file': (tts.get('texts_file') or '').strip(),
+                'response_monitor': rm_merged,
+            }
 
     return default_config
 
@@ -276,6 +365,10 @@ def modular_framework(device_sn, package, test_config, pytestconfig):
         enabled_modules.append(TestModule.PERFORMANCE_RESPONSE)
     if pytestconfig.getoption("--module-resource", default=False):
         enabled_modules.append(TestModule.PERFORMANCE_RESOURCE)
+    if pytestconfig.getoption("--module-broadcast", default=False):
+        enabled_modules.append(TestModule.BROADCAST_STRESS)
+    if pytestconfig.getoption("--module-tts", default=False):
+        enabled_modules.append(TestModule.TTS_STRESS)
     
     # 如果没有指定模块，默认启用所有
     if not enabled_modules:
@@ -380,6 +473,18 @@ def pytest_addoption(parser):
         help="启用资源消耗测试模块"
     )
     parser.addoption(
+        "--module-broadcast",
+        action="store_true",
+        default=False,
+        help="启用广播模式压力测试模块"
+    )
+    parser.addoption(
+        "--module-tts",
+        action="store_true",
+        default=False,
+        help="启用 TTS 模式压力测试模块"
+    )
+    parser.addoption(
         "--establish-baseline",
         action="store_true",
         default=False,
@@ -396,4 +501,10 @@ def pytest_addoption(parser):
         action="store",
         default=None,
         help="长时间压力测试时长（单位：小时，可为小数；由 GUI 或 main.py 传入）"
+    )
+    parser.addoption(
+        "--use-fallback-only",
+        action="store_true",
+        default=False,
+        help="直接使用 Fallback 事件注入，跳过 adb shell monkey 命令（由 GUI 勾选传入）"
     )

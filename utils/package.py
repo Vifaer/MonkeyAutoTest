@@ -15,6 +15,7 @@ class Package:
         self.name = ""
         self.activity = ""
         self.version_name = ""
+        self.app_label = ""  # 应用名称（尽力从 aapt dump badging 解析）
         self.source = "apk"  # apk / installed
         self.__set_pkg_info()
 
@@ -30,6 +31,7 @@ class Package:
         obj.name = (package_name or "").strip()
         obj.activity = ""
         obj.version_name = ""
+        obj.app_label = ""
         obj.source = "installed"
         obj._populate_from_device(device_sn)
         return obj
@@ -95,6 +97,15 @@ class Package:
                 self.name = package_name
             except Exception as e:
                 logging.warning("[pkg_info] failed to regex package name from {}. {}".format(rst, e))
+            try:
+                # application-label-zh-CN:'xxx' / application-label:'xxx'
+                m = re.search(r"application-label-zh-CN:'([^']+)'", rst)
+                if not m:
+                    m = re.search(r"application-label:'([^']+)'", rst)
+                if m:
+                    self.app_label = m.group(1).strip()
+            except Exception as e:
+                logging.warning("[pkg_info] failed to regex app label from {}. {}".format(rst, e))
             try:
                 # launchable-activity: name='com.xxx.MainActivity'  label='...' icon='...'
                 m = re.search(r"launchable-activity:\s+name='([^']+)'", rst)

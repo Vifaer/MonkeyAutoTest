@@ -16,6 +16,8 @@ class Device:
         self.os = ""
         self.screen = ""
         self.model = ""
+        # 设备版本标识（如 ro.build.display.id），用于报告与筛选
+        self.build_display_id = ""
         self.__set_device_info()
 
     def __set_device_info(self):
@@ -59,6 +61,17 @@ class Device:
                 self.os = os_version
             except Exception as e:
                 logging.warning("[device_info] failed to regex os from {}. {}".format(rst, e))
+        # 获取设备版本标识（构建号/显示版本，例如 ro.build.display.id）
+        try:
+            cmd = "adb -s {} shell getprop ro.build.display.id".format(self.sn)
+            rst = timeout_command.run(cmd)
+            if rst and isinstance(rst, str):
+                val = rst.strip()
+                if val:
+                    self.build_display_id = val
+        except Exception as e:
+            logging.debug(f"[device_info] failed to get ro.build.display.id: {e}")
+
         # 获取分辨率
         # Windows 下不要依赖 `| grep`；优先用 `wm size`，再兜底 dumpsys
         cmd = "adb -s {} shell wm size".format(self.sn)

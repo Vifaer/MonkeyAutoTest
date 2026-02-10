@@ -1,21 +1,24 @@
 {
-  "theme": "pulse",
-  "adb_path": "D:/softwares/platform-tools/adb.exe",
-  "app_source": "installed",
-  "package_name": "com.cei.llm.data",
-  "prj_ver": "",
+  "theme": "cosmo",
+  "adb_path": "D:/codes/MonkeyAutoTest/tools/adb/adb.exe",
+  "app_type": "system",
+  "package_name": "com.svw.avatar",
+  "pinned_packages": [],
+  "prj_ver": "broadcast_stress_test",
   "device_sn": "7ff80600",
   "apk_path": "",
   "email": "",
   "test_mode": "modular",
   "modules": {
-    "system_robustness": true,
+    "system_robustness": false,
     "exception_recovery": false,
     "performance_response": false,
-    "performance_resource": false,
-    "performance_all": false
+    "performance_all": false,
+    "broadcast_stress": true,
+    "tts_stress": false
   },
-  "duration": "1",
+  "duration_preset": "快速测试（30分钟）",
+  "duration": "30",
   "duration_unit": "分钟",
   "network_method": "pc_proxy",
   "multi_devices": "7ff80600",
@@ -23,15 +26,41 @@
   "baseline_compare": false,
   "no_mock_server": false,
   "no_network_proxy": false,
+  "use_fallback_only": true,
   "mock_server": {
     "mode": "mitmproxy",
     "host": "127.0.0.1",
     "port": "8080",
     "rules_path": "conf\\mock_rules.json"
   },
-  "traditional_monkey": {
-    "throttle": "700",
-    "count": "10000",
-    "uninstall": false
+  "performance_monitor": {
+    "clickable_elements": "AI Power,智能体广场,对话收藏"
+  },
+  "monkey_mask": {
+    "top": "10.0",
+    "bottom": "10.0",
+    "left": "0.0",
+    "right": "0.0"
+  },
+  "broadcast_stress": {
+    "hints": [
+      "介绍一下白居易",
+      "讲个笑话",
+      "今天天气怎么样"
+    ],
+    "hints_file": "D:\\codes\\MonkeyAutoTest\\docs\\hints.txt"
+  },
+  "tts_stress": {
+    "texts": [
+      "打开设置",
+      "介绍一下北京",
+      "今天天气怎么样"
+    ],
+    "texts_file": "D:\\codes\\MonkeyAutoTest\\docs\\hints.txt"
+  },
+  "response_monitor": {
+    "max_wait_for_appear": 6.0,
+    "check_interval": 0.1,
+    "max_wait_for_disappear": 120.0
   }
 }

@@ -5,6 +5,7 @@ import time
 import logging
 import os
 import json
+import threading
 from datetime import datetime
 from utils.timeout_command import run as run_cmd
 
@@ -59,35 +60,51 @@ class ExceptionRecoveryTest:
         # 异常恢复测试分配总时长的30%（如果配置时长很短，至少保证5分钟）
         max_duration_seconds = max(300, int(duration_hours * 3600 * 0.3))
         
+        run_ts = datetime.now().strftime("%Y%m%d%H%M%S")
+        run_log_dir = os.path.join("logs", str(self.device.sn), run_ts)
+        os.makedirs(run_log_dir, exist_ok=True)
+        logcat_log_path = os.path.join(run_log_dir, "logcat_exception_recovery.log")
+        
         results = {
             'test_type': 'exception_recovery',
             'start_time': datetime.now().isoformat(),
             'max_duration_seconds': max_duration_seconds,
+            'run_log_dir': run_log_dir,
             'tests': {}
         }
         
-        test_start_time = time.time()
+        from utils.stress_monitor import StressMonitor
+        monitor = StressMonitor(self.device, self.package, self.config)
+        monitor._stop_logcat.clear()
+        logcat_thread = monitor.start_logcat_capture(logcat_log_path)
+        
+        try:
+            test_start_time = time.time()
 
-        # 网络异常测试
-        if time.time() - test_start_time < max_duration_seconds:
-            results['tests']['network_exception'] = self._run_network_exception_test(
-                max_duration_seconds - (time.time() - test_start_time)
-            )
-        else:
-            logging.warning("异常恢复测试超过配置时长，跳过网络异常测试")
-            results['tests']['network_exception'] = {'skipped': True, 'reason': 'timeout'}
+            # 网络异常测试
+            if time.time() - test_start_time < max_duration_seconds:
+                results['tests']['network_exception'] = self._run_network_exception_test(
+                    max_duration_seconds - (time.time() - test_start_time)
+                )
+            else:
+                logging.warning("异常恢复测试超过配置时长，跳过网络异常测试")
+                results['tests']['network_exception'] = {'skipped': True, 'reason': 'timeout'}
 
-        # 数据与服务异常测试
-        if time.time() - test_start_time < max_duration_seconds:
-            results['tests']['data_service_exception'] = self._run_data_service_exception_test(
-                max_duration_seconds - (time.time() - test_start_time)
-            )
-        else:
-            logging.warning("异常恢复测试超过配置时长，跳过数据服务异常测试")
-            results['tests']['data_service_exception'] = {'skipped': True, 'reason': 'timeout'}
+            # 数据与服务异常测试
+            if time.time() - test_start_time < max_duration_seconds:
+                results['tests']['data_service_exception'] = self._run_data_service_exception_test(
+                    max_duration_seconds - (time.time() - test_start_time)
+                )
+            else:
+                logging.warning("异常恢复测试超过配置时长，跳过数据服务异常测试")
+                results['tests']['data_service_exception'] = {'skipped': True, 'reason': 'timeout'}
 
-        results['end_time'] = datetime.now().isoformat()
-        results['actual_duration_seconds'] = time.time() - test_start_time
+            results['end_time'] = datetime.now().isoformat()
+            results['actual_duration_seconds'] = time.time() - test_start_time
+        finally:
+            monitor.stop()
+            if logcat_thread:
+                logcat_thread.join(timeout=5)
 
         return results
 
@@ -250,7 +267,7 @@ class ExceptionRecoveryTest:
 
         try:
             # 断开网络
-            self._disable_network()
+            self.network_simulator._disable_network()
             time.sleep(5)
 
             # 启动应用（模拟离线状态下启动）
@@ -258,7 +275,7 @@ class ExceptionRecoveryTest:
             time.sleep(5)
 
             # 恢复网络
-            self._enable_network()
+            self.network_simulator._enable_network()
             time.sleep(10)  # 等待网络恢复和数据同步
 
             # 检查数据是否自动刷新
@@ -438,7 +455,12 @@ class ExceptionRecoveryTest:
     # 辅助方法 - 应用控制
     def _launch_app(self):
         """启动应用"""
-        cmd = f"adb -s {self.device.sn} shell am start -n {self.package.name}/{self.package.activity}"
+        activity = getattr(self.package, "activity", "") or ""
+        if activity:
+            cmd = f"adb -s {self.device.sn} shell am start -n {self.package.name}/{activity}"
+        else:
+            cmd = (f"adb -s {self.device.sn} shell am start "
+                   f"-a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p {self.package.name}")
         run_cmd(cmd)
         logging.info(f"应用 {self.package.name} 已启动")
 

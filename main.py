@@ -36,18 +36,9 @@ from utils.config_io import read_json
 def init_param():
     """
     系统参数：
-    传统Monkey测试模式：
-    -v/--version,必填，项目版本。该项目版本必须为conf/project.json中的主key
-    -u/--url，选填，apk网络地址。如果存在该项，则不自动取包，改用该地址的apk文件（优先级高于-p/--path）
-    -p/--path，选填，apk本地路径。如果存在该项，则不自动取包，改用该路径的apk文件（优先级低于-u/--url）
-    -s/--sn，必填，待测设备序列号。如果有多个，以空格隔开
-    -i/--uninstall，选填，安装前是否卸载。参数取值为true时，安装apk之前会先执行卸载操作
-    -t/--throttle，选填，monkey参数。默认值为700
-    -c/--count，选填，monkey参数。默认值为10000
-    -r/--recipient，必填，收件人。如果有多个，以空格隔开
-
     稳定性测试模式：
     --stability，启用稳定性测试模式
+    -s/--sn，必填，待测设备序列号。如果有多个，以空格隔开
     --config，选填，稳定性测试配置文件路径
     --duration，选填，测试时长（小时），默认12小时
     --no-mock-server，选填，禁用Mock Server
@@ -58,17 +49,8 @@ def init_param():
     # 测试模式选择
     parser.add_argument("--stability", action="store_true", help="启用车载端侧稳定性测试模式")
 
-    # 传统Monkey测试参数
-    parser.add_argument("-v", "--version", required=False, help="Project version, must in conf/project.json")
-    parser.add_argument("-u", "--url", required=False, help="URL of apk which for monkey test")
-    parser.add_argument("-p", "--path", required=False, help="Local path of apk which for monkey test")
+    # 稳定性测试参数
     parser.add_argument("-s", "--sn", required=True, help="Serial number(s) of Android device")
-    parser.add_argument("-i", "--uninstall", required=False, help="Uninstall package before install")
-    parser.add_argument("-t", "--throttle", required=False, help="Parameter in monkey, throttle", default="700")
-    parser.add_argument("-c", "--count", required=False, help="Parameter in monkey, count", default="10000")
-    parser.add_argument("-r", "--recipient", required=False, help="Email recipient(s) of results")
-
-    # 稳定性测试专用参数
     parser.add_argument("--config", required=False, help="Stability test configuration file path")
     parser.add_argument("--duration", type=int, default=12, help="Test duration in hours (default: 12)")
     parser.add_argument("--no-mock-server", action="store_true", help="Disable Mock Server")
@@ -85,14 +67,16 @@ def init_param():
     parser.add_argument("--performance-only", action="store_true", help="Run only performance tests")
     parser.add_argument("--response-only", action="store_true", help="Run only response performance test")
     parser.add_argument("--resource-only", action="store_true", help="Run only resource consumption test")
+    parser.add_argument("--broadcast-only", action="store_true", help="Run only broadcast stress test")
+    parser.add_argument("--tts-only", action="store_true", help="Run only TTS stress test")
 
     args = parser.parse_args()
 
     # 验证参数
-    if not args.stability and not args.version:
-        parser.error("传统模式需要指定 -v/--version 参数，或使用 --stability 启用稳定性测试模式")
+    if not args.stability:
+        parser.error("请使用 --stability 启用稳定性测试模式")
 
-    if args.stability and not args.sn:
+    if not args.sn:
         parser.error("稳定性测试模式需要指定 -s/--sn 参数")
 
     # 处理参数
@@ -100,7 +84,8 @@ def init_param():
         # 稳定性测试模式
         # 检查是否启用模块化测试
         modular_enabled = (args.modular or args.robustness_only or args.recovery_only or
-                          args.performance_only or args.response_only or args.resource_only)
+                          args.performance_only or args.response_only or args.resource_only or
+                          args.broadcast_only or args.tts_only)
 
         # 确定启用的测试模块
         enabled_modules = []
@@ -114,6 +99,10 @@ def init_param():
             enabled_modules.append('performance_response')
         if args.resource_only:
             enabled_modules.append('performance_resource')
+        if args.broadcast_only:
+            enabled_modules.append('broadcast_stress')
+        if args.tts_only:
+            enabled_modules.append('tts_stress')
 
         return {
             'mode': 'stability',
@@ -127,95 +116,49 @@ def init_param():
             'compare_baseline': args.compare_baseline,
             'modular_enabled': modular_enabled,
             'enabled_modules': enabled_modules,
-            'apk_url': args.url or "",
-            'apk_path': args.path or ""
+            'apk_url': getattr(args, 'url', None) or "",
+            'apk_path': getattr(args, 'path', None) or ""
         }
-    else:
-        # 传统Monkey测试模式
-        sn_list = args.sn.split()
-        need_uninstall = True if args.uninstall is not None and args.uninstall.lower() == "true" else False
-        throttle = int(args.throttle)
-        count = int(args.count)
-        rcpt_list = args.recipient.split() if args.recipient else []
-
-        return {
-            'mode': 'traditional',
-            'prj_ver': args.version,
-            'apk_url': args.url or "",
-            'apk_path': args.path or "",
-            'sn_list': sn_list,
-            'need_uninstall': need_uninstall,
-            'throttle': throttle,
-            'count': count,
-            'rcpt_list': rcpt_list
-        }
+    return None
 
 
 def main():
     """主程序入口"""
     params = init_param()
-
-    if params['mode'] == 'stability':
-        # 稳定性测试模式
-        run_stability_test(params)
-    else:
-        # 传统Monkey测试模式
-        run_traditional_test(params)
-
-
-def run_traditional_test(params):
-    """运行传统Monkey测试"""
-    logging.info("开始传统Monkey测试模式")
-
-    # 获取版本信息
-    prj_json = addition.get_project_json()
-    if params['prj_ver'] not in prj_json:
-        logging.error("project version not found")
-        sys.exit(-1)
-
-    # 获取apk安装包
-    logging.info(">>> Getting package")
-    package = addition.get_package(params['prj_ver'], prj_json[params['prj_ver']],
-                                 params['apk_url'], params['apk_path'])
-    logging.info("path: {}".format(package.path))
-    logging.info("name: {}".format(package.name))
-    logging.info(">>> Done")
-
-    # 多线程测试
-    thread_list = []
-    for sn in params['sn_list']:
-        thread = threading.Thread(
-            target=addition.monkey_test,
-            name=sn,
-            args=(sn, package, prj_json[params['prj_ver']], params['need_uninstall'],
-                  params['throttle'], params['count'], params['rcpt_list'])
-        )
-        thread_list.append(thread)
-
-    # 启动所有线程
-    for thread in thread_list:
-        thread.start()
-
-    # 主线程等待所有子线程退出
-    for thread in thread_list:
-        thread.join()
-
-    logging.info("传统Monkey测试完成")
+    if params is None:
+        return
+    # 稳定性测试模式
+    run_stability_test(params)
 
 
 def build_pytest_args(params):
     """
     构建pytest命令行参数
-    使用配置字典优化参数构建逻辑
+    使用配置字典优化参数构建逻辑。
+    每次运行生成独立的 HTML 报告文件，避免覆盖历史报告。
     """
+    import os
+    from datetime import datetime
+
     # 基础pytest参数
-    pytest_args = [
-        'tests/',  # 测试目录
-        '-v',
-        '--tb=short',
-        '--html=reports/pytest_report.html',
-        '--self-contained-html',
-    ]
+    # GUI 场景下（smoke_only）优先跑 tests/integration，避免同一用例在 tests/ 与 tests/integration 重复执行
+    test_target = 'tests/'
+    if params.get('smoke_only', False):
+        test_target = 'tests/integration/'
+    # 模块化稳定性（GUI 勾选模块）：使用单一 runner 用例，runner 内部按参数运行模块并生成实时/阶段性/最终报告
+    if params.get('modular_enabled', False):
+        test_target = 'tests/integration/test_modular_runner.py'
+
+    # 模块化测试时由 report_generator 写入单一综合报告（{sn}_{project}_{ts}.html），不在此处添加 pytest-html
+    reports_dir = 'reports'
+    os.makedirs(reports_dir, exist_ok=True)
+    pytest_args = [test_target, '-v', '--tb=short']
+    if not params.get('modular_enabled', False):
+        mode = params.get('mode', 'test')
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        html_report_name = f"pytest_{mode}_{ts}.html"
+        html_report_path = os.path.join(reports_dir, html_report_name)
+        pytest_args.extend([f'--html={html_report_path}', '--self-contained-html'])
 
     # 设备序列号参数
     if params['sn_list']:
@@ -236,6 +179,8 @@ def build_pytest_args(params):
         'performance_all': 'performance',
         'performance_response': 'performance',
         'performance_resource': 'performance',
+        'broadcast_stress': 'broadcast_stress',
+        'tts_stress': 'tts_stress',
     }
 
     MODULE_ARG_MAP = {
@@ -244,9 +189,11 @@ def build_pytest_args(params):
         'performance_all': '--module-performance',
         'performance_response': '--module-response',
         'performance_resource': '--module-resource',
+        'broadcast_stress': '--module-broadcast',
+        'tts_stress': '--module-tts',
     }
 
-    # 模块化测试：根据启用的模块添加参数和标记
+    # 模块化测试：根据启用的模块添加参数（由 runner 用例内部执行模块，不再依赖 pytest marker 过滤）
     if params.get('modular_enabled', False):
         enabled_modules = params.get('enabled_modules', [])
         
@@ -254,13 +201,6 @@ def build_pytest_args(params):
         for module in enabled_modules:
             if module in MODULE_ARG_MAP:
                 pytest_args.append(MODULE_ARG_MAP[module])
-        
-        # 构建标记过滤字符串
-        markers = [MODULE_MARKER_MAP.get(m) for m in enabled_modules if m in MODULE_MARKER_MAP]
-        if markers:
-            # 去重并组合
-            unique_markers = list(set(markers))
-            pytest_args.extend(['-m', ' or '.join(unique_markers)])
     else:
         # 完整测试套件：运行所有稳定性测试
         # GUI 场景下仅运行标记为 stability_smoke 的轻量用例
@@ -283,6 +223,10 @@ def build_pytest_args(params):
         except Exception:
             # 如果转换失败则忽略，由测试侧使用默认值
             pass
+
+    # 直接使用 Fallback 事件注入（跳过 monkey 命令）
+    if params.get('use_fallback_only', False):
+        pytest_args.append('--use-fallback-only')
 
     return pytest_args
 
@@ -323,7 +267,8 @@ def load_stability_config(params):
         'long_stress': {
             'duration_hours': params['duration'],
             'throttle': 700,
-            'event_count': 100000
+            'event_count': 100000,
+            'use_fallback_only': params.get('use_fallback_only', False)  # 直接使用Fallback事件注入
         },
         'performance': {
             'sample_interval': 30,
@@ -357,7 +302,7 @@ def load_stability_config(params):
         except Exception as e:
             logging.warning(f"加载配置文件失败: {str(e)}")
 
-    # 与GUI持久化配置联动：如果存在 conf/test_ui_config.json，则将其中的 mock_server 段合并进来
+    # 与GUI持久化配置联动：如果存在 conf/test_ui_config.json，则将其中的 mock_server / monkey_mask 段合并进来
     try:
         gui_cfg_path = os.path.join("conf", "test_ui_config.json")
         gui_cfg = read_json(gui_cfg_path, default={})
@@ -369,6 +314,20 @@ def load_stability_config(params):
                 # GUI配置优先覆盖默认 host/port/mode/rules_path 等
                 config["mock_server"].update(ms)
                 logging.info(f"已从GUI配置合并Mock Server设置: {ms}")
+
+            # GUI 中配置的 monkey 遮罩区域（百分比），合并到 long_stress.monkey_mask 中
+            mm = gui_cfg.get("monkey_mask")
+            if isinstance(mm, dict):
+                try:
+                    ls = config.get("long_stress")
+                    if not isinstance(ls, dict):
+                        ls = {}
+                    # 只写入一个子 dict，具体解析/容错交给 ExtendedMonkeyTest 内部处理
+                    ls["monkey_mask"] = mm
+                    config["long_stress"] = ls
+                    logging.info(f"已从GUI配置合并 Monkey 遮罩区域设置: {mm}")
+                except Exception as _e:
+                    logging.warning(f"合并 Monkey 遮罩区域配置失败: {_e}")
     except Exception as e:
         logging.warning(f"从GUI配置加载Mock Server设置失败: {e}")
 

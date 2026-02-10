@@ -1,0 +1,40 @@
+[project]
+name = "monkey-auto-test"
+version = "0.1.0"
+description = "车载端侧应用稳定性/压力/性能自动化测试工具（GUI + pytest）"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+  { name = "MonkeyAutoTest Team" },
+]
+license = { text = "Proprietary" }
+
+dependencies = [
+  # 测试框架与插件
+  "pytest>=7.0.0",
+  "pytest-html>=3.1.0",
+  "pytest-cov>=4.0.0",
+  "pytest-timeout>=2.1.0",
+  "pytest-xdist>=3.0.0",
+
+  # HTTP / 配置 / GUI
+  "requests>=2.28.0",
+  "ttkbootstrap>=1.10.1",
+  "pyyaml>=6.0",
+
+  # TTS 压力测试
+  "pyttsx3>=2.90",
+
+  # 网络代理（按需启用）
+  "mitmproxy>=9.0.0",
+  # 图表和数据处理（如需在本地生成静态图表或做数据透视）
+  "matplotlib>=3.5.0",
+  "pandas>=1.5.0",
+]
+
+[project.urls]
+Homepage = "https://example.com/monkey-auto-test"
+
+[tool.uv]
+# 这里保留默认配置，使用全局/用户 uv 设置。
+# 如需企业内网镜像，可在本地 uv 配置中设置 index-url，而不是写死在项目里。

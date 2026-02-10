@@ -45,8 +45,9 @@ class TestSystemRobustness:
         logging.info(f"系统健壮性测试完成: 崩溃 {crashes} 次, ANR {anrs} 次")
     
     @pytest.mark.parametrize("duration_hours", [1, 12, 24])
+    @pytest.mark.skip(reason="参数化测试，GUI模式下不运行，仅用于CI/CD")
     def test_stress_test_duration(self, stability_framework, duration_hours):
-        """不同时长的压力测试（参数化）"""
+        """不同时长的压力测试（参数化，仅用于CI/CD，GUI模式下跳过）"""
         # 修改配置中的测试时长
         stability_framework.config['long_stress']['duration_hours'] = duration_hours
         

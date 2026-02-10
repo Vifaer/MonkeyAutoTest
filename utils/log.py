@@ -18,18 +18,15 @@ class ProjectLog:
         self.history_root = HISTORY_ROOT
 
     def set_up(self):
-        # 清理之前的项目日志目录
-        if os.path.exists(self.log_root):
-            shutil.rmtree(self.log_root)
-        # 创建新的项目日志目录
-        os.makedirs(self.log_root)
-        # 初始化logging
+        # 不再整体删除 logs 目录，改为在其中追加/复用 log.txt，保留历史运行结果。
+        os.makedirs(self.log_root, exist_ok=True)
+        # 初始化logging（追加模式）
         logging.basicConfig(
             level=logging.INFO,
-            format="%(asctime)s %(levelname)s\t[%(threadName)s] %(message)s",
+            format="%(asctime)s [%(levelname)s] %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
             filename=self.log_path,
-            filemode="w"
+            filemode="a"
         )
 
     def tear_down(self):
@@ -52,14 +49,11 @@ class DeviceLog:
         self.log_path = "{}/{}".format(self.device_root, "monkey.log")
 
     def init(self):
-        # 清理device之前的日志目录
-        if os.path.exists(self.device_root):
-            shutil.rmtree(self.device_root)
-        # 创建device所需的日志目录
-        os.makedirs(self.device_root)
-        os.makedirs(self.anr_dir)
-        os.makedirs(self.crash_dir)
-        os.makedirs(self.dump_dir)
+        # 不再删除整个设备日志目录，仅确保必要子目录存在，避免覆盖历史日志
+        os.makedirs(self.device_root, exist_ok=True)
+        os.makedirs(self.anr_dir, exist_ok=True)
+        os.makedirs(self.crash_dir, exist_ok=True)
+        os.makedirs(self.dump_dir, exist_ok=True)
 
     @staticmethod
     def __remove_excess_traces(anr_info):

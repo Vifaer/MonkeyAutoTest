@@ -75,6 +75,36 @@ def monkey_test(sn, package, prj_info, need_uninstall, throttle, count, rcpt_lis
     logging.info(">>> Done")
     # 获取anr数量、crash数量和附件list
     anr_cnt, crash_cnt, att_list = device_log.get()
+    # 使用统一报告生成器生成 HTML/JSON 报告（与稳定性测试等格式一致）
+    try:
+        from utils.report_generator import StabilityReportGenerator, TEST_TYPE_MONKEY
+        raw_results = {
+            'device_info': {
+                'sn': device.sn,
+                'model': device.model,
+                'os': device.os,
+                'screen': device.screen,
+                # 设备显示版本号（ro.build.display.id），用于报告展示与筛选
+                'build_display_id': getattr(device, "build_display_id", ""),
+            },
+            'package_info': {
+                'name': package.name,
+                'filename': package.filename,
+                'path': getattr(package, 'path', ''),
+                # 应用版本信息（若可用）
+                'version_name': getattr(package, "version_name", ""),
+                'app_label': getattr(package, "app_label", ""),
+            },
+            'crashes': crash_cnt,
+            'anrs': anr_cnt,
+            'throttle': throttle,
+            'count': count,
+            'log_path': device_log.log_path,
+        }
+        report_gen = StabilityReportGenerator()
+        report_gen.generate_report(raw_results, test_type=TEST_TYPE_MONKEY)
+    except Exception as e:
+        logging.debug("统一报告生成跳过: %s", e)
     # 发送邮件
     send_log(prj_info, device, package, rcpt_list, anr_cnt, crash_cnt, att_list)
 
