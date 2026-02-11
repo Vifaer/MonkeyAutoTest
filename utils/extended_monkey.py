@@ -1342,16 +1342,16 @@ class ExtendedMonkeyTest:
                     # 监控内存使用率
                     mem_usage = self._get_memory_usage()
 
-                    # 记录性能数据（memory_pss从KB转换为MB，保留两位小数）
+                    # 记录性能数据（应用级 PSS：KB/MB）
                     memory_mb = round(mem_usage / 1024.0, 2) if mem_usage > 0 else 0.0
                     perf_data = {
                         'timestamp': datetime.now().isoformat(),
-                        'cpu_usage': cpu_usage,
-                        'memory_pss': mem_usage,  # 保持KB值用于内部计算
-                        'memory_pss_mb': memory_mb,  # MB值用于显示
-                        'mode': mode,
+                        'app_cpu_pct': cpu_usage,
+                        'app_memory_pss_kb': mem_usage,
+                        'app_memory_pss_mb': memory_mb,
+                        'app_foreground_mode': mode,
                         'device_sn': self.device.sn,
-                        'package': self.package.name
+                        'package': self.package.name,
                     }
 
                     result['performance_data'].append(perf_data)
@@ -1387,10 +1387,10 @@ class ExtendedMonkeyTest:
         if not pkg:
             return 0.0
         
-        # 方法1: top -n 1 -d 0（快速采样）
+        # 方法1: top -n 1 -d 1（约 1 秒采样，避免 -d 0 瞬时采样导致常为 0%）
         try:
-            cmd = f"adb -s {self.device.sn} shell top -n 1 -d 0"
-            result = run_cmd(cmd, timeout=3)
+            cmd = f"adb -s {self.device.sn} shell top -n 1 -d 1"
+            result = run_cmd(cmd, timeout=5)
             if result and isinstance(result, str):
                 for line in result.splitlines():
                     if pkg in line:
@@ -1434,8 +1434,8 @@ class ExtendedMonkeyTest:
                         if len(parts) >= 2:
                             pid = parts[1]
                             # 用top查看该PID的CPU
-                            cmd2 = f"adb -s {self.device.sn} shell top -n 1 -d 0 -p {pid}"
-                            result2 = run_cmd(cmd2, timeout=3)
+                            cmd2 = f"adb -s {self.device.sn} shell top -n 1 -d 1 -p {pid}"
+                            result2 = run_cmd(cmd2, timeout=5)
                             if result2 and isinstance(result2, str):
                                 for line2 in result2.splitlines():
                                     if pid in line2:
@@ -1607,9 +1607,9 @@ class ExtendedMonkeyTest:
                                 first_ts = ts
                             last_ts = ts
 
-                        mode = item.get("mode", "")
-                        cpu = item.get("cpu_usage", 0.0)
-                        mem = item.get("memory_pss", 0)
+                        mode = item.get("app_foreground_mode", "")
+                        cpu = float(item.get("app_cpu_pct", 0.0) or 0.0)
+                        mem = int(item.get("app_memory_pss_kb", 0) or 0)
                         if mode == "foreground":
                             cpu_fg.append(cpu)
                             mem_fg.append(mem)
@@ -1633,9 +1633,9 @@ class ExtendedMonkeyTest:
             for d in perf_data:
                 if not isinstance(d, dict):
                     continue
-                mode = d.get("mode", "foreground")
-                cpu = d.get("cpu_usage", 0.0)
-                mem = d.get("memory_pss", 0)
+                mode = d.get("app_foreground_mode", "foreground")
+                cpu = float(d.get("app_cpu_pct", 0.0) or 0.0)
+                mem = int(d.get("app_memory_pss_kb", 0) or 0)
                 if mode == "background":
                     cpu_bg.append(cpu)
                     mem_bg.append(mem)

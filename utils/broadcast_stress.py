@@ -10,6 +10,7 @@ import os
 import time
 import logging
 import threading
+from typing import Callable, Optional
 from datetime import datetime, timedelta
 
 from utils.timeout_command import run as run_cmd
@@ -36,7 +37,7 @@ class BroadcastStressTest:
         self._consecutive_no_response = 0
 
     def _restart_service_and_wait(self):
-        """终止当前应用进程并重新拉起服务，等待 8 秒后继续。"""
+        """终止当前应用进程并重新拉起到前台，等待 10 秒让应用完全启动和稳定后继续。"""
         try:
             pkg = getattr(self.package, "name", None) or getattr(self.package, "package", None)
             if not pkg:
@@ -54,8 +55,8 @@ class BroadcastStressTest:
             monitor.ensure_app_in_foreground()
         except Exception as e:
             logging.warning(f"[response-monitor] 自动拉起应用失败: {e}")
-        logging.info("[response-monitor] 自动恢复完成，等待 8 秒后继续测试")
-        time.sleep(8)
+        logging.info("[response-monitor] 自动恢复完成，等待 10 秒后继续测试")
+        time.sleep(10)
 
     def _load_hints(self):
         """加载 hint 列表：优先 hints_file（文本文件），否则 hints（每行一条），否则默认"""
@@ -73,8 +74,8 @@ class BroadcastStressTest:
             return [str(h).strip() for h in hints if str(h).strip()]
         return ["介绍一下白居易", "讲个笑话", "今天天气怎么样", "介绍一下北京"]
 
-    def run_broadcast_stress_test(self):
-        """执行广播模式压力测试"""
+    def run_broadcast_stress_test(self, progress_cb: Optional[Callable[[dict], None]] = None):
+        """执行广播模式压力测试（可选 progress_cb 用于实时上报进度）"""
         hints = self._load_hints()
         interval_seconds = int(self.config.get("interval_seconds", 30))
         duration_hours = float(self.config.get("duration_hours", 12))
@@ -93,6 +94,7 @@ class BroadcastStressTest:
             "start_time": datetime.now().isoformat(),
             "crashes": 0,
             "anrs": 0,
+            "anr_events": [],  # ANR 事件列表，供实时报告展示
             "performance_data": [],
             "log_summary": {},
             "run_log_dir": self._run_log_dir,
@@ -135,6 +137,28 @@ class BroadcastStressTest:
         start_time = datetime.now()
         hint_index = 0
 
+        def _emit_progress():
+            """向外部实时上报：尽量轻量，只包含报告所需字段。"""
+            if not progress_cb:
+                return
+            try:
+                partial = {
+                    "test_type": result.get("test_type"),
+                    "start_time": result.get("start_time"),
+                    "run_log_dir": result.get("run_log_dir"),
+                    "hints_count": result.get("hints_count"),
+                    "broadcasts_sent": result.get("broadcasts_sent"),
+                    "crashes": result.get("crashes", 0),
+                    "anrs": result.get("anrs", 0),
+                    "anr_events": list(result.get("anr_events") or []),
+                    # 保留最新少量明细，避免无限增大影响实时更新开销
+                    "response_monitoring": list((result.get("response_monitoring") or [])[-50:]),
+                }
+                progress_cb(partial)
+            except Exception:
+                # 进度回调不影响主流程
+                pass
+
         try:
             while datetime.now() < end_time and not self._stop_event.is_set():
                 hint = hints[hint_index % len(hints)]
@@ -172,9 +196,23 @@ class BroadcastStressTest:
                             f"{model_suffix}"
                         )
                     elif monitor_result['status'] == 'timeout_appear':
-                        result['anrs'] += 1  # 无响应视为ANR
+                        result['anrs'] += 1
+                        result['anr_events'].append({
+                            'hint_index': result['broadcasts_sent'],
+                            'hint_preview': hint[:50],
+                            'time': datetime.now().isoformat(),
+                            'reason': monitor_result.get('error') or monitor_result['status'],
+                        })
                         logging.warning(f"[response-monitor] Hint #{result['broadcasts_sent']} 无响应（ANR）")
                     else:
+                        # timeout_disappear 或 error：同样计入 ANR 并记录事件
+                        result['anrs'] += 1
+                        result['anr_events'].append({
+                            'hint_index': result['broadcasts_sent'],
+                            'hint_preview': hint[:50],
+                            'time': datetime.now().isoformat(),
+                            'reason': monitor_result.get('error') or monitor_result['status'],
+                        })
                         logging.warning(f"[response-monitor] Hint #{result['broadcasts_sent']} 监控异常: {monitor_result.get('error', 'unknown')}")
                     
                     with open(self.log_path, "a", encoding="utf-8") as f:
@@ -187,35 +225,29 @@ class BroadcastStressTest:
                             line += f", 模型={model_name}"
                         f.write(line + "\n")
 
-                    # 连续失败计数与自动恢复（仅针对“未能获取到响应”的场景）
+                    # 检测到 ANR/error 后立即恢复：杀进程、重启前台、等待 10 秒
                     if monitor_result['status'] == 'success':
                         self._consecutive_no_response = 0
                     elif monitor_result['status'] in ('timeout_appear', 'timeout_disappear', 'error'):
                         self._consecutive_no_response += 1
-                        if self.max_failure_count > 0 and self._consecutive_no_response >= self.max_failure_count:
-                            logging.warning(
-                                f"[response-monitor] 连续 {self._consecutive_no_response} 次未获得有效响应，"
-                                f"触发自动重启服务（阈值={self.max_failure_count}）"
-                            )
-                            self._restart_service_and_wait()
-                            self._consecutive_no_response = 0
+                        self._restart_service_and_wait()
+                        self._consecutive_no_response = 0
+
+                    # 每条 hint 完成后实时上报进度（含 ANR 次数/事件列表）
+                    _emit_progress()
                     
-                    # 如果文本已消失，可以立即执行下一条；否则等待剩余时间；超时未出现则快速跳过
-                    if monitor_result['status'] == 'timeout_appear':
-                        time.sleep(1)
-                    elif monitor_result['status'] == 'success' and monitor_result.get('disappear_time'):
+                    # 超时或异常时跳过当前 hint，短等待后继续下一条；成功则按剩余间隔等待
+                    if monitor_result['status'] == 'success' and monitor_result.get('disappear_time'):
                         remaining_wait = max(0, interval_seconds - (datetime.now() - hint_send_time).total_seconds())
                         if remaining_wait > 0:
                             time.sleep(min(remaining_wait, interval_seconds))
                     else:
-                        for _ in range(interval_seconds):
-                            if self._stop_event.is_set() or datetime.now() >= end_time:
-                                break
-                            time.sleep(1)
+                        time.sleep(1)
                 except Exception as e:
                     logging.warning(f"发送广播失败: {e}")
                     with open(self.log_path, "a", encoding="utf-8") as f:
                         f.write(f"ERROR: {e}\n")
+                    _emit_progress()
                     # 发生异常时也等待间隔时间
                     for _ in range(interval_seconds):
                         if self._stop_event.is_set() or datetime.now() >= end_time:

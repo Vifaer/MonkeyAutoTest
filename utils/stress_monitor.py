@@ -97,13 +97,19 @@ class StressMonitor:
         logging.info("[stress-monitor] 已尝试所有拉起方式，将继续执行")
 
     def get_cpu_usage(self):
-        """获取 CPU 使用率"""
+        """
+        获取待测应用 CPU 使用率（%）。
+
+        使用 top -n 1 -d 1 进行约 1 秒采样再输出，避免 -d 0 瞬时采样导致多数为 0%。
+        若 top 未列出该进程（如后台被折叠）或解析失败，则尝试 dumpsys cpuinfo 作为回退。
+        """
         pkg = self._get_package_name()
         if not pkg:
             return 0.0
         try:
-            cmd = f"adb -s {self.device.sn} shell top -n 1 -d 0"
-            result = run_cmd(cmd, timeout=3)
+            # 使用 -d 1 让 top 采样约 1 秒再输出，否则 -d 0 瞬时采样常为 0%
+            cmd = f"adb -s {self.device.sn} shell top -n 1 -d 1"
+            result = run_cmd(cmd, timeout=5)
             if result and isinstance(result, str):
                 for line in result.splitlines():
                     if pkg in line:
@@ -116,6 +122,115 @@ class StressMonitor:
                                         return cpu_val
                                 except ValueError:
                                     pass
+            # 回退：dumpsys cpuinfo 会列出各进程 CPU，部分 ROM 在后台也会包含目标包
+            cmd2 = f"adb -s {self.device.sn} shell dumpsys cpuinfo"
+            result2 = run_cmd(cmd2, timeout=5)
+            if result2 and isinstance(result2, str):
+                import re
+                for line in result2.splitlines():
+                    if pkg in line:
+                        # 格式常见为 "12% 12345/com.svw.avatar: 8% user + 4% kernel"
+                        m = re.search(r"(\d+(?:\.\d+)?)\s*%", line)
+                        if m:
+                            try:
+                                cpu_val = float(m.group(1))
+                                if 0 <= cpu_val <= 100:
+                                    return cpu_val
+                            except ValueError:
+                                pass
+        except Exception:
+            pass
+        return 0.0
+
+    def get_device_cpu_total(self):
+        """
+        获取设备总体 CPU 使用率（0–100%）。从 top 首行或 dumpsys cpuinfo 解析。
+        说明：应用 CPU（app_cpu_pct）为单进程占比，多核下可能超过 100%；设备总 CPU 为整机平均，
+        故可能出现 app_cpu_pct > device_cpu_pct，属正常现象。
+        """
+        try:
+            cmd = f"adb -s {self.device.sn} shell top -n 1 -d 1"
+            result = run_cmd(cmd, timeout=5)
+            if result and isinstance(result, str):
+                import re
+                lines = result.splitlines()
+                for line in lines:
+                    # 首行常为 "User 12%, Kernel 5%, IOW 0%, IRQ 0%"
+                    m = re.search(r"User\s*(\d+)%", line, re.I)
+                    if m:
+                        user = int(m.group(1))
+                        kernel = 0
+                        mk = re.search(r"Kernel\s*(\d+)%", line, re.I)
+                        if mk:
+                            kernel = int(mk.group(1))
+                        total = user + kernel
+                        if 0 <= total <= 100:
+                            return float(total)
+                for line in lines:
+                    if re.match(r"^\s*CPU\s*:", line) or "Total:" in line:
+                        m = re.search(r"(\d+(?:\.\d+)?)\s*%", line)
+                        if m:
+                            return float(m.group(1))
+            cmd2 = f"adb -s {self.device.sn} shell dumpsys cpuinfo"
+            result2 = run_cmd(cmd2, timeout=5)
+            if result2 and isinstance(result2, str):
+                import re
+                m = re.search(r"Total:\s*(\d+(?:\.\d+)?)\s*%", result2)
+                if m:
+                    return float(m.group(1))
+        except Exception:
+            pass
+        return 0.0
+
+    def get_device_memory_total_mb(self):
+        """
+        获取设备总体已用内存（MB）。用于与应用 PSS 区分，表示整机已用 RAM。
+        优先使用 /proc/meminfo 的 MemTotal - MemFree（更稳定）；若失败则尝试 dumpsys meminfo。
+        若 dumpsys 解析值过小（< 50 MB）则视为异常，回退到 /proc/meminfo。
+        """
+        import re
+        # 1) /proc/meminfo 最可靠：MemTotal - MemFree = 已用内存 (kB)
+        try:
+            cmd2 = f"adb -s {self.device.sn} shell cat /proc/meminfo"
+            result2 = run_cmd(cmd2, timeout=3)
+            if result2 and isinstance(result2, str):
+                total_m = re.search(r"MemTotal:\s*(\d+)\s*kB", result2)
+                free_m = re.search(r"MemFree:\s*(\d+)\s*kB", result2)
+                if total_m and free_m:
+                    used_kb = int(total_m.group(1)) - int(free_m.group(1))
+                    used_mb = round(used_kb / 1024.0, 2)
+                    if used_mb >= 0:
+                        return used_mb
+        except Exception:
+            pass
+        # 2) dumpsys meminfo 作为补充
+        try:
+            cmd = f"adb -s {self.device.sn} shell dumpsys meminfo"
+            result = run_cmd(cmd, timeout=8)
+            if result and isinstance(result, str):
+                m = re.search(r"Used\s+RAM:\s*(\d+)\s*kB", result, re.I)
+                if m:
+                    used_mb = round(int(m.group(1)) / 1024.0, 2)
+                    if used_mb >= 50:  # 合理性：设备已用内存通常数百 MB 以上
+                        return used_mb
+                m = re.search(r"Total\s+PSS\s+by\s+process:\s*(\d+)", result, re.I)
+                if m:
+                    used_mb = round(int(m.group(1)) / 1024.0, 2)
+                    if used_mb >= 50:
+                        return used_mb
+        except Exception:
+            pass
+        # 3) 若 /proc 未取到，再试 dumpsys 不校验（兼容异常设备）
+        try:
+            cmd = f"adb -s {self.device.sn} shell dumpsys meminfo"
+            result = run_cmd(cmd, timeout=8)
+            if result and isinstance(result, str):
+                m = re.search(r"Used\s+RAM:\s*(\d+)\s*kB", result, re.I)
+                if m:
+                    return round(int(m.group(1)) / 1024.0, 2)
+                m = re.search(r"Total\s+PSS\s+by\s+process:\s*(\d+)", result, re.I)
+                if m:
+                    return round(int(m.group(1)) / 1024.0, 2)
         except Exception:
             pass
         return 0.0
@@ -154,12 +269,16 @@ class StressMonitor:
                     cpu_usage = self.get_cpu_usage()
                     mem_usage = self.get_memory_usage()
                     memory_mb = round(mem_usage / 1024.0, 2) if mem_usage > 0 else 0.0
+                    device_cpu_pct = self.get_device_cpu_total()
+                    device_memory_used_mb = self.get_device_memory_total_mb()
                     perf_data = {
                         'timestamp': datetime.now().isoformat(),
-                        'cpu_usage': cpu_usage,
-                        'memory_pss': mem_usage,
-                        'memory_pss_mb': memory_mb,
-                        'mode': mode,
+                        'app_cpu_pct': cpu_usage,
+                        'app_memory_pss_kb': mem_usage,
+                        'app_memory_pss_mb': memory_mb,
+                        'app_foreground_mode': mode,
+                        'device_cpu_pct': device_cpu_pct,
+                        'device_memory_used_mb': device_memory_used_mb,
                         'device_sn': self.device.sn,
                         'package': self._get_package_name(),
                     }
@@ -581,7 +700,9 @@ class StressMonitor:
         """
         通过 adb logcat 监控融合卡片出现/消失。
         匹配规则：tag 包含 logcat_tag，消息包含 logcat_appear_text（出现）或 logcat_disappear_text（消失）。
-        仅处理时间戳 >= request_send_time 的日志行，使用 log 实际时间戳计算 response_time、display_duration。
+        仅处理时间戳 >= request_send_time - 校准时间差 -2s 的日志行（校准时间差 = PC 时间 - 设备时间，由 _ensure_device_time_offset 得到），
+        使用 log 时间戳对齐到 PC 后与 request_send_time 相减得到 response_time。
+        若结果为负（时钟偏差或匹配到上一次的「已显示」），则按 0 秒计并打 warning 日志。
         """
         result = {
             'status': 'error',
@@ -597,19 +718,18 @@ class StressMonitor:
         line_lock = threading.Lock()
         stop_logcat = threading.Event()
 
-        # 时间戳过滤：只接受不早于 request_send_time - 2s 的日志（设备与 PC 可能有时差）
+        # 时间戳过滤：只接受 对齐后时间戳 >= request_send_time - 校准时间差 -2s 的日志（校准时间差 = pc_time - device_time）
         cutoff_dt = None
-        if request_send_time:
-            try:
-                cutoff_dt = request_send_time - timedelta(seconds=2)
-            except Exception:
-                pass
-
-        # 若提供了 request_send_time，则尝试对齐设备时间到 PC 时间轴
         device_offset = None
         if request_send_time:
             self._ensure_device_time_offset()
             device_offset = self._device_time_offset
+            try:
+                # 使用校准时间差+2s作为容差；若未校准则回退为 2s 容差
+                offset_seconds = (device_offset or 0.0) + 2.0
+                cutoff_dt = request_send_time - timedelta(seconds=offset_seconds)
+            except Exception:
+                pass
 
         def _is_line_valid(line):
             if cutoff_dt is None:
@@ -679,9 +799,18 @@ class StressMonitor:
                                 appear_log_ts = aligned_dt.timestamp()
                                 ref_time = request_send_time if request_send_time else datetime.fromtimestamp(poll_start)
                                 result['response_time'] = (aligned_dt - ref_time).total_seconds()
+                                # 可能出现负值：设备/PC 时钟偏差、或匹配到上一次的「已显示」日志；对外统一按 0 处理
+                                if result['response_time'] < 0:
+                                    logging.warning(
+                                        f"[response-monitor] 响应时间为负 ({result['response_time']:.3f}s)，"
+                                        "可能为时钟偏差或匹配到旧日志，已按 0 秒计"
+                                    )
+                                    result['response_time'] = 0.0
                             else:
                                 appear_log_ts = time.time()
                                 result['response_time'] = appear_log_ts - poll_start
+                                if result['response_time'] < 0:
+                                    result['response_time'] = 0.0
                             result['appear_time'] = appear_log_ts
                             result['status'] = 'success'
                             logging.info(f"[response-monitor] logcat 检测到「{appear_text}」，响应时间: {result['response_time']:.3f}秒")

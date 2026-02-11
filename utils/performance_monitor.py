@@ -728,25 +728,37 @@ class PerformanceMonitor:
 
     def _get_cpu_usage(self):
         """
-        获取应用CPU使用率
+        获取应用 CPU 使用率（%）。
+        使用 top -n 1 -d 1 进行约 1 秒采样再输出，避免 -d 0 瞬时采样导致多数为 0%。
+        若 top 未列出该进程则尝试 dumpsys cpuinfo 作为回退。
         """
-        cmd = f"adb -s {self.device.sn} shell top -n 1 -d 0"
-        result = run_cmd(cmd)
-
+        import re
+        cmd = f"adb -s {self.device.sn} shell top -n 1 -d 1"
+        result = run_cmd(cmd, timeout=5)
         if result and isinstance(result, str):
             try:
-                lines = result.strip().splitlines()
-                for line in lines:
+                for line in result.strip().splitlines():
                     if self.package.name in line:
-                        parts = line.split()
-                        # 不同 ROM 列顺序可能不同，尽量宽松：找带 % 的字段
-                        for token in parts:
+                        for token in line.split():
                             if token.endswith("%"):
-                                cpu_str = token.rstrip("%")
-                                return float(cpu_str)
-            except (ValueError, IndexError) as e:
-                logging.debug(f"解析CPU使用率失败: {str(e)}")
-
+                                cpu_val = float(token.rstrip("%"))
+                                if 0 <= cpu_val <= 100:
+                                    return cpu_val
+            except (ValueError, IndexError):
+                pass
+        cmd2 = f"adb -s {self.device.sn} shell dumpsys cpuinfo"
+        result2 = run_cmd(cmd2, timeout=5)
+        if result2 and isinstance(result2, str):
+            for line in result2.splitlines():
+                if self.package.name in line:
+                    m = re.search(r"(\d+(?:\.\d+)?)\s*%", line)
+                    if m:
+                        try:
+                            v = float(m.group(1))
+                            if 0 <= v <= 100:
+                                return v
+                        except ValueError:
+                            pass
         return None
 
     def _get_memory_pss(self):

@@ -2797,12 +2797,12 @@ class MonkeyTestGUI:
         body = tk.Frame(win, bg=UIColors.WHITE, relief="raised", bd=1)
         body.pack(fill=tk.BOTH, expand=True, padx=15, pady=(0, 15))
 
-        columns = ("project", "sn", "pkg", "device_ver", "app_ver", "status", "time", "size", "file")
+        columns = ("project", "sn", "device_ver", "pkg", "app_ver", "status", "time", "size", "file")
         tree = ttk.Treeview(body, columns=columns, show="headings", height=18, selectmode="extended")
         tree.heading("project", text="测试项目")
         tree.heading("sn", text="设备SN")
-        tree.heading("pkg", text="应用包名")
         tree.heading("device_ver", text="设备版本")
+        tree.heading("pkg", text="应用包名")
         tree.heading("app_ver", text="应用版本")
         tree.heading("status", text="状态")
         tree.heading("time", text="时间")
@@ -2810,8 +2810,8 @@ class MonkeyTestGUI:
         tree.heading("file", text="文件名")
         tree.column("project", width=120, anchor="w")
         tree.column("sn", width=90, anchor="w")
-        tree.column("pkg", width=220, anchor="w")
         tree.column("device_ver", width=160, anchor="w")
+        tree.column("pkg", width=220, anchor="w")
         tree.column("app_ver", width=140, anchor="w")
         tree.column("status", width=100, anchor="w")
         tree.column("time", width=160, anchor="w")
@@ -2935,8 +2935,8 @@ class MonkeyTestGUI:
                 items.append({
                     "project": project,
                     "sn": sn,
-                    "pkg": pkg,
                     "device_version": device_ver,
+                    "pkg": pkg,
                     "app_version": app_ver,
                     "status": status,
                     "time": mtime,
@@ -3001,8 +3001,8 @@ class MonkeyTestGUI:
                     values=(
                         i["project"],
                         i["sn"],
-                        i["pkg"],
                         i.get("device_version", ""),
+                        i["pkg"],
                         i.get("app_version", ""),
                         i["status"],
                         i["time"],

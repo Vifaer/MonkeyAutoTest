@@ -13,6 +13,7 @@ import logging
 import threading
 import subprocess
 import base64
+from typing import Callable, Optional
 from datetime import datetime, timedelta
 
 from utils.timeout_command import run as run_cmd
@@ -96,7 +97,7 @@ class TTSStressTest:
         return _play_tts_via_subprocess(text)
 
     def _restart_service_and_wait(self):
-        """终止当前应用进程并重新拉起服务，等待 8 秒后继续。"""
+        """终止当前应用进程并重新拉起到前台，等待 10 秒让应用完全启动和稳定后继续。"""
         try:
             pkg = getattr(self.package, "name", None) or getattr(self.package, "package", None)
             if not pkg:
@@ -114,11 +115,11 @@ class TTSStressTest:
             monitor.ensure_app_in_foreground()
         except Exception as e:
             logging.warning(f"[response-monitor] 自动拉起应用失败: {e}")
-        logging.info("[response-monitor] 自动恢复完成，等待 8 秒后继续测试")
-        time.sleep(8)
+        logging.info("[response-monitor] 自动恢复完成，等待 10 秒后继续测试")
+        time.sleep(10)
 
-    def run_tts_stress_test(self):
-        """执行 TTS 模式压力测试"""
+    def run_tts_stress_test(self, progress_cb: Optional[Callable[[dict], None]] = None):
+        """执行 TTS 模式压力测试（可选 progress_cb 用于实时上报进度）"""
         texts = self._load_texts()
         interval_seconds = int(self.config.get("interval_seconds", 30))
         duration_hours = float(self.config.get("duration_hours", 12))
@@ -136,6 +137,7 @@ class TTSStressTest:
             "start_time": datetime.now().isoformat(),
             "crashes": 0,
             "anrs": 0,
+            "anr_events": [],  # ANR 事件列表，供实时报告展示
             "performance_data": [],
             "log_summary": {},
             "run_log_dir": self._run_log_dir,
@@ -161,6 +163,25 @@ class TTSStressTest:
         end_time = datetime.now() + timedelta(hours=duration_hours)
         start_time = datetime.now()
         text_index = 0
+
+        def _emit_progress():
+            if not progress_cb:
+                return
+            try:
+                partial = {
+                    "test_type": result.get("test_type"),
+                    "start_time": result.get("start_time"),
+                    "run_log_dir": result.get("run_log_dir"),
+                    "texts_count": result.get("texts_count"),
+                    "tts_played": result.get("tts_played"),
+                    "crashes": result.get("crashes", 0),
+                    "anrs": result.get("anrs", 0),
+                    "anr_events": list(result.get("anr_events") or []),
+                    "response_monitoring": list((result.get("response_monitoring") or [])[-50:]),
+                }
+                progress_cb(partial)
+            except Exception:
+                pass
 
         tts_available = True
         try:
@@ -204,9 +225,22 @@ class TTSStressTest:
                                     f"{model_suffix}"
                                 )
                             elif monitor_result['status'] == 'timeout_appear':
-                                result['anrs'] += 1  # 仅在启用响应监控时，无响应视为 ANR
+                                result['anrs'] += 1
+                                result['anr_events'].append({
+                                    'text_index': result['tts_played'],
+                                    'text_preview': text[:50],
+                                    'time': datetime.now().isoformat(),
+                                    'reason': monitor_result.get('error') or monitor_result['status'],
+                                })
                                 logging.warning(f"[response-monitor] TTS #{result['tts_played']} 无响应（ANR）")
                             else:
+                                result['anrs'] += 1
+                                result['anr_events'].append({
+                                    'text_index': result['tts_played'],
+                                    'text_preview': text[:50],
+                                    'time': datetime.now().isoformat(),
+                                    'reason': monitor_result.get('error') or monitor_result['status'],
+                                })
                                 logging.warning(f"[response-monitor] TTS #{result['tts_played']} 监控异常: {monitor_result.get('error', 'unknown')}")
                             
                             with open(self.log_path, "a", encoding="utf-8") as f:
@@ -219,46 +253,42 @@ class TTSStressTest:
                                     line += f", 模型={model_name}"
                                 f.write(line + "\n")
 
-                            # 连续失败计数与自动恢复（仅在启用响应监控时生效）
+                            # 检测到 ANR/error 后立即恢复：杀进程、重启前台、等待 10 秒
                             if monitor_result['status'] == 'success':
                                 self._consecutive_no_response = 0
                             elif monitor_result['status'] in ('timeout_appear', 'timeout_disappear', 'error'):
                                 self._consecutive_no_response += 1
-                                if self.max_failure_count > 0 and self._consecutive_no_response >= self.max_failure_count:
-                                    logging.warning(
-                                        f"[response-monitor] 连续 {self._consecutive_no_response} 次未获得有效响应，"
-                                        f"触发自动重启服务（阈值={self.max_failure_count}）"
-                                    )
-                                    self._restart_service_and_wait()
-                                    self._consecutive_no_response = 0
+                                self._restart_service_and_wait()
+                                self._consecutive_no_response = 0
+
+                            _emit_progress()
                             
-                            if monitor_result['status'] == 'timeout_appear':
-                                time.sleep(1)
-                            elif monitor_result['status'] == 'success' and monitor_result.get('disappear_time'):
+                            # 超时或异常时跳过当前条，短等待后继续；成功则按剩余间隔等待
+                            if monitor_result['status'] == 'success' and monitor_result.get('disappear_time'):
                                 remaining_wait = max(0, interval_seconds - (datetime.now() - text_send_time).total_seconds())
                                 if remaining_wait > 0:
                                     time.sleep(min(remaining_wait, interval_seconds))
                             else:
-                                for _ in range(interval_seconds):
-                                    if self._stop_event.is_set() or datetime.now() >= end_time:
-                                        break
-                                    time.sleep(1)
+                                time.sleep(1)
                         else:
                             # 未启用响应监控：按间隔等待后执行下一条
                             for _ in range(interval_seconds):
                                 if self._stop_event.is_set() or datetime.now() >= end_time:
                                     break
                                 time.sleep(1)
+                            _emit_progress()
                     else:
                         # 播放失败，等待间隔后重试下一条
                         for _ in range(interval_seconds):
                             if self._stop_event.is_set() or datetime.now() >= end_time:
                                 break
                             time.sleep(1)
+                        _emit_progress()
                 except Exception as e:
                     logging.warning(f"TTS 播放异常: {e}")
                     with open(self.log_path, "a", encoding="utf-8") as f:
                         f.write(f"ERROR: {e}\n")
+                    _emit_progress()
                     # 发生异常时也等待间隔时间
                     for _ in range(interval_seconds):
                         if self._stop_event.is_set() or datetime.now() >= end_time:

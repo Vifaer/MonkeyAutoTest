@@ -394,7 +394,18 @@ class ModularStabilityTest:
         from utils.broadcast_stress import BroadcastStressTest
         cfg = self.config.get('broadcast_stress', self.config.get('long_stress', {}))
         broadcast_test = BroadcastStressTest(self.device, self.package, cfg)
-        result = broadcast_test.run_broadcast_stress_test()
+
+        def _progress_cb(partial_result: dict):
+            """广播压力测试运行中增量写回，供实时报告线程读取。"""
+            try:
+                self.test_results.setdefault('tests', {})['broadcast_stress'] = partial_result
+                run_log_dir = partial_result.get('run_log_dir')
+                if run_log_dir:
+                    self._live_state['run_log_dir'] = run_log_dir
+            except Exception:
+                pass
+
+        result = broadcast_test.run_broadcast_stress_test(progress_cb=_progress_cb)
         self.test_results['tests']['broadcast_stress'] = result
         logging.info("广播模式压力测试完成")
 
@@ -404,7 +415,18 @@ class ModularStabilityTest:
         from utils.tts_stress import TTSStressTest
         cfg = self.config.get('tts_stress', self.config.get('long_stress', {}))
         tts_test = TTSStressTest(self.device, self.package, cfg)
-        result = tts_test.run_tts_stress_test()
+
+        def _progress_cb(partial_result: dict):
+            """TTS 压力测试运行中增量写回，供实时报告线程读取。"""
+            try:
+                self.test_results.setdefault('tests', {})['tts_stress'] = partial_result
+                run_log_dir = partial_result.get('run_log_dir')
+                if run_log_dir:
+                    self._live_state['run_log_dir'] = run_log_dir
+            except Exception:
+                pass
+
+        result = tts_test.run_tts_stress_test(progress_cb=_progress_cb)
         self.test_results['tests']['tts_stress'] = result
         logging.info("TTS 模式压力测试完成")
 
@@ -478,8 +500,14 @@ class ModularStabilityTest:
     def _live_report_update_loop(self):
         """后台线程：每隔 LIVE_REPORT_UPDATE_INTERVAL 秒更新一次实时报告。"""
         from utils.report_generator import LIVE_REPORT_UPDATE_INTERVAL
+        # 可通过配置覆盖刷新间隔（秒）
+        try:
+            interval = float(self.config.get("live_report_update_interval", LIVE_REPORT_UPDATE_INTERVAL))
+            interval = max(1.0, min(3600.0, interval))
+        except Exception:
+            interval = float(LIVE_REPORT_UPDATE_INTERVAL)
         while True:
-            if self._live_report_stop.wait(LIVE_REPORT_UPDATE_INTERVAL):
+            if self._live_report_stop.wait(interval):
                 break
             try:
                 self._live_state['test_results_snapshot'] = dict(self.test_results)

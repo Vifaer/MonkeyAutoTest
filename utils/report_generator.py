@@ -29,7 +29,13 @@ except ImportError:
     pd = None  # type: ignore
 
 # 实时报告更新间隔（秒）
-LIVE_REPORT_UPDATE_INTERVAL = 60
+# 默认 10s；可通过环境变量 MONKEYAUTOTEST_LIVE_REPORT_UPDATE_INTERVAL 覆盖
+try:
+    LIVE_REPORT_UPDATE_INTERVAL = int(os.environ.get("MONKEYAUTOTEST_LIVE_REPORT_UPDATE_INTERVAL", "10"))
+    if LIVE_REPORT_UPDATE_INTERVAL < 1:
+        LIVE_REPORT_UPDATE_INTERVAL = 10
+except Exception:
+    LIVE_REPORT_UPDATE_INTERVAL = 10
 
 # 支持的测试类型（用于统一报告入口）
 TEST_TYPE_MONKEY = "monkey"
@@ -39,6 +45,35 @@ TEST_TYPE_EXCEPTION_RECOVERY = "exception_recovery"
 TEST_TYPE_PERFORMANCE = "performance"
 TEST_TYPE_BROADCAST_STRESS = "broadcast_stress"
 TEST_TYPE_TTS_STRESS = "tts_stress"
+
+
+def _perf_app_cpu(p: Dict[str, Any]) -> float:
+    """性能采样行：应用 CPU 占比（app_cpu_pct）。"""
+    return float(p.get('app_cpu_pct', 0) or 0)
+
+
+def _perf_app_mem_mb(p: Dict[str, Any]) -> float:
+    """性能采样行：应用 PSS 内存 MB（app_memory_pss_mb / app_memory_pss_kb）。"""
+    v = p.get('app_memory_pss_mb')
+    if v is not None:
+        return float(v)
+    kb = p.get('app_memory_pss_kb', 0) or 0
+    return round(kb / 1024.0, 2) if kb else 0.0
+
+
+def _perf_mode(p: Dict[str, Any]) -> str:
+    """性能采样行：前台/后台（app_foreground_mode）。"""
+    return (p.get('app_foreground_mode') or '').lower()
+
+
+def _perf_device_cpu(p: Dict[str, Any]) -> Any:
+    """性能采样行：设备 CPU 占比（device_cpu_pct）。"""
+    return p.get('device_cpu_pct')
+
+
+def _perf_device_mem_mb(p: Dict[str, Any]) -> Any:
+    """性能采样行：设备已用内存 MB（device_memory_used_mb）。"""
+    return p.get('device_memory_used_mb')
 
 
 def normalize_test_results(raw: Dict[str, Any], test_type: str) -> Dict[str, Any]:
@@ -357,12 +392,12 @@ class StabilityReportGenerator:
         log_dir = run_log_dir or self._resolve_latest_run_log_dir(device_sn)
         log_tail = self._read_log_tail(log_dir, tail_lines=30)
         live_state['log_tail'] = log_tail
-        # 从 test_results_snapshot 更新已完成的崩溃/ANR 等
+        # 从 test_results_snapshot 汇总各模块的崩溃/ANR（含广播、TTS 压力测试进行中的实时数据）
         snapshot = live_state.get('test_results_snapshot') or {}
         tests = snapshot.get('tests', {})
-        rb = tests.get('system_robustness', {})
-        live_state['crashes_so_far'] = rb.get('crashes', 0)
-        live_state['anrs_so_far'] = rb.get('anrs', 0)
+        modules_for_crash_anr = ('system_robustness', 'broadcast_stress', 'tts_stress')
+        live_state['crashes_so_far'] = sum(tests.get(m, {}).get('crashes', 0) for m in modules_for_crash_anr)
+        live_state['anrs_so_far'] = sum(tests.get(m, {}).get('anrs', 0) for m in modules_for_crash_anr)
         html_content = self._build_unified_report_html(live_state)
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write(html_content)
@@ -552,8 +587,6 @@ class StabilityReportGenerator:
         package_info = live_state.get('package_info') or {}
         device_version = device_info.get('build_display_id') or device_info.get('os') or 'Unknown'
         app_version = package_info.get('version_name') or 'Unknown'
-        device_version = device_info.get('build_display_id') or device_info.get('os') or 'Unknown'
-        app_version = package_info.get('version_name') or 'Unknown'
         test_params = live_state.get('test_params') or {}
         start_time_str = live_state.get('start_time') or datetime.now().isoformat()
         current_phase = live_state.get('current_phase', 'idle')
@@ -583,9 +616,9 @@ class StabilityReportGenerator:
         if perf_snapshot:
             for p in perf_snapshot[-10:]:
                 ts = (p.get('timestamp') or '')[:19]
-                cpu = p.get('cpu_usage', 0)
-                mem_mb = p.get('memory_pss_mb') or (p.get('memory_pss', 0) / 1024.0)
-                mode = (p.get("mode") or "").lower()
+                cpu = _perf_app_cpu(p)
+                mem_mb = _perf_app_mem_mb(p)
+                mode = _perf_mode(p)
                 mode_txt = "前台" if mode == "foreground" else ("后台" if mode == "background" else (mode or "-"))
                 cpu_mem_rows += f"<tr><td>{ts}</td><td>{mode_txt}</td><td>{cpu}%</td><td>{mem_mb:.1f} MB</td></tr>"
         if not cpu_mem_rows:
@@ -607,11 +640,6 @@ class StabilityReportGenerator:
             status_badge = '<div style="background: #6c757d; color: #fff; padding: 5px 10px; border-radius: 4px; display: inline-block;">初始报告</div>'
 
         perf_tables_html = self._build_perf_snapshot_tables_html(perf_snapshot)
-
-        device_info = summary.get('device_info') or {}
-        package_info = summary.get('package_info') or {}
-        device_version = device_info.get('build_display_id') or device_info.get('os') or 'Unknown'
-        app_version = package_info.get('version_name') or 'Unknown'
 
         html = f"""
 <!DOCTYPE html>
@@ -691,33 +719,47 @@ class StabilityReportGenerator:
         return html
 
     def _build_perf_snapshot_tables_html(self, perf_snapshot: List[Dict[str, Any]]) -> str:
-        """构建性能采样两个表格：最新10条与最早10条，均按时间倒序（新→旧）。"""
+        """构建性能采样两个表格：最新10条与最早10条，均按时间倒序（新→旧）。含待测应用与设备总体 CPU/内存。"""
+        has_device = bool(perf_snapshot and any(
+            _perf_device_cpu(p) is not None or _perf_device_mem_mb(p) is not None for p in perf_snapshot
+        ))
+
         def row(p: Dict[str, Any]) -> str:
             ts = (p.get('timestamp') or '')[:19]
-            cpu = p.get('cpu_usage', 0)
-            mem_mb = p.get('memory_pss_mb') or (p.get('memory_pss', 0) / 1024.0)
-            mode = (p.get("mode") or "").lower()
+            cpu = _perf_app_cpu(p)
+            mem_mb = _perf_app_mem_mb(p)
+            mode = _perf_mode(p)
             mode_txt = "前台" if mode == "foreground" else ("后台" if mode == "background" else (mode or "-"))
-            return f"<tr><td>{ts}</td><td>{mode_txt}</td><td>{cpu}%</td><td>{mem_mb:.1f} MB</td></tr>"
+            base = f"<tr><td>{ts}</td><td>{mode_txt}</td><td>{cpu}%</td><td>{mem_mb:.1f} MB</td>"
+            if has_device:
+                dev_cpu = _perf_device_cpu(p)
+                dev_mem = _perf_device_mem_mb(p)
+                dev_mem_str = f"{float(dev_mem):.1f} MB" if dev_mem is not None else "-"
+                base += f"<td>{dev_cpu if dev_cpu is not None else '-'}%</td><td>{dev_mem_str}</td>"
+            base += "</tr>"
+            return base
 
         if not perf_snapshot:
-            return "<table><tr><th>时间</th><th>模式</th><th>CPU 使用率</th><th>内存 (MB)</th></tr><tr><td colspan='4'>暂无采样数据</td></tr></table>"
+            cols = 6 if has_device else 4
+            return f"<table><tr><th>时间</th><th>模式</th><th>应用 CPU%</th><th>应用内存 (MB)</th>" + ("<th>设备 CPU%</th><th>设备内存 (MB)</th>" if has_device else "") + f"</tr><tr><td colspan='{cols}'>暂无采样数据</td></tr></table>"
 
         latest_10 = perf_snapshot[-10:]
         earliest_10 = perf_snapshot[:10]
         rows_latest = "".join(row(p) for p in reversed(latest_10))
         rows_earliest = "".join(row(p) for p in reversed(earliest_10))
+        header_extra = "<th>设备 CPU%</th><th>设备内存 (MB)</th>" if has_device else ""
+        colspan = 6 if has_device else 4
 
         html = """
-        <p><strong>最新 10 条采样</strong>（时间倒序）</p>
+        <p><strong>最新 10 条采样</strong>（时间倒序；待测应用 + 设备总体）</p>
         <table>
-            <tr><th>时间</th><th>模式</th><th>CPU 使用率</th><th>内存 (MB)</th></tr>
-            """ + (rows_latest if rows_latest else "<tr><td colspan='4'>无</td></tr>") + """
+            <tr><th>时间</th><th>模式</th><th>应用 CPU%</th><th>应用内存 (MB)</th>""" + header_extra + """</tr>
+            """ + (rows_latest if rows_latest else f"<tr><td colspan='{colspan}'>无</td></tr>") + """
         </table>
         <p><strong>最早 10 条采样</strong>（时间倒序）</p>
         <table>
-            <tr><th>时间</th><th>模式</th><th>CPU 使用率</th><th>内存 (MB)</th></tr>
-            """ + (rows_earliest if rows_earliest else "<tr><td colspan='4'>无</td></tr>") + """
+            <tr><th>时间</th><th>模式</th><th>应用 CPU%</th><th>应用内存 (MB)</th>""" + header_extra + """</tr>
+            """ + (rows_earliest if rows_earliest else f"<tr><td colspan='{colspan}'>无</td></tr>") + """
         </table>
         """
         return html
@@ -726,6 +768,8 @@ class StabilityReportGenerator:
         """单一综合报告构建入口：实时区块 + 结果区块（来自 test_results_snapshot），根据 report_stopped 区分进行中/已停止。"""
         device_info = live_state.get('device_info') or {}
         package_info = live_state.get('package_info') or {}
+        device_version = device_info.get('build_display_id') or device_info.get('os') or 'Unknown'
+        app_version = package_info.get('version_name') or 'Unknown'
         test_params = live_state.get('test_params') or {}
         start_time_str = live_state.get('start_time') or datetime.now().isoformat()
         current_phase = live_state.get('current_phase', 'idle')
@@ -760,6 +804,31 @@ class StabilityReportGenerator:
         snapshot = live_state.get('test_results_snapshot') or {}
         has_snapshot = bool(snapshot and snapshot.get('tests'))
 
+        # ANR 事件列表：从 broadcast_stress / tts_stress 的 anr_events 合并，最近 20 条
+        anr_events_merged = []
+        tests_for_anr = snapshot.get('tests') or {}
+        for mod, key in [('broadcast_stress', 'hint_index'), ('tts_stress', 'text_index')]:
+            events = tests_for_anr.get(mod, {}).get('anr_events') or []
+            prefix = 'Hint #' if mod == 'broadcast_stress' else 'TTS #'
+            for ev in events:
+                idx = ev.get(key, ev.get('hint_index', ev.get('text_index', '-')))
+                preview = ev.get('hint_preview') if mod == 'broadcast_stress' else ev.get('text_preview')
+                anr_events_merged.append({
+                    'source': f"{prefix}{idx}",
+                    'time': ev.get('time', '')[:19] if ev.get('time') else '-',
+                    'reason': self._escape_html(str(ev.get('reason', '-'))[:200]),
+                    'preview': self._escape_html(str((preview or '')[:50])),
+                })
+        anr_events_merged = anr_events_merged[-20:]
+        anr_events_rows = "".join(
+            f"<tr><td>{e['source']}</td><td>{e['time']}</td><td>{e['reason']}</td><td>{e['preview']}</td></tr>"
+            for e in anr_events_merged
+        )
+        anr_events_table = (
+            "<table><tr><th>序号</th><th>时间</th><th>原因</th><th>摘要</th></tr>" + anr_events_rows + "</table>"
+            if anr_events_rows else "<p>暂无 ANR 事件记录</p>"
+        )
+
         if report_stopped:
             status_badge = '<div style="background: #dc3545; color: #fff; padding: 5px 10px; border-radius: 4px; display: inline-block; margin-left: 10px;">实时报告（已停止）</div>'
         elif has_snapshot:
@@ -791,6 +860,8 @@ class StabilityReportGenerator:
                 <tr><td>当前崩溃次数</td><td>{crashes}</td></tr>
                 <tr><td>当前 ANR 次数</td><td>{anrs}</td></tr>
             </table>
+            <p><strong>ANR 事件列表</strong>（最近 20 条）</p>
+            {anr_events_table}
         </div>
         <div class="section">
             <h3>性能监控数据（最近采样）</h3>
@@ -1341,7 +1412,11 @@ class StabilityReportGenerator:
     def _build_html_content(self, test_results: Dict[str, Any], is_intermediate: bool = False) -> str:
         """构建HTML内容"""
         summary = self._generate_summary(test_results)
-        
+        device_info = summary.get('device_info') or {}
+        package_info = summary.get('package_info') or {}
+        device_version = device_info.get('build_display_id') or device_info.get('os') or 'Unknown'
+        app_version = package_info.get('version_name') or 'Unknown'
+
         # 添加阶段性报告标记
         status_badge = ""
         if is_intermediate:
@@ -1779,6 +1854,7 @@ class StabilityReportGenerator:
             labels = []
             cpu_fg, cpu_bg = [], []
             mem_fg, mem_bg = [], []
+            device_cpu_list, device_mem_list = [], []
             with open(jsonl_path, 'r', encoding='utf-8') as f:
                 for line in f:
                     line = line.strip()
@@ -1786,10 +1862,19 @@ class StabilityReportGenerator:
                         continue
                     try:
                         data = json.loads(line)
-                        mode = (data.get("mode") or "").lower()
-                        cpu = float(data.get('cpu_usage', 0.0) or 0.0)
-                        mem_kb = data.get('memory_pss', 0)
-                        mem_mb = data.get('memory_pss_mb', round(mem_kb / 1024.0, 2) if mem_kb > 0 else 0.0)
+                        mode = _perf_mode(data)
+                        cpu = _perf_app_cpu(data)
+                        mem_mb = _perf_app_mem_mb(data)
+                        dev_cpu = _perf_device_cpu(data)
+                        dev_mem = _perf_device_mem_mb(data)
+                        if dev_cpu is not None:
+                            device_cpu_list.append(float(dev_cpu))
+                        else:
+                            device_cpu_list.append(None)
+                        if dev_mem is not None:
+                            device_mem_list.append(float(dev_mem))
+                        else:
+                            device_mem_list.append(None)
                         ts_str = data.get('timestamp', '')
                         if ts_str:
                             try:
@@ -1807,7 +1892,6 @@ class StabilityReportGenerator:
                             cpu_bg.append(cpu)
                             mem_bg.append(mem_mb)
                         else:
-                            # 默认按前台处理（兼容 mode 缺失/异常）
                             cpu_fg.append(cpu)
                             mem_fg.append(mem_mb)
                             cpu_bg.append(None)
@@ -1818,13 +1902,15 @@ class StabilityReportGenerator:
             if not labels:
                 return ""
 
-            # 截取最近 300 个点，兼顾长时测试与渲染性能
+            # 截取最近 300 个点
             cap = 300
             labels_trim = labels[-cap:]
             cpu_fg_trim = cpu_fg[-cap:]
             cpu_bg_trim = cpu_bg[-cap:]
             mem_fg_trim = mem_fg[-cap:]
             mem_bg_trim = mem_bg[-cap:]
+            device_cpu_trim = device_cpu_list[-cap:] if device_cpu_list else []
+            device_mem_trim = device_mem_list[-cap:] if device_mem_list else []
 
             def _stats(xs):
                 xs2 = [x for x in xs if isinstance(x, (int, float)) and x is not None]
@@ -1836,22 +1922,66 @@ class StabilityReportGenerator:
             bg_n, bg_cpu_avg, bg_cpu_peak = _stats(cpu_bg)
             fg_n_m, fg_mem_avg, fg_mem_peak = _stats(mem_fg)
             bg_n_m, bg_mem_avg, bg_mem_peak = _stats(mem_bg)
+            dev_n, dev_cpu_avg, dev_cpu_peak = _stats(device_cpu_list)
+            dev_n_m, dev_mem_avg, dev_mem_peak = _stats(device_mem_list)
+
+            device_stats_html = ""
+            device_charts_html = ""
+            device_charts_script = ""
+            if dev_n or dev_n_m:
+                device_stats_html = f"""
+          <p><b>设备总体</b></p>
+          <ul style="margin: 8px 0 0 18px;">
+            <li>设备 CPU：平均 {dev_cpu_avg:.1f}% / 峰值 {dev_cpu_peak:.1f}%（{dev_n} 点）</li>
+            <li>设备内存：平均 {dev_mem_avg:.1f} MB / 峰值 {dev_mem_peak:.1f} MB（{dev_n_m} 点）</li>
+          </ul>"""
+                device_charts_html = """
+        <h3>设备总体 CPU / 内存</h3>
+        <div style="margin: 20px 0;">
+            <canvas id="deviceCpuChart" style="max-width: 100%; height: 320px;"></canvas>
+        </div>
+        <div style="margin: 20px 0;">
+            <canvas id="deviceMemoryChart" style="max-width: 100%; height: 320px;"></canvas>
+        </div>"""
+                device_charts_script = f"""
+            const deviceCpuCtx = document.getElementById('deviceCpuChart').getContext('2d');
+            new Chart(deviceCpuCtx, {{
+                type: 'line',
+                data: {{
+                    labels: {json.dumps(labels_trim, ensure_ascii=False)},
+                    datasets: [{{ label: '设备 CPU%', data: {json.dumps(device_cpu_trim)}, borderColor: 'rgb(54, 162, 235)', tension: 0.15, fill: false, pointRadius: 0, spanGaps: true }}]
+                }},
+                options: {{ responsive: true, maintainAspectRatio: false, plugins: {{ title: {{ display: true, text: '设备总体 CPU 使用率' }} }}, scales: {{ y: {{ beginAtZero: true }} }} }}
+            }});
+            const deviceMemCtx = document.getElementById('deviceMemoryChart').getContext('2d');
+            new Chart(deviceMemCtx, {{
+                type: 'line',
+                data: {{
+                    labels: {json.dumps(labels_trim, ensure_ascii=False)},
+                    datasets: [{{ label: '设备内存 MB', data: {json.dumps(device_mem_trim)}, borderColor: 'rgb(255, 206, 86)', tension: 0.15, fill: false, pointRadius: 0, spanGaps: true }}]
+                }},
+                options: {{ responsive: true, maintainAspectRatio: false, plugins: {{ title: {{ display: true, text: '设备总体内存使用 (MB)' }} }}, scales: {{ y: {{ beginAtZero: true }} }} }}
+            }});"""
 
             html = f"""
-        <h2>资源消耗趋势图（按模式：前台/后台）</h2>
+        <h2>资源消耗趋势图（待测应用 + 设备总体）</h2>
         <div style="background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 6px; padding: 12px; margin: 10px 0;">
-          <b>采样统计（数据来源：{os.path.basename(jsonl_path)}，mode=foreground/background）</b>
+          <b>采样统计（数据来源：{os.path.basename(jsonl_path)}）</b>
+          <p><b>待测应用（按模式：前台/后台）</b></p>
           <ul style="margin: 8px 0 0 18px;">
             <li>前台：CPU 平均 {fg_cpu_avg:.1f}% / 峰值 {fg_cpu_peak:.1f}%（{fg_n} 点）｜内存 平均 {fg_mem_avg:.1f}MB / 峰值 {fg_mem_peak:.1f}MB（{fg_n_m} 点）</li>
             <li>后台：CPU 平均 {bg_cpu_avg:.1f}% / 峰值 {bg_cpu_peak:.1f}%（{bg_n} 点）｜内存 平均 {bg_mem_avg:.1f}MB / 峰值 {bg_mem_peak:.1f}MB（{bg_n_m} 点）</li>
           </ul>
+          {device_stats_html}
         </div>
+        <h3>待测应用 CPU / 内存（按前台/后台）</h3>
         <div style="margin: 20px 0;">
             <canvas id="cpuChart" style="max-width: 100%; height: 400px;"></canvas>
         </div>
         <div style="margin: 20px 0;">
             <canvas id="memoryChart" style="max-width: 100%; height: 400px;"></canvas>
         </div>
+        {device_charts_html}
         
         <script src="https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js"></script>
         <script>
@@ -1884,7 +2014,7 @@ class StabilityReportGenerator:
                     responsive: true,
                     maintainAspectRatio: false,
                     plugins: {{
-                        title: {{ display: true, text: 'CPU使用率随时间变化（按前台/后台）' }},
+                        title: {{ display: true, text: '待测应用 CPU 使用率（按前台/后台）' }},
                         legend: {{ display: true }},
                         tooltip: {{ mode: 'index', intersect: false }}
                     }},
@@ -1925,7 +2055,7 @@ class StabilityReportGenerator:
                     responsive: true,
                     maintainAspectRatio: false,
                     plugins: {{
-                        title: {{ display: true, text: '内存使用随时间变化（按前台/后台）' }},
+                        title: {{ display: true, text: '待测应用内存使用（按前台/后台）' }},
                         legend: {{ display: true }},
                         tooltip: {{ mode: 'index', intersect: false }}
                     }},
@@ -1936,8 +2066,9 @@ class StabilityReportGenerator:
                     }}
                 }}
             }});
+            {device_charts_script}
         </script>
-        <p style="color: #6c757d; font-size: 0.9em;">共 {len(labels)} 个采样点（展示最近 {min(cap, len(labels))} 个）。mode 字段含义：foreground=前台，background=后台。</p>
+        <p style="color: #6c757d; font-size: 0.9em;">共 {len(labels)} 个采样点（展示最近 {min(cap, len(labels))} 个）。含待测应用与设备总体 CPU/内存。</p>
         """
         except Exception as e:
             logging.warning(f"生成performance_sampling.jsonl可视化图表失败: {e}")
