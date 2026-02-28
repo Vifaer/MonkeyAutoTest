@@ -32,9 +32,32 @@ dependencies = [
   "pandas>=1.5.0",
 ]
 
+[project.optional-dependencies]
+dev = ["ruff>=0.1.0"]
+
 [project.urls]
 Homepage = "https://example.com/monkey-auto-test"
 
 [tool.uv]
 # 这里保留默认配置，使用全局/用户 uv 设置。
 # 如需企业内网镜像，可在本地 uv 配置中设置 index-url，而不是写死在项目里。
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+exclude = ["tools", "build", "dist", ".git", "apks", "baselines", "conf"]
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # Pyflakes
+    "I",      # isort
+    "B",      # flake8-bugbear
+    "C4",     # flake8-comprehensions
+    "UP",     # pyupgrade
+]
+ignore = ["E501"]  # line too long handled by formatter
+
+[tool.ruff.lint.isort]
+known-first-party = ["utils", "libs"]

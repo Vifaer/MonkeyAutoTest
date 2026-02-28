@@ -11,7 +11,7 @@ tests/
 │   └── __init__.py
 └── integration/                 # 集成测试（依赖设备/ADB/网络/Mock）
     ├── __init__.py
-    ├── test_system_robustness.py    # 系统健壮性测试
+    ├── test_system_robustness.py    # Monkey 模式压力测试
     ├── test_exception_recovery.py   # 异常恢复测试
     └── test_performance.py          # 性能测试
 ```
@@ -25,7 +25,7 @@ tests/
 pytest tests/
 
 # 运行特定模块的测试
-pytest tests/ -m system_robustness
+pytest tests/ -m monkey_stress
 pytest tests/ -m exception_recovery
 pytest tests/ -m performance
 
@@ -49,8 +49,8 @@ python main.py --stability -s device_sn --apk-path path/to/app.apk
 ### 模块化测试
 
 ```bash
-# 仅运行系统健壮性测试
-pytest tests/ -m system_robustness
+# 仅运行 Monkey 模式压力测试
+pytest tests/ -m monkey_stress
 
 # 仅运行异常恢复测试
 pytest tests/ -m exception_recovery
@@ -72,7 +72,7 @@ pytest 支持以下自定义参数（通过 conftest.py 定义）：
 - `--device-sn`: 设备序列号
 - `--apk-path`: APK 包本地路径
 - `--apk-url`: APK 包网络地址
-- `--module-robustness`: 启用系统健壮性测试模块
+- `--module-robustness`: 启用 Monkey 模式压力测试模块
 - `--module-recovery`: 启用异常恢复测试模块
 - `--module-performance`: 启用完整性能测试模块
 - `--module-response`: 启用响应性能测试模块
@@ -83,7 +83,7 @@ pytest 支持以下自定义参数（通过 conftest.py 定义）：
 ## 测试标记（Markers）
 
 - `@pytest.mark.stability`: 稳定性测试标记
-- `@pytest.mark.system_robustness`: 系统健壮性测试标记
+- `@pytest.mark.monkey_stress`: Monkey 模式压力测试标记
 - `@pytest.mark.exception_recovery`: 异常恢复测试标记
 - `@pytest.mark.performance`: 性能测试标记
 - `@pytest.mark.performance_response`: 响应性能测试标记
@@ -142,7 +142,7 @@ pytest 配置文件：`pytest.ini`
 
 1. **设备连接**：运行测试前确保设备已连接并通过 `adb devices` 验证
 2. **APK 路径**：必须提供有效的 APK 包路径（通过 `--apk-path` 参数或配置文件）
-3. **长时间测试**：系统健壮性测试可能需要数小时，使用 `-m slow` 标记可以跳过这些测试
+3. **长时间测试**：Monkey 模式压力测试可能需要数小时，使用 `-m slow` 标记可以跳过这些测试
 4. **Mock Server**：某些测试需要 Mock Server，确保 Mock Server 已正确配置和启动
 
 ## 迁移说明

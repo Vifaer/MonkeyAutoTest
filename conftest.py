@@ -33,7 +33,7 @@ DEFAULT_RESPONSE_MONITOR = {
 def pytest_configure(config):
     """pytest 配置钩子：注册自定义标记"""
     config.addinivalue_line("markers", "stability: 稳定性测试标记")
-    config.addinivalue_line("markers", "system_robustness: 系统健壮性测试标记")
+    config.addinivalue_line("markers", "monkey_stress: Monkey 模式压力测试标记")
     config.addinivalue_line("markers", "exception_recovery: 异常恢复测试标记")
     config.addinivalue_line("markers", "performance: 性能测试标记")
     config.addinivalue_line("markers", "performance_response: 响应性能测试标记")
@@ -51,7 +51,7 @@ def pytest_collection_modifyitems(config, items):
         # 根据测试名称自动添加标记
         test_name = item.name.lower()
         if "robustness" in test_name or "stress" in test_name or "monkey" in test_name:
-            item.add_marker(pytest.mark.system_robustness)
+            item.add_marker(pytest.mark.monkey_stress)
             item.add_marker(pytest.mark.stability)
         elif "exception" in test_name or "recovery" in test_name:
             item.add_marker(pytest.mark.exception_recovery)
@@ -215,6 +215,8 @@ def test_config(pytestconfig):
                 continue
             if v is not None:
                 rm_merged[k] = v
+    # 顶层 response_monitor，供 stability_test 注入到 broadcast_stress/tts_stress 的 cfg（含 anr_recover_threshold=0 时禁用自动恢复）
+    default_config['response_monitor'] = rm_merged
     if isinstance(gui_config, dict) and 'broadcast_stress' in gui_config:
         bc = gui_config['broadcast_stress']
         if isinstance(bc, dict):
@@ -356,7 +358,7 @@ def modular_framework(device_sn, package, test_config, pytestconfig):
     # 从命令行参数获取启用的模块
     enabled_modules = []
     if pytestconfig.getoption("--module-robustness", default=False):
-        enabled_modules.append(TestModule.SYSTEM_ROBUSTNESS)
+        enabled_modules.append(TestModule.MONKEY_STRESS)
     if pytestconfig.getoption("--module-recovery", default=False):
         enabled_modules.append(TestModule.EXCEPTION_RECOVERY)
     if pytestconfig.getoption("--module-performance", default=False):
@@ -373,7 +375,7 @@ def modular_framework(device_sn, package, test_config, pytestconfig):
     # 如果没有指定模块，默认启用所有
     if not enabled_modules:
         enabled_modules = [
-            TestModule.SYSTEM_ROBUSTNESS,
+            TestModule.MONKEY_STRESS,
             TestModule.EXCEPTION_RECOVERY,
             TestModule.PERFORMANCE_ALL
         ]
@@ -446,7 +448,7 @@ def pytest_addoption(parser):
         "--module-robustness",
         action="store_true",
         default=False,
-        help="启用系统健壮性测试模块"
+        help="启用 Monkey 模式压力测试模块"
     )
     parser.addoption(
         "--module-recovery",

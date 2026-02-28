@@ -38,3 +38,117 @@ def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]
             result[k] = v
     return result
 
+
+def load_stability_config(config_path: str | Path | None = None) -> Dict[str, Any]:
+    """
+    统一加载稳定性测试配置。
+    
+    优先级：
+    1. 命令行/GUI 传入的 config_path
+    2. conf/test_ui_config.json
+    3. conf/project.json 中的 stability_test.stability_config
+    4. 内建默认值
+    
+    Returns:
+        合并后的配置字典，包含 long_stress、performance、exception_recovery 等段
+    """
+    import os
+    import logging
+    
+    # 内建默认配置
+    default_config = {
+        'long_stress': {
+            'duration_hours': 12,
+            'throttle': 700,
+            'event_count': 100000
+        },
+        'performance': {
+            'sample_interval': 30,
+            'monitor_duration': 3600,
+            'cold_start_threshold': 3.0,
+            'response_delay_threshold': 1.5,
+            'cpu_foreground_threshold': 30.0,
+            'cpu_background_threshold': 1.0
+        },
+        'exception_recovery': {
+            'network_disconnect_duration': 30,
+            'weak_network_duration': 60,
+            'mock_server_enabled': True,
+            'network_proxy_enabled': True
+        },
+        'broadcast_stress': {
+            'duration_hours': 12,
+            'interval_seconds': 30,
+            'broadcast_action': 'com.cei.llm.INPUT_HINT_TO_LLM',
+            'hints': [],
+            'hints_file': ''
+        },
+        'tts_stress': {
+            'duration_hours': 12,
+            'interval_seconds': 30,
+            'texts': [],
+            'texts_file': ''
+        }
+    }
+    
+    config = dict(default_config)
+    
+    # 优先级 3: 从 project.json 加载 stability_test.stability_config
+    try:
+        project_cfg = read_json("conf/project.json", default={})
+        if isinstance(project_cfg, dict):
+            stability_test = project_cfg.get("stability_test", {})
+            if isinstance(stability_test, dict):
+                stability_config = stability_test.get("stability_config", {})
+                if isinstance(stability_config, dict):
+                    config = deep_merge(config, stability_config)
+    except Exception as e:
+        logging.debug("从 project.json 加载配置失败: %s", e)
+    
+    # 优先级 2: 从 test_ui_config.json 加载
+    try:
+        gui_cfg_path = os.path.join("conf", "test_ui_config.json")
+        gui_cfg = read_json(gui_cfg_path, default={})
+        if isinstance(gui_cfg, dict):
+            # 合并 mock_server
+            ms = gui_cfg.get("mock_server")
+            if isinstance(ms, dict):
+                if "mock_server" not in config:
+                    config["mock_server"] = {}
+                config["mock_server"].update(ms)
+            
+            # 合并 monkey_mask 到 long_stress
+            mm = gui_cfg.get("monkey_mask")
+            if isinstance(mm, dict):
+                if "long_stress" not in config:
+                    config["long_stress"] = {}
+                config["long_stress"]["monkey_mask"] = mm
+            
+            # 合并 broadcast_stress
+            bs = gui_cfg.get("broadcast_stress")
+            if isinstance(bs, dict):
+                config["broadcast_stress"] = deep_merge(config.get("broadcast_stress", {}), bs)
+            
+            # 合并 tts_stress
+            ts = gui_cfg.get("tts_stress")
+            if isinstance(ts, dict):
+                config["tts_stress"] = deep_merge(config.get("tts_stress", {}), ts)
+            
+            # 合并 response_monitor
+            rm = gui_cfg.get("response_monitor")
+            if isinstance(rm, dict):
+                config["response_monitor"] = rm
+    except Exception as e:
+        logging.debug("从 test_ui_config.json 加载配置失败: %s", e)
+    
+    # 优先级 1: 命令行/GUI 传入的 config_path
+    if config_path:
+        try:
+            override_cfg = read_json(config_path, default={})
+            if isinstance(override_cfg, dict):
+                config = deep_merge(config, override_cfg)
+        except Exception as e:
+            logging.warning("加载指定配置文件失败: %s", e)
+    
+    return config
+

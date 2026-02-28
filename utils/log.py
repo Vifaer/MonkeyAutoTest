@@ -6,9 +6,52 @@ import shutil
 import datetime
 import logging
 import re
+from typing import Optional
 
 LOG_ROOT = "logs"
 HISTORY_ROOT = "history_logs"
+
+
+def setup_logging(level: int = logging.INFO, log_file: Optional[str] = None, encoding: str = 'utf-8') -> None:
+    """
+    统一配置日志系统，避免重复 basicConfig。
+    
+    Args:
+        level: 日志级别，默认 INFO
+        log_file: 日志文件路径，None 表示只输出到控制台
+        encoding: 文件编码，默认 utf-8
+    """
+    # 检查是否已有 handler，避免重复配置
+    root_logger = logging.getLogger()
+    if root_logger.handlers:
+        # 已有 handler，只更新级别
+        root_logger.setLevel(level)
+        return
+    
+    # 配置格式
+    formatter = logging.Formatter(
+        '[%(asctime)s] [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # 控制台 handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(level)
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
+    
+    # 文件 handler（如果指定）
+    if log_file:
+        try:
+            os.makedirs(os.path.dirname(log_file), exist_ok=True)
+            file_handler = logging.FileHandler(log_file, mode='a', encoding=encoding)
+            file_handler.setLevel(level)
+            file_handler.setFormatter(formatter)
+            root_logger.addHandler(file_handler)
+        except Exception as e:
+            logging.warning("创建日志文件失败: %s", e)
+    
+    root_logger.setLevel(level)
 
 
 class ProjectLog:
@@ -20,14 +63,8 @@ class ProjectLog:
     def set_up(self):
         # 不再整体删除 logs 目录，改为在其中追加/复用 log.txt，保留历史运行结果。
         os.makedirs(self.log_root, exist_ok=True)
-        # 初始化logging（追加模式）
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s [%(levelname)s] %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-            filename=self.log_path,
-            filemode="a"
-        )
+        # 使用统一的日志配置函数
+        setup_logging(level=logging.INFO, log_file=self.log_path)
 
     def tear_down(self):
         # 创建历史结果目录

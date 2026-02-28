@@ -72,13 +72,9 @@ try:
 except:
     pass
 
-# 设置日志编码
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-    encoding='utf-8'
-)
+# 使用统一的日志配置（避免重复 basicConfig）
+from utils.log import setup_logging
+setup_logging(level=logging.INFO)
 
 # 添加项目根目录到路径
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -129,6 +125,7 @@ from utils.stability_test import StabilityTestFramework, StabilityTestRunner
 from utils import Package
 from utils import mock_server as mock_server_mod
 from utils.config_io import read_json, write_json
+from utils.report_regenerator import regenerate_report
 
 
 class ToolTip:
@@ -147,11 +144,61 @@ class ToolTip:
         self.tip_window = None
         self.id = None
         self.x = self.y = 0
+        # 防止被垃圾回收：将自身挂到控件上
+        try:
+            setattr(self.widget, "_tooltip", self)
+        except Exception:
+            pass
+        # 为有提示的控件增加统一的视觉标识（如下划线或“ⓘ”）
+        self._mark_widget_with_hint()
         
         # 绑定事件
         self.widget.bind('<Enter>', self.on_enter)
         self.widget.bind('<Leave>', self.on_leave)
         self.widget.bind('<Motion>', self.on_motion)
+    
+    def _mark_widget_with_hint(self):
+        """为绑定了 Tooltip 的控件增加统一的视觉标识（幂等）"""
+        w = self.widget
+        try:
+            # 已经标记过则不重复处理
+            if getattr(w, "_has_tooltip_marker", False):
+                return
+            # 仅对常见文本控件添加标记，避免影响 Entry/Text 等输入内容
+            text_widgets = (tk.Label, tk.Checkbutton, tk.Radiobutton, ttk.Label, ttk.Checkbutton, ttk.Radiobutton)
+            if isinstance(w, text_widgets):
+                # 优先尝试使用带下划线的字体
+                try:
+                    font_name = w.cget("font")
+                except Exception:
+                    font_name = ""
+                if font_name:
+                    try:
+                        base_font = tkfont.nametofont(font_name)
+                        marker_font = base_font.copy()
+                        marker_font.configure(underline=1)
+                        w.configure(font=marker_font)
+                        setattr(w, "_tooltip_font", marker_font)
+                    except Exception:
+                        # 退化为在文本末尾追加“ⓘ”
+                        try:
+                            text = w.cget("text")
+                            if text and "ⓘ" not in text:
+                                w.configure(text=f"{text} ⓘ")
+                        except Exception:
+                            pass
+                else:
+                    # 没有字体配置时，仅追加“ⓘ”标记
+                    try:
+                        text = w.cget("text")
+                        if text and "ⓘ" not in text:
+                            w.configure(text=f"{text} ⓘ")
+                    except Exception:
+                        pass
+                setattr(w, "_has_tooltip_marker", True)
+        except Exception:
+            # 任何异常都静默忽略，不影响主界面
+            pass
     
     def on_enter(self, event=None):
         """鼠标进入时，延迟显示提示"""
@@ -267,7 +314,7 @@ class MonkeyTestGUI:
         # 测试配置相关变量（便于弹窗和主界面共享）
         self.test_mode_var = tk.StringVar(value="comprehensive")
         self.module_vars = {
-            'system_robustness': tk.BooleanVar(value=True),
+            'monkey_stress': tk.BooleanVar(value=True),
             'exception_recovery': tk.BooleanVar(value=True),
             'performance_response': tk.BooleanVar(value=False),
             'performance_all': tk.BooleanVar(value=True),
@@ -303,12 +350,15 @@ class MonkeyTestGUI:
         self.broadcast_hints_file_var = tk.StringVar(value="")
         self.tts_texts_var = tk.StringVar(value="打开设置\n介绍一下北京\n今天天气怎么样")
         self.tts_texts_file_var = tk.StringVar(value="")
+        self.tts_end_phrase_var = tk.StringVar(value="")
+        self.tts_wake_phrase_var = tk.StringVar(value="")
+        self.tts_wake_delay_var = tk.StringVar(value="2")
         # 响应监控参数（广播/TTS 共用，当前仅 logcat 模式，不再支持 UI 正则；发送后立即开始监控）
         self.response_monitor_max_wait_appear_var = tk.StringVar(value="6")
         self.response_monitor_check_interval_var = tk.StringVar(value="0.1")
         self.response_monitor_max_wait_disappear_var = tk.StringVar(value="300")
-        # 连续失败自动恢复：最大允许连续无响应次数（0 表示不启用自动恢复）
-        self.response_monitor_max_failure_count_var = tk.StringVar(value="0")
+        # 连续 ANR/无响应后自动恢复的触发阈值（次数），默认 1 次即触发
+        self.response_monitor_anr_recover_threshold_var = tk.StringVar(value="1")
         self._mock_server = None
         self._mock_server_started_by_gui = False
         self._mock_status_label = None
@@ -369,6 +419,15 @@ class MonkeyTestGUI:
             "BUTTON": 10,
             "MONO": 9,
         }
+        # 最小字体大小约束（避免高 DPI 小窗口下过小）
+        self._font_min_sizes = {
+            "TITLE": 12,
+            "SUBTITLE": 11,
+            "BODY": 10,
+            "CAPTION": 8,
+            "BUTTON": 10,
+            "MONO": 9,
+        }
         self._init_font_objects()
 
         # 加载配置
@@ -421,7 +480,10 @@ class MonkeyTestGUI:
             for name, base in self._font_base_sizes.items():
                 font_obj = getattr(UIFonts, name, None)
                 if isinstance(font_obj, tkfont.Font):
-                    new_size = max(8, int(round(base * scale)))
+                    new_size = int(round(base * scale))
+                    # 应用最小字体约束
+                    min_size = self._font_min_sizes.get(name, new_size)
+                    new_size = max(new_size, min_size)
                     font_obj.configure(size=new_size)
         except Exception:
             pass
@@ -682,11 +744,11 @@ class MonkeyTestGUI:
         # 模块选择区域
         self.modules_frame = ttk.LabelFrame(stability_frame, text="自定义模块组合")
         self.modules_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), padx=5, pady=5)
-        ToolTip(self.modules_frame, "选择要执行的稳定性测试模块：系统健壮性（长时间压力）、异常恢复（网络/数据异常）、完整性能、仅响应性能等。勾选后将运行相应测试。")
+        ToolTip(self.modules_frame, "选择要执行的稳定性测试模块：Monkey 模式压力测试（长时间压力）、异常恢复（网络/数据异常）、完整性能、仅响应性能等。勾选后将运行相应测试。")
 
         # 模块复选框变量
         self.module_vars = {
-            'system_robustness': tk.BooleanVar(value=True),
+            'monkey_stress': tk.BooleanVar(value=True),
             'exception_recovery': tk.BooleanVar(value=True),
             'performance_response': tk.BooleanVar(value=False),
             'performance_all': tk.BooleanVar(value=True),
@@ -694,9 +756,9 @@ class MonkeyTestGUI:
             'tts_stress': tk.BooleanVar(value=False),
         }
 
-        # 系统健壮性测试
-        ttk.Checkbutton(self.modules_frame, text="系统健壮性测试 (长时间压力测试)",
-                        variable=self.module_vars['system_robustness']).grid(row=0, column=0, columnspan=2, sticky=tk.W, padx=5, pady=2)
+        # Monkey 模式压力测试
+        ttk.Checkbutton(self.modules_frame, text="Monkey 模式压力测试 (长时间压力测试)",
+                        variable=self.module_vars['monkey_stress']).grid(row=0, column=0, columnspan=2, sticky=tk.W, padx=5, pady=2)
 
         # 异常恢复测试
         ttk.Checkbutton(self.modules_frame, text="异常恢复测试 (网络异常、数据异常)",
@@ -835,12 +897,14 @@ class MonkeyTestGUI:
         ttk.Button(button_frame, text="刷新报告列表", command=self.refresh_reports).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="打开报告", command=self.open_selected_report).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="删除报告", command=self.delete_selected_report).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="♻ 重构报告", command=self.refactor_selected_report).pack(side=tk.LEFT, padx=5)
 
         # 报告预览
         ttk.Label(reports_frame, text="报告预览", font=("Arial", 12, "bold")).grid(row=3, column=0, columnspan=2, sticky=tk.W, padx=5, pady=10)
 
         self.report_preview = scrolledtext.ScrolledText(reports_frame, height=15, wrap=tk.WORD)
         self.report_preview.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), padx=5, pady=5)
+        self.reports_listbox.bind("<<ListboxSelect>>", self._on_report_selection_changed)
 
         # 配置网格权重
         reports_frame.columnconfigure(0, weight=1)
@@ -1241,7 +1305,7 @@ class MonkeyTestGUI:
 
         enabled = [k for k, v in self.module_vars.items() if v.get()]
         name_map = {
-            "system_robustness": "系统健壮性",
+            "monkey_stress": "Monkey 模式压力测试",
             "exception_recovery": "异常恢复",
             "performance_all": "完整性能",
             "performance_response": "响应性能",
@@ -1537,7 +1601,7 @@ class MonkeyTestGUI:
         return os.path.join("conf", "test_ui_config.json")
 
     def _get_broadcast_hints_for_config(self):
-        """获取广播 hints 配置：优先从配置弹窗的文本框读取，否则从 var"""
+        """获取广播Hints配置：优先从配置弹窗的文本框读取，否则从 var"""
         try:
             w = getattr(self, "_broadcast_hints_text", None)
             if w and w.winfo_exists():
@@ -1582,13 +1646,18 @@ class MonkeyTestGUI:
             "check_interval": _num("response_monitor_check_interval_var", 0.1),
             "max_wait_for_disappear": _num("response_monitor_max_wait_disappear_var", 300),
         }
-        # 最大失败次数（整数），0 表示不启用自动恢复
+        # 连续 ANR/无响应次数阈值：0 表示禁用自动恢复，>0 表示连续 N 次后触发
         try:
-            v = getattr(self, "response_monitor_max_failure_count_var", None)
+            v = getattr(self, "response_monitor_anr_recover_threshold_var", None)
             if v is not None:
-                cfg["max_failure_count"] = int(float(v.get() or "0"))
+                threshold = int(float(v.get() or "1"))
+            else:
+                threshold = 1
         except Exception:
-            cfg["max_failure_count"] = 0
+            threshold = 1
+        if threshold < 0:
+            threshold = 0
+        cfg["anr_recover_threshold"] = threshold
         return cfg
 
     def _collect_test_ui_config(self):
@@ -1669,6 +1738,9 @@ class MonkeyTestGUI:
             "tts_stress": {
                 "texts": self._get_tts_texts_for_config(),
                 "texts_file": getattr(self, "tts_texts_file_var", tk.StringVar(value="")).get().strip(),
+                "end_phrase": getattr(self, "tts_end_phrase_var", tk.StringVar(value="")).get().strip(),
+                "wake_phrase": getattr(self, "tts_wake_phrase_var", tk.StringVar(value="")).get().strip(),
+                "wake_delay_seconds": getattr(self, "tts_wake_delay_var", tk.StringVar(value="2")).get().strip(),
             },
             "response_monitor": self._get_response_monitor_for_config(),
         }
@@ -1829,6 +1901,12 @@ class MonkeyTestGUI:
                 self.tts_texts_var.set("\n".join(str(t) for t in tts["texts"]))
             if "texts_file" in tts:
                 self.tts_texts_file_var.set(str(tts["texts_file"]))
+            if "end_phrase" in tts:
+                self.tts_end_phrase_var.set(str(tts["end_phrase"] or ""))
+            if "wake_phrase" in tts:
+                self.tts_wake_phrase_var.set(str(tts["wake_phrase"] or ""))
+            if "wake_delay_seconds" in tts and tts["wake_delay_seconds"] is not None:
+                self.tts_wake_delay_var.set(str(tts["wake_delay_seconds"]))
 
         rm = cfg.get("response_monitor")
         if isinstance(rm, dict):
@@ -1838,8 +1916,8 @@ class MonkeyTestGUI:
                 self.response_monitor_check_interval_var.set(str(rm["check_interval"]))
             if "max_wait_for_disappear" in rm and rm["max_wait_for_disappear"] is not None:
                 self.response_monitor_max_wait_disappear_var.set(str(rm["max_wait_for_disappear"]))
-            if "max_failure_count" in rm and rm["max_failure_count"] is not None:
-                self.response_monitor_max_failure_count_var.set(str(rm["max_failure_count"]))
+            if "anr_recover_threshold" in rm and rm["anr_recover_threshold"] is not None:
+                self.response_monitor_anr_recover_threshold_var.set(str(rm["anr_recover_threshold"]))
 
         # 确保模块区启用/禁用状态正确
         self.on_test_mode_changed()
@@ -1866,8 +1944,31 @@ class MonkeyTestGUI:
             self._suppress_autosave = True
             self._apply_test_ui_config(cfg)
             self._last_saved_test_cfg = cfg
+            
+            # 加载 GUI 特定配置（字体、窗口大小等）
+            gui_cfg = cfg.get("gui", {})
+            if isinstance(gui_cfg, dict):
+                # 最小窗口大小
+                min_width = gui_cfg.get("min_window_width")
+                min_height = gui_cfg.get("min_window_height")
+                if min_width and min_height:
+                    try:
+                        self.root.minsize(int(min_width), int(min_height))
+                    except Exception:
+                        pass
+                
+                # 字体缩放
+                font_scale = gui_cfg.get("font_scale")
+                if font_scale:
+                    try:
+                        scale_factor = float(font_scale)
+                        for name in self._font_base_sizes:
+                            self._font_base_sizes[name] = int(self._font_base_sizes.get(name, 11) * scale_factor)
+                        self._scale_fonts(self.root.winfo_width())
+                    except Exception:
+                        pass
         except Exception as e:
-            logging.warning(f"加载测试配置失败: {e}")
+            logging.warning("加载测试配置失败: %s", e)
         finally:
             self._suppress_autosave = False
 
@@ -1963,7 +2064,7 @@ class MonkeyTestGUI:
 
     def open_latest_safe_region_overlay(self):
         """
-        打开当前设备最近一次系统健壮性测试生成的 safe_region_overlay.png。
+        打开当前设备最近一次 Monkey 模式压力测试生成的 safe_region_overlay.png。
         查找规则：
         logs/<sn>/<时间戳>/safe_region_overlay.png （按时间戳子目录从新到旧）
         若未找到，再退回 logs/<sn>/safe_region_overlay.png（例如仅做预览时生成）
@@ -2001,7 +2102,7 @@ class MonkeyTestGUI:
                 candidate = p
 
         if not candidate:
-            messagebox.showinfo("提示", "未找到最近的遮罩图文件，请先运行一次系统健壮性测试或生成遮罩预览。")
+            messagebox.showinfo("提示", "未找到最近的遮罩图文件，请先运行一次 Monkey 模式压力测试或生成遮罩预览。")
             return
 
         try:
@@ -2791,13 +2892,15 @@ class MonkeyTestGUI:
         btns.grid(row=0, column=6, rowspan=2, padx=(0, 10), pady=8, sticky="e")
         self.create_action_button(btns, text="🔄 刷新", command=lambda: _refresh(), variant="success", side=tk.LEFT, padx=(0, 8))
         self.create_action_button(btns, text="📖 打开", command=lambda: _open_selected(), variant="primary", side=tk.LEFT, padx=(0, 8))
-        self.create_action_button(btns, text="🗑️ 删除", command=lambda: _delete_selected(), variant="error", side=tk.LEFT)
+        self.create_action_button(btns, text="🗑️ 删除", command=lambda: _delete_selected(), variant="error", side=tk.LEFT, padx=(0, 8))
+        self.create_action_button(btns, text="♻ 重构", command=lambda: _refactor_selected(), variant="warning", side=tk.LEFT)
 
         # 列表区（Treeview）
         body = tk.Frame(win, bg=UIColors.WHITE, relief="raised", bd=1)
         body.pack(fill=tk.BOTH, expand=True, padx=15, pady=(0, 15))
 
-        columns = ("project", "sn", "device_ver", "pkg", "app_ver", "status", "time", "size", "file")
+        # 增加“已运行时间”列
+        columns = ("project", "sn", "device_ver", "pkg", "app_ver", "status", "runtime", "time", "size", "file")
         tree = ttk.Treeview(body, columns=columns, show="headings", height=18, selectmode="extended")
         tree.heading("project", text="测试项目")
         tree.heading("sn", text="设备SN")
@@ -2805,18 +2908,31 @@ class MonkeyTestGUI:
         tree.heading("pkg", text="应用包名")
         tree.heading("app_ver", text="应用版本")
         tree.heading("status", text="状态")
+        tree.heading("runtime", text="已运行时间")
         tree.heading("time", text="时间")
         tree.heading("size", text="大小")
         tree.heading("file", text="文件名")
-        tree.column("project", width=120, anchor="w")
-        tree.column("sn", width=90, anchor="w")
-        tree.column("device_ver", width=160, anchor="w")
-        tree.column("pkg", width=220, anchor="w")
-        tree.column("app_ver", width=140, anchor="w")
-        tree.column("status", width=100, anchor="w")
-        tree.column("time", width=160, anchor="w")
-        tree.column("size", width=80, anchor="e")
-        tree.column("file", width=260, anchor="w")
+
+        # 计算“8 个字符”对应的大致像素宽度，作为各列默认宽度上限
+        try:
+            base_font = tkfont.nametofont(tree.cget("font"))
+            char8_width = base_font.measure("中" * 8)
+        except Exception:
+            # 兜底：给一个相对保守的默认宽度
+            char8_width = 120
+
+        # 大部分列默认宽度约为 8 个字符，文件名/包名等信息列适当放大一些，
+        # 用户仍可手动拖拽列宽查看更多内容。
+        tree.column("project", width=char8_width, anchor="w", stretch=True)
+        tree.column("sn", width=int(char8_width * 0.8), anchor="w", stretch=True)
+        tree.column("device_ver", width=char8_width, anchor="w", stretch=True)
+        tree.column("pkg", width=int(char8_width * 1.5), anchor="w", stretch=True)
+        tree.column("app_ver", width=char8_width, anchor="w", stretch=True)
+        tree.column("status", width=int(char8_width * 0.9), anchor="w", stretch=True)
+        tree.column("runtime", width=char8_width, anchor="w", stretch=True)
+        tree.column("time", width=char8_width, anchor="w", stretch=True)
+        tree.column("size", width=int(char8_width * 0.8), anchor="e", stretch=True)
+        tree.column("file", width=int(char8_width * 1.5), anchor="w", stretch=True)
 
         vsb = ttk.Scrollbar(body, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=vsb.set)
@@ -2862,8 +2978,9 @@ class MonkeyTestGUI:
                 with open(json_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 meta = {}
-                dev = (data.get("device_info") or data.get("detailed_results", {}).get("device_info") or {})
-                pkg = (data.get("package_info") or data.get("detailed_results", {}).get("package_info") or {})
+                detailed = data.get("detailed_results") if isinstance(data.get("detailed_results"), dict) else {}
+                dev = (data.get("device_info") or detailed.get("device_info") or {})
+                pkg = (data.get("package_info") or detailed.get("package_info") or {})
                 m = (data.get("metadata") or {})
                 meta["sn"] = dev.get("sn", "")
                 meta["pkg"] = pkg.get("name", "")
@@ -2872,9 +2989,53 @@ class MonkeyTestGUI:
                 # 版本信息：优先使用 metadata 中预计算的字段，其次回退到 device_info / package_info
                 meta["device_version"] = m.get("device_version") or dev.get("build_display_id") or dev.get("os", "")
                 meta["app_version"] = m.get("app_version") or pkg.get("version_name", "")
+                # 运行时间相关字段：尽力从最终报告结构中提取 start/end_time
+                if detailed:
+                    meta["start_time"] = detailed.get("start_time")
+                    meta["end_time"] = detailed.get("end_time") or m.get("generated_at")
                 return meta
             except Exception:
                 return {}
+
+        def _compute_runtime_str_from_meta(jmeta: dict, fallback_time: str) -> str:
+            """基于 JSON 元数据的 start/end_time 计算已运行时间；失败时返回 '-'。"""
+            from datetime import datetime as _dt
+            if not isinstance(jmeta, dict):
+                return "-"
+            start = jmeta.get("start_time")
+            end = jmeta.get("end_time") or jmeta.get("generated_at") or fallback_time
+            if not start or not end:
+                return "-"
+            try:
+                s = _dt.fromisoformat(str(start).replace("Z", "+00:00"))
+                e = _dt.fromisoformat(str(end).replace("Z", "+00:00"))
+                if s.tzinfo:
+                    s = s.replace(tzinfo=None)
+                if e.tzinfo:
+                    e = e.replace(tzinfo=None)
+            except Exception:
+                return "-"
+            if e <= s:
+                return "0小时0分钟"
+            delta = e - s
+            seconds = int(delta.total_seconds())
+            hours = seconds // 3600
+            minutes = (seconds % 3600) // 60
+            return f"{hours}小时{minutes}分钟"
+
+        def _get_runtime_from_html(path: str) -> str:
+            """从统一/实时报告 HTML 中解析“已运行时间”一行。"""
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    head = f.read(8192)
+            except Exception:
+                return "-"
+            import re as _re
+            m = _re.search(r"<td>已运行时间</td><td>([^<]+)</td>", head)
+            if m:
+                text = m.group(1).strip()
+                return text or "-"
+            return "-"
 
         def _map_status_from_metadata(jmeta: dict, suffix: str, path: str) -> str:
             """基于 JSON 元数据优先判定报告状态，文件名/HTML 作为回退。"""
@@ -2932,6 +3093,10 @@ class MonkeyTestGUI:
                 pkg = jmeta.get("pkg") or ""
                 device_ver = jmeta.get("device_version") or ""
                 app_ver = jmeta.get("app_version") or ""
+                # 运行时间：优先用 JSON 中的 start/end_time 计算；否则从 HTML 中解析
+                runtime_str = _compute_runtime_str_from_meta(jmeta, mtime)
+                if runtime_str == "-":
+                    runtime_str = _get_runtime_from_html(path)
                 items.append({
                     "project": project,
                     "sn": sn,
@@ -2939,6 +3104,7 @@ class MonkeyTestGUI:
                     "pkg": pkg,
                     "app_version": app_ver,
                     "status": status,
+                    "runtime": runtime_str,
                     "time": mtime,
                     "size": f"{size_kb}KB",
                     "file": fn,
@@ -3005,6 +3171,7 @@ class MonkeyTestGUI:
                         i["pkg"],
                         i.get("app_version", ""),
                         i["status"],
+                        i.get("runtime", "-"),
                         i["time"],
                         i["size"],
                         i["file"],
@@ -3055,6 +3222,13 @@ class MonkeyTestGUI:
                 _refresh()
             except Exception as e:
                 messagebox.showerror("错误", str(e), parent=win)
+
+        def _refactor_selected():
+            paths = [p for p in _selected_paths() if p.lower().endswith(".html")]
+            if not paths:
+                messagebox.showwarning("提示", "请先选择至少一条 HTML 报告", parent=win)
+                return
+            self._do_refactor_reports(paths, parent=win)
 
         _refresh()
 
@@ -3132,8 +3306,51 @@ class MonkeyTestGUI:
             side=tk.LEFT
         )
 
+        self.create_action_button(
+            buttons_frame,
+            text="♻ 重构报告",
+            command=self.refactor_selected_report,
+            variant="warning",
+            side=tk.LEFT,
+            padx=(10, 0),
+        )
+
         # 初始刷新报告列表
         self.refresh_reports()
+
+    def refactor_selected_report(self):
+        """重构旧版报告选项卡中选中的单个报告"""
+        selection = self.reports_listbox.curselection()
+        if not selection:
+            messagebox.showwarning("警告", "请先选择一个报告文件")
+            return
+        index = selection[0]
+        report_file = self.report_file_map.get(index)
+        if not report_file:
+            display_text = self.reports_listbox.get(index)
+            report_file = display_text.split("|")[-1].strip() if "|" in display_text else display_text.strip()
+        if not report_file:
+            messagebox.showerror("错误", "无法获取报告文件名")
+            return
+        # 仅支持 HTML 报告，若选中 JSON，则尝试映射到同名 HTML
+        if report_file.lower().endswith(".json"):
+            base = os.path.splitext(report_file)[0]
+            html_candidate = base + ".html"
+            html_path = os.path.join("reports", html_candidate)
+            if not os.path.exists(html_path):
+                messagebox.showwarning("提示", "仅支持重构 HTML 报告，请选择 .html 文件")
+                return
+            report_file = html_candidate
+        elif not report_file.lower().endswith(".html"):
+            messagebox.showwarning("提示", "仅支持重构 HTML 报告，请选择 .html 文件")
+            return
+
+        report_path = os.path.join("reports", report_file)
+        if not os.path.exists(report_path):
+            messagebox.showerror("错误", "报告文件不存在: %s" % report_file)
+            return
+
+        self._do_refactor_reports([report_path], parent=self.root)
 
     def on_version_selected(self, event=None):
         """测试模块选择事件：同步 key、加载模块、更新模块说明（方案 C）"""
@@ -3251,43 +3468,43 @@ class MonkeyTestGUI:
         # 根据预设名称设置模块
         preset_configs = {
             "完整测试套件（全部模块）": {
-                'system_robustness': True,
+                'monkey_stress': True,
                 'exception_recovery': True,
                 'performance_all': True,
                 'performance_response': False,
             },
-            "仅系统健壮性": {
-                'system_robustness': True,
+            "仅 Monkey 压力测试": {
+                'monkey_stress': True,
                 'exception_recovery': False,
                 'performance_all': False,
                 'performance_response': False,
             },
             "仅异常恢复": {
-                'system_robustness': False,
+                'monkey_stress': False,
                 'exception_recovery': True,
                 'performance_all': False,
                 'performance_response': False,
             },
             "仅性能测试（完整）": {
-                'system_robustness': False,
+                'monkey_stress': False,
                 'exception_recovery': False,
                 'performance_all': True,
                 'performance_response': False,
             },
             "仅响应性能": {
-                'system_robustness': False,
+                'monkey_stress': False,
                 'exception_recovery': False,
                 'performance_all': False,
                 'performance_response': True,
             },
-            "健壮性+异常恢复": {
-                'system_robustness': True,
+            "Monkey 压力+异常恢复": {
+                'monkey_stress': True,
                 'exception_recovery': True,
                 'performance_all': False,
                 'performance_response': False,
             },
-            "健壮性+性能测试": {
-                'system_robustness': True,
+            "Monkey 压力+性能测试": {
+                'monkey_stress': True,
                 'exception_recovery': False,
                 'performance_all': True,
                 'performance_response': False,
@@ -3309,7 +3526,7 @@ class MonkeyTestGUI:
         try:
             # 获取当前选中的模块
             current_selection = {
-                'system_robustness': self.module_vars['system_robustness'].get(),
+                'monkey_stress': self.module_vars['monkey_stress'].get(),
                 'exception_recovery': self.module_vars['exception_recovery'].get(),
                 'performance_all': self.module_vars['performance_all'].get(),
                 'performance_response': self.module_vars['performance_response'].get(),
@@ -3318,43 +3535,43 @@ class MonkeyTestGUI:
             # 检查是否匹配预设组合
             preset_configs = {
                 "完整测试套件（全部模块）": {
-                    'system_robustness': True,
+                    'monkey_stress': True,
                     'exception_recovery': True,
                     'performance_all': True,
                     'performance_response': False,
                 },
-                "仅系统健壮性": {
-                    'system_robustness': True,
+                "仅 Monkey 压力测试": {
+                    'monkey_stress': True,
                     'exception_recovery': False,
                     'performance_all': False,
                     'performance_response': False,
                 },
                 "仅异常恢复": {
-                    'system_robustness': False,
+                    'monkey_stress': False,
                     'exception_recovery': True,
                     'performance_all': False,
                     'performance_response': False,
                 },
                 "仅性能测试（完整）": {
-                    'system_robustness': False,
+                    'monkey_stress': False,
                     'exception_recovery': False,
                     'performance_all': True,
                     'performance_response': False,
                 },
                 "仅响应性能": {
-                    'system_robustness': False,
+                    'monkey_stress': False,
                     'exception_recovery': False,
                     'performance_all': False,
                     'performance_response': True,
                 },
-                "健壮性+异常恢复": {
-                    'system_robustness': True,
+                "Monkey 压力+异常恢复": {
+                    'monkey_stress': True,
                     'exception_recovery': True,
                     'performance_all': False,
                     'performance_response': False,
                 },
-                "健壮性+性能测试": {
-                    'system_robustness': True,
+                "Monkey 压力+性能测试": {
+                    'monkey_stress': True,
                     'exception_recovery': False,
                     'performance_all': True,
                     'performance_response': False,
@@ -3462,12 +3679,12 @@ class MonkeyTestGUI:
             base_combos = [
                 "自定义",
                 "完整测试套件（全部模块）",
-                "仅系统健壮性",
+                "仅 Monkey 压力测试",
                 "仅异常恢复",
                 "仅性能测试（完整）",
                 "仅响应性能",
-                "健壮性+异常恢复",
-                "健壮性+性能测试"
+                "Monkey 压力+异常恢复",
+                "Monkey 压力+性能测试"
             ]
             
             # 加载保存的自定义组合
@@ -4293,69 +4510,126 @@ class MonkeyTestGUI:
         return True, None
 
     def refresh_reports(self):
-        """刷新报告列表，显示详细信息"""
-        self.reports_listbox.delete(0, tk.END)
-        # 清空文件映射字典
-        self.report_file_map = {}
+        """刷新报告列表（在后台线程执行 I/O，避免阻塞主线程）"""
+        def _do_refresh() -> list:
+            reports_dir = "reports"
+            if not os.path.exists(reports_dir):
+                return []
+            report_files = []
+            for file in os.listdir(reports_dir):
+                if file.endswith(('.html', '.json')):
+                    file_path = os.path.join(reports_dir, file)
+                    try:
+                        mtime = os.path.getmtime(file_path)
+                        file_time = datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')
+                        file_size = os.path.getsize(file_path)
+                        report_info = self._parse_report_filename(file)
+                        report_info['file_time'] = file_time
+                        report_info['file_size'] = file_size
+                        report_info['filename'] = file
+                        report_files.append(report_info)
+                    except Exception as e:
+                        logging.warning("解析报告文件信息失败 %s: %s", file, e)
+                        report_files.append({
+                            'filename': file, 'file_time': '', 'test_type': 'unknown',
+                            'status': 'unknown', 'device_sn': '', 'package_name': ''
+                        })
+            report_files.sort(key=lambda x: x.get('file_time', ''), reverse=True)
+            return report_files
 
-        reports_dir = "reports"
-        if not os.path.exists(reports_dir):
-            self.update_status("报告目录不存在")
+        def _on_done(files: list) -> None:
+            # 仅在 reports_listbox 已初始化时才更新旧版报告列表区域
+            if not hasattr(self, "reports_listbox") or self.reports_listbox is None:
+                # 控件尚未创建时静默跳过，避免在应用启动早期触发异常
+                if not files:
+                    self.update_status("报告目录不存在或为空")
+                return
+            self.reports_listbox.delete(0, tk.END)
+            self.report_file_map = {}
+            if not files:
+                self.update_status("报告目录不存在或为空")
+                return
+            for report_info in files:
+                display_text = self._format_report_display(report_info)
+                index = self.reports_listbox.size()
+                self.reports_listbox.insert(tk.END, display_text)
+                self.report_file_map[index] = report_info['filename']
+            self.update_status("报告列表已刷新，共 %d 个报告" % len(files))
+
+        def _run() -> None:
+            try:
+                files = _do_refresh()
+                self.root.after(0, lambda: _on_done(files))
+            except Exception as e:
+                logging.exception("刷新报告列表异常")
+                self.root.after(0, lambda: self.update_status("刷新报告列表失败: %s" % str(e)))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _strip_html_for_preview(self, html_str: str, max_chars: int = 2000) -> str:
+        """从 HTML 中提取纯文本用于预览，避免完整 HTML 导致卡顿。"""
+        if not html_str:
+            return ""
+        import re
+        text = re.sub(r"<script[^>]*>[\s\S]*?</script>", " ", html_str, flags=re.I)
+        text = re.sub(r"<style[^>]*>[\s\S]*?</style>", " ", text, flags=re.I)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        if len(text) > max_chars:
+            text = text[:max_chars] + "..."
+        return text
+
+    def _on_report_selection_changed(self, event=None) -> None:
+        """列表选中变化时在后台加载报告摘要并更新预览（纯文本，避免大 HTML 卡顿）。"""
+        sel = self.reports_listbox.curselection()
+        if not sel:
             return
+        index = sel[0]
+        report_file = self.report_file_map.get(index)
+        if not report_file:
+            display_text = self.reports_listbox.get(index)
+            report_file = display_text.split("|")[-1].strip() if "|" in display_text else display_text.strip()
+        if not report_file:
+            return
+        report_path = os.path.join("reports", report_file)
 
-        # 收集所有报告文件及其信息
-        report_files = []
-        for file in os.listdir(reports_dir):
-            if file.endswith(('.html', '.json')):
-                file_path = os.path.join(reports_dir, file)
-                try:
-                    # 获取文件修改时间
-                    mtime = os.path.getmtime(file_path)
-                    file_time = datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')
-                    file_size = os.path.getsize(file_path)
-                    
-                    # 解析文件名获取信息
-                    report_info = self._parse_report_filename(file)
-                    report_info['file_time'] = file_time
-                    report_info['file_size'] = file_size
-                    report_info['filename'] = file
-                    report_files.append(report_info)
-                except Exception as e:
-                    logging.warning(f"解析报告文件信息失败 {file}: {e}")
-                    # 如果解析失败，仍然显示文件名
-                    report_files.append({
-                        'filename': file,
-                        'file_time': '',
-                        'test_type': 'unknown',
-                        'status': 'unknown',
-                        'device_sn': '',
-                        'package_name': ''
-                    })
-        
-        # 按时间倒序排序（最新的在前）
-        report_files.sort(key=lambda x: x.get('file_time', ''), reverse=True)
-        
-        # 显示报告列表
-        for report_info in report_files:
-            display_text = self._format_report_display(report_info)
-            index = self.reports_listbox.size()
-            self.reports_listbox.insert(tk.END, display_text)
-            # 存储索引到文件名的映射（Listbox不支持tags，使用字典）
-            self.report_file_map[index] = report_info['filename']
+        def _load_preview() -> None:
+            try:
+                if not os.path.exists(report_path):
+                    self.root.after(0, lambda: self._set_report_preview_text("文件不存在。"))
+                    return
+                with open(report_path, "r", encoding="utf-8", errors="replace") as f:
+                    raw = f.read(65536)
+                if report_file.endswith(".html"):
+                    text = self._strip_html_for_preview(raw, 2000)
+                elif report_file.endswith(".json"):
+                    text = raw[:2000] + ("..." if len(raw) > 2000 else "")
+                else:
+                    text = raw[:2000] + ("..." if len(raw) > 2000 else "")
+                self.root.after(0, lambda t=(text or "(无内容)"): self._set_report_preview_text(t))
+            except Exception as e:
+                self.root.after(0, lambda msg=("预览加载失败: %s" % str(e)): self._set_report_preview_text(msg))
 
-        self.update_status(f"报告列表已刷新，共 {len(report_files)} 个报告")
+        threading.Thread(target=_load_preview, daemon=True).start()
+
+    def _set_report_preview_text(self, text: str) -> None:
+        """在主线程更新报告预览区域（仅文本，避免大 HTML 卡顿）。"""
+        if getattr(self, "report_preview", None) is None:
+            return
+        self.report_preview.delete(1.0, tk.END)
+        self.report_preview.insert(tk.END, text)
 
     def _parse_report_filename(self, filename: str) -> dict:
         """
         解析报告文件名，提取测试类型、状态、设备信息等
         
-        格式: {test_type}_{status}_{device_sn}_{package_name}_{timestamp}.{ext}
+        实际格式: {sn_short}_{project_key}_{timestamp}[_intermediate][_NN].{ext}
         """
         info = {
             'test_type': 'unknown',
-            'status': 'unknown',
+            'status': 'final',
             'device_sn': '',
-            'package_name': '',
+            'project_key': '',
             'timestamp': ''
         }
         
@@ -4364,18 +4638,28 @@ class MonkeyTestGUI:
             base_name = os.path.splitext(filename)[0]
             parts = base_name.split('_')
             
-            if len(parts) >= 5:
-                info['test_type'] = parts[0]  # 测试类型
-                info['status'] = parts[1]     # 状态（final/intermediate）
-                info['device_sn'] = parts[2]  # 设备序列号
-                info['package_name'] = parts[3]  # 包名
-                info['timestamp'] = '_'.join(parts[4:])  # 时间戳（可能包含下划线）
+            # 格式: {sn_short}_{project_key}_{timestamp}[_intermediate][_NN]
+            if len(parts) >= 3:
+                info['device_sn'] = parts[0]  # 设备序列号（前8位）
+                info['project_key'] = parts[1]  # 测试项目键
+                # 检查是否有 intermediate
+                if '_intermediate' in base_name:
+                    info['status'] = 'intermediate'
+                    # 移除 intermediate 标记
+                    parts = [p for p in parts if p != 'intermediate']
+                # 时间戳是剩余部分（可能包含 _NN 后缀）
+                if len(parts) >= 3:
+                    info['timestamp'] = '_'.join(parts[2:])
+                    # 从 project_key 推断 test_type
+                    if info['project_key'] in ('monkey_stress', 'comprehensive', 'exception_recovery', 
+                                               'performance', 'broadcast_stress', 'tts_stress'):
+                        info['test_type'] = info['project_key']
             
             # 尝试从JSON文件中读取更多信息
-            if filename.endswith('.json'):
-                json_path = os.path.join("reports", filename)
+            json_path = os.path.join("reports", filename.replace('.html', '.json'))
+            if os.path.exists(json_path):
                 try:
-                    with open(json_path, 'r', encoding='utf-8') as f:
+                    with open(json_path, 'r', encoding='utf-8', errors='replace') as f:
                         json_data = json.load(f)
                         metadata = json_data.get('metadata', {})
                         if 'generated_at' in metadata:
@@ -4383,11 +4667,14 @@ class MonkeyTestGUI:
                         if 'report_status' in metadata:
                             info['status'] = metadata['report_status']
                         if 'is_intermediate' in metadata:
-                            info['is_intermediate'] = metadata['is_intermediate']
+                            info['status'] = 'intermediate' if metadata['is_intermediate'] else 'final'
+                        if 'project_key' in metadata:
+                            info['project_key'] = metadata['project_key']
+                            info['test_type'] = metadata.get('test_type', metadata.get('project_key', 'unknown'))
                 except Exception:
                     pass
         except Exception as e:
-            logging.debug(f"解析文件名失败 {filename}: {e}")
+            logging.debug("解析文件名失败 %s: %s", filename, e)
         
         return info
 
@@ -4408,7 +4695,7 @@ class MonkeyTestGUI:
         # 格式化测试类型显示
         type_display = {
             'comprehensive': '综合测试',
-            'system_robustness': '系统健壮性',
+            'system_robustness': 'Monkey 模式压力测试',
             'exception_recovery': '异常恢复',
             'performance': '性能测试'
         }.get(test_type, '未知测试' if test_type == 'unknown' else test_type)
@@ -4466,99 +4753,148 @@ class MonkeyTestGUI:
         return display_text
 
     def open_selected_report(self):
-        """打开选中的报告"""
+        """打开选中的报告（在后台线程执行打开/读取，避免阻塞 UI）"""
         selection = self.reports_listbox.curselection()
         if not selection:
             messagebox.showwarning("警告", "请先选择一个报告文件")
             return
-
-        # 从映射字典中获取实际文件名
         index = selection[0]
         report_file = self.report_file_map.get(index)
         if not report_file:
-            # 如果映射中没有，尝试从显示文本中提取（备用方案）
             display_text = self.reports_listbox.get(index)
-            # 简单提取：假设文件名在最后
-            report_file = display_text.split('|')[-1].strip() if '|' in display_text else display_text.strip()
+            report_file = display_text.split("|")[-1].strip() if "|" in display_text else display_text.strip()
             if not report_file:
                 messagebox.showerror("错误", "无法获取报告文件名")
                 return
-        
         report_path = os.path.join("reports", report_file)
-        
-        # 检查文件是否存在
         if not os.path.exists(report_path):
-            messagebox.showerror("错误", f"报告文件不存在: {report_file}")
+            messagebox.showerror("错误", "报告文件不存在: %s" % report_file)
             return
 
-        if report_file.endswith('.html'):
-            # 打开HTML报告
+        def _open_html() -> None:
             try:
                 import webbrowser
                 abs_path = os.path.abspath(report_path)
-                # Windows路径需要转换为file://格式
-                if os.name == 'nt':
-                    abs_path = abs_path.replace('\\', '/')
-                webbrowser.open(f"file:///{abs_path}")
-                self.update_status(f"已打开报告: {report_file}")
+                if os.name == "nt":
+                    abs_path = abs_path.replace("\\", "/")
+                webbrowser.open("file:///%s" % abs_path)
+                self.root.after(0, lambda: self.update_status("已打开报告: %s" % report_file))
             except Exception as e:
-                messagebox.showerror("错误", f"无法打开报告: {str(e)}")
-        elif report_file.endswith('.json'):
-            # 对于JSON报告，在新窗口中显示内容
+                self.root.after(0, lambda: messagebox.showerror("错误", "无法打开报告: %s" % str(e)))
+
+        def _open_json() -> None:
             try:
-                with open(report_path, 'r', encoding='utf-8') as f:
+                with open(report_path, "r", encoding="utf-8") as f:
                     content = json.dumps(json.load(f), indent=2, ensure_ascii=False)
-                
-                # 创建新窗口显示JSON内容
-                json_window = tk.Toplevel(self.root)
-                json_window.title(f"JSON报告查看器 - {report_file}")
-                json_window.geometry("900x700")
-                json_window.configure(bg=UIColors.BG_LIGHT)
-                
-                # 标题
-                title_label = tk.Label(
-                    json_window,
-                    text=f"📄 {report_file}",
-                    font=UIFonts.SUBTITLE,
-                    fg=UIColors.TEXT_PRIMARY,
-                    bg=UIColors.BG_LIGHT
-                )
-                title_label.pack(anchor=tk.W, padx=20, pady=(20, 10))
-                
-                # 文本显示区域
-                text_widget = scrolledtext.ScrolledText(
-                    json_window,
-                    font=('Consolas', 10),
-                    bg=UIColors.WHITE,
-                    fg=UIColors.TEXT_PRIMARY,
-                    wrap=tk.WORD,
-                    relief='flat',
-                    padx=10,
-                    pady=10
-                )
-                text_widget.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 20))
-                text_widget.insert(tk.END, content)
-                text_widget.config(state='disabled')  # 只读模式
-                
-                self.update_status(f"已打开JSON报告: {report_file}")
+                self.root.after(0, lambda c=content: self._show_json_report_window(report_file, c))
+                self.root.after(0, lambda: self.update_status("已打开JSON报告: %s" % report_file))
             except Exception as e:
-                messagebox.showerror("错误", f"无法读取报告: {str(e)}")
+                self.root.after(0, lambda err=str(e): messagebox.showerror("错误", "无法读取报告: %s" % err))
+
+        if report_file.endswith(".html"):
+            threading.Thread(target=_open_html, daemon=True).start()
+        elif report_file.endswith(".json"):
+            threading.Thread(target=_open_json, daemon=True).start()
         else:
-            # 其他格式，尝试用系统默认程序打开
-            try:
-                import webbrowser
-                import subprocess
-                import platform
-                
-                if platform.system() == 'Windows':
-                    os.startfile(report_path)
-                elif platform.system() == 'Darwin':  # macOS
-                    subprocess.call(['open', report_path])
-                else:  # Linux
-                    subprocess.call(['xdg-open', report_path])
-                self.update_status(f"已打开报告: {report_file}")
-            except Exception as e:
-                messagebox.showerror("错误", f"无法打开报告: {str(e)}")
+            def _open_other() -> None:
+                try:
+                    import subprocess
+                    import platform
+                    if platform.system() == "Windows":
+                        os.startfile(report_path)
+                    elif platform.system() == "Darwin":
+                        subprocess.call(["open", report_path])
+                    else:
+                        subprocess.call(["xdg-open", report_path])
+                    self.root.after(0, lambda: self.update_status("已打开报告: %s" % report_file))
+                except Exception as e:
+                    self.root.after(0, lambda: messagebox.showerror("错误", "无法打开报告: %s" % str(e)))
+            threading.Thread(target=_open_other, daemon=True).start()
+
+    def _do_refactor_reports(self, report_paths, parent=None):
+        """在后台线程中重构一批报告文件，避免阻塞 UI"""
+
+        def worker():
+            success_count = 0
+            fail_items = []
+            total = len(report_paths)
+            for report_path in report_paths:
+                filename = os.path.basename(report_path)
+                try:
+                    self.root.after(
+                        0,
+                        lambda f=filename: self.update_status(f"正在重构报告: {f}（请稍候）"),
+                    )
+                    ok, msg = regenerate_report(report_path)
+                except Exception as e:
+                    ok = False
+                    msg = f"重构失败: {filename}: {e}"
+                    logging.exception("重构报告时发生异常: %s", report_path)
+
+                def _notify(m=msg):
+                    try:
+                        self.update_status(m)
+                    except Exception:
+                        pass
+                    try:
+                        self.append_log(m)
+                    except Exception:
+                        pass
+
+                self.root.after(0, _notify)
+
+                if ok:
+                    success_count += 1
+                else:
+                    fail_items.append((filename, msg))
+
+            def _final():
+                # 刷新两个入口的列表视图
+                try:
+                    self.refresh_reports()
+                except Exception:
+                    pass
+                summary = f"报告重构完成：成功 {success_count} 个，失败 {len(fail_items)} 个（共 {total} 个）"
+                try:
+                    if parent is not None:
+                        messagebox.showinfo("重构完成", summary, parent=parent)
+                    else:
+                        messagebox.showinfo("重构完成", summary)
+                except Exception:
+                    # 在无父窗口或窗口已销毁等情况下静默忽略
+                    logging.debug("显示重构结果对话框失败")
+
+            self.root.after(0, _final)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_json_report_window(self, report_file: str, content: str) -> None:
+        """在主线程创建并显示 JSON 报告窗口（由 open_selected_report 经 after 调用）。"""
+        json_window = tk.Toplevel(self.root)
+        json_window.title("JSON报告查看器 - %s" % report_file)
+        json_window.geometry("900x700")
+        json_window.configure(bg=UIColors.BG_LIGHT)
+        title_label = tk.Label(
+            json_window,
+            text="\u2702 %s" % report_file,
+            font=UIFonts.SUBTITLE,
+            fg=UIColors.TEXT_PRIMARY,
+            bg=UIColors.BG_LIGHT,
+        )
+        title_label.pack(anchor=tk.W, padx=20, pady=(20, 10))
+        text_widget = scrolledtext.ScrolledText(
+            json_window,
+            font=("Consolas", 10),
+            bg=UIColors.WHITE,
+            fg=UIColors.TEXT_PRIMARY,
+            wrap=tk.WORD,
+            relief="flat",
+            padx=10,
+            pady=10,
+        )
+        text_widget.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 20))
+        text_widget.insert(tk.END, content)
+        text_widget.config(state="disabled")
 
     def delete_selected_report(self):
         """删除选中的报告"""
@@ -4693,6 +5029,8 @@ class MonkeyTestGUI:
             cmd = [sys.executable, "-m", "pytest", *pytest_args]
             exit_code = self._run_test_subprocess(cmd, title="稳定性测试")
             if exit_code != 0 and self.is_testing:
+                self.log_queue.put(f"测试异常结束（退出码: {exit_code}），请查看上方日志排查。")
+                self.update_status(f"测试异常结束（退出码: {exit_code}）")
                 raise RuntimeError(f"pytest退出码: {exit_code}")
 
             if self.is_testing:
@@ -4721,6 +5059,95 @@ class MonkeyTestGUI:
                 self._mark_live_report_stopped()
             except Exception:
                 pass
+            # 手动停止时：若设备侧存在与目标应用相关的 ANR/tombstone，则补采 bugreport
+            try:
+                self._collect_bugreport_after_manual_stop()
+            except Exception:
+                pass
+
+    def _collect_bugreport_after_manual_stop(self):
+        """
+        stop_test 会强制终止 pytest 子进程（Windows 下 taskkill /T /F），子进程无法在 finally 中补采 bugreport。
+        这里由 GUI 进程在后台线程做一次兜底：
+        - 解析当前 live report 路径推断 run_log_dir（logs/<sn>/<ts>）
+        - 若推断失败，则对多设备 sn 列表取各自 logs/<sn>/ 下最新目录
+        - 若发现设备侧与包名匹配的 ANR/tombstone，导出 adb bugreport 到 run_log_dir/bugreport/
+        """
+        pkg = (getattr(self, "package_name_var", None).get() or "").strip() if getattr(self, "package_name_var", None) else ""
+        if not pkg:
+            return
+        sn_list = []
+        try:
+            s = (getattr(self, "multi_devices_var", None).get() or "").strip() if getattr(self, "multi_devices_var", None) else ""
+            sn_list = [x.strip() for x in s.split() if x.strip()]
+        except Exception:
+            sn_list = []
+        if not sn_list:
+            try:
+                sn = (getattr(self, "device_sn_var", None).get() or "").strip() if getattr(self, "device_sn_var", None) else ""
+                if sn:
+                    sn_list = [sn]
+            except Exception:
+                sn_list = []
+        if not sn_list:
+            return
+
+        # 尝试从当前 live report 推断 sn / ts -> run_log_dir
+        inferred = {}  # sn -> run_log_dir
+        try:
+            import os as _os
+            import re as _re
+            rp = (getattr(self, "_current_live_report_path", "") or "").strip()
+            if rp and _os.path.exists(rp):
+                base = _os.path.basename(rp)
+                m = _re.match(r"^(?P<sn>[^_]+)_.+_(?P<ts>\d{8}_\d{6})\.html$", base)
+                if m:
+                    sn0 = (m.group("sn") or "").strip()
+                    ts0 = (m.group("ts") or "").strip()
+                    if sn0 and ts0:
+                        inferred[sn0] = _os.path.join("logs", sn0, ts0)
+        except Exception:
+            inferred = {}
+
+        def _latest_run_dir(sn: str) -> str:
+            import os as _os
+            root = _os.path.join("logs", sn)
+            if not _os.path.isdir(root):
+                return ""
+            try:
+                dirs = [d for d in _os.listdir(root) if _os.path.isdir(_os.path.join(root, d))]
+                if not dirs:
+                    return ""
+                # 优先按 mtime
+                latest = max(dirs, key=lambda d: _os.path.getmtime(_os.path.join(root, d)))
+                return _os.path.join(root, latest)
+            except Exception:
+                return ""
+
+        def _worker():
+            try:
+                from utils.stress_monitor import StressMonitor
+            except Exception:
+                return
+            for sn in sn_list:
+                run_dir = inferred.get(sn) or _latest_run_dir(sn)
+                if not run_dir:
+                    continue
+                try:
+                    out = StressMonitor.collect_bugreport_if_needed(sn, pkg, run_dir, reason="manual_stop")
+                    if out:
+                        try:
+                            self.log_queue.put(f"[bugreport] 已导出: {out}")
+                        except Exception:
+                            pass
+                except Exception:
+                    continue
+
+        try:
+            t = threading.Thread(target=_worker, daemon=True)
+            t.start()
+        except Exception:
+            pass
 
     def _mark_live_report_stopped(self):
         """将当前 live 实时报告标记为“已停止”，并记录停止时间/简要信息。"""
@@ -5038,7 +5465,7 @@ class MonkeyTestGUI:
 
         # 1) 模块选择 + 预设组合（测试模式已移除，模块选择直接控制运行内容）
         modules_card = self.create_card_grid(content, "🧩 自定义模块组合", row=0, column=0, sticky="nsew", padx=(0, 10), pady=(0, 10))
-        ToolTip(modules_card, "选择要执行的稳定性测试模块：系统健壮性（长时间压力）、异常恢复（网络/数据异常）、完整性能、仅响应性能等。勾选后将运行相应测试。")
+        ToolTip(modules_card, "选择要执行的稳定性测试模块：Monkey 模式压力测试（长时间压力）、异常恢复（网络/数据异常）、完整性能、仅响应性能等。勾选后将运行相应测试。")
 
         preset_frame = tk.Frame(modules_card, bg=UIColors.WHITE)
         preset_frame.pack(fill=tk.X, padx=5, pady=(5, 10))
@@ -5057,17 +5484,21 @@ class MonkeyTestGUI:
             values=[
                 "自定义",
                 "完整测试套件（全部模块）",
-                "仅系统健壮性",
+                "仅 Monkey 压力测试",
                 "仅异常恢复",
                 "仅性能测试（完整）",
                 "仅响应性能",
-                "健壮性+异常恢复",
-                "健壮性+性能测试",
+                "Monkey 压力+异常恢复",
+                "Monkey 压力+性能测试",
             ],
             state="readonly",
             width=25,
         )
         self.preset_combos_widget.pack(side=tk.LEFT, padx=(0, 10))
+        ToolTip(
+            self.preset_combos_widget,
+            "测试模块预设组合：\n- 选择常用组合快速勾选下方模块，例如“完整测试套件”、“仅 Monkey 压力测试”等。\n- 选择“自定义”时，可手动勾选/取消各模块复选框。"
+        )
         self.preset_combos_widget.bind("<<ComboboxSelected>>", self.on_preset_combo_selected)
         try:
             self._refresh_preset_combos()
@@ -5091,7 +5522,7 @@ class MonkeyTestGUI:
         self.modules_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=(0, 5))
 
         modules_data = [
-            ("system_robustness", "🏗️ 系统健壮性测试", "长时间压力测试"),
+            ("monkey_stress", "🏗️ Monkey 模式压力测试", "长时间压力测试"),
             ("exception_recovery", "🔄 异常恢复测试", "网络/数据异常"),
             ("performance_all", "📊 完整性能测试", "响应+资源"),
             ("performance_response", "⚡ 仅响应性能测试", "冷启动、延迟"),
@@ -5099,7 +5530,7 @@ class MonkeyTestGUI:
             ("tts_stress", "🔊 TTS 模式压力测试", "PC 端语音播放 + 设备麦克风接收"),
         ]
         for key, main_text, sub_text in modules_data:
-            tk.Checkbutton(
+            cb = tk.Checkbutton(
                 self.modules_frame,
                 text=f"{main_text}（{sub_text}）",
                 variable=self.module_vars[key],
@@ -5107,7 +5538,23 @@ class MonkeyTestGUI:
                 font=UIFonts.BODY,
                 cursor="hand2",
                 command=self.on_module_selection_changed,
-            ).pack(anchor=tk.W, pady=3)
+            )
+            cb.pack(anchor=tk.W, pady=3)
+            if key == "monkey_stress":
+                tip = "Monkey 模式压力测试：\n-使用adb monkey进行长时间随机事件压力。\n-建议配合性能监控与 Monkey 遮罩区域一起使用。"
+            elif key == "exception_recovery":
+                tip = "异常恢复测试：\n-覆盖网络断开、弱网、Mock Server 等异常场景。\n-需正确配置 Mock Server 与网络代理选项。"
+            elif key == "performance_all":
+                tip = "完整性能测试：\n-同时评估响应性能与资源消耗（CPU/内存等）。"
+            elif key == "performance_response":
+                tip = "仅响应性能测试：\n-关注冷启动时间与交互响应延迟，不采集长期资源趋势。"
+            elif key == "broadcast_stress":
+                tip = "广播模式压力测试：\n-通过 adb broadcast 发送Hint调用应用能力。\n-Hints文本与文件、响应监控参数由下方配置。"
+            elif key == "tts_stress":
+                tip = "TTS 模式压力测试：\n-PC 端播放语音，设备麦克风接收后由应用响应。\n-文本内容与文件、响应监控参数由下方配置。"
+            else:
+                tip = "测试模块。"
+            ToolTip(cb, tip)
 
         # 3) 参数设置（时长 + 网络 + 多设备）
         params_card = self.create_card_grid(content, "🛡️ 参数设置", row=0, column=1, sticky="nsew", padx=(10, 0), pady=(0, 10))
@@ -5135,6 +5582,10 @@ class MonkeyTestGUI:
             width=18,
         )
         self.duration_preset_combo.grid(row=0, column=0, sticky=tk.W)
+        ToolTip(
+            self.duration_preset_combo,
+            "测试方案预设时长：\n-快速测试：约 30 分钟。\n-标准测试：约 2 小时。\n-深度测试：约 6 小时。\n-长期/持久压力测试：12~24 小时。\n可在主界面中进一步调整具体时长。"
+        )
         self.duration_preset_combo.bind("<<ComboboxSelected>>", self.on_duration_preset_changed)
 
         self.duration_preset_desc_label = tk.Label(
@@ -5159,10 +5610,17 @@ class MonkeyTestGUI:
             state="readonly",
         )
         network_combo.grid(row=1, column=1, sticky=tk.EW, pady=6, padx=(10, 0))
+        ToolTip(
+            network_combo,
+            "网络模拟方法：\n-root：通过 root 权限直接控制网络。\n-pc_proxy：通过 PC 端代理（如 mitmproxy）注入流量。\n-wifi_control：通过 Wi-Fi 控制网络状态。\n-app_simulation：由应用自身模拟网络行为。\n请与 Mock Server/网络代理配置配合使用。"
+        )
 
         tk.Label(form, text="多设备SN(空格分隔):", font=UIFonts.BODY, bg=UIColors.WHITE).grid(row=2, column=0, sticky=tk.W, pady=6)
-        tk.Entry(form, textvariable=self.multi_devices_var, font=UIFonts.BODY).grid(
-            row=2, column=1, sticky=tk.EW, pady=6, padx=(10, 0)
+        multi_sn_entry = tk.Entry(form, textvariable=self.multi_devices_var, font=UIFonts.BODY)
+        multi_sn_entry.grid(row=2, column=1, sticky=tk.EW, pady=6, padx=(10, 0))
+        ToolTip(
+            multi_sn_entry,
+            "多设备序列号：\n-使用空格分隔多个 Android 设备 SN，例如：\n  7ff80600 emulator-5554\n-仅在需要同时对多台设备执行稳定性测试时填写。"
         )
 
         # 广播/TTS 配置
@@ -5170,49 +5628,148 @@ class MonkeyTestGUI:
         bc_frame = tk.Frame(broadcast_tts_card, bg=UIColors.WHITE)
         bc_frame.pack(fill=tk.X, padx=5, pady=5)
         bc_frame.grid_columnconfigure(1, weight=1)
-        tk.Label(bc_frame, text="广播 Hints(每行一条):", font=UIFonts.BODY, bg=UIColors.WHITE).grid(row=0, column=0, sticky=tk.NW, pady=4)
+        bc_hints_label = tk.Label(bc_frame, text="广播Hints(每行一条):", font=UIFonts.BODY, bg=UIColors.WHITE)
+        bc_hints_label.grid(row=0, column=0, sticky=tk.NW, pady=4)
         bc_text = tk.Text(bc_frame, height=3, width=40, font=UIFonts.BODY)
         bc_text.grid(row=0, column=1, sticky=tk.EW, padx=(10, 0), pady=4)
         bc_text.insert("1.0", getattr(self, "broadcast_hints_var", tk.StringVar(value="")).get() or "介绍一下白居易\n讲个笑话")
         self._broadcast_hints_text = bc_text
-        tk.Label(bc_frame, text="Hints 文件路径(可选):", font=UIFonts.BODY, bg=UIColors.WHITE).grid(row=1, column=0, sticky=tk.W, pady=4)
-        tk.Entry(bc_frame, textvariable=getattr(self, "broadcast_hints_file_var", tk.StringVar(value="")), font=UIFonts.BODY).grid(row=1, column=1, sticky=tk.EW, padx=(10, 0), pady=4)
-        tk.Label(bc_frame, text="TTS 文本(每行一条):", font=UIFonts.BODY, bg=UIColors.WHITE).grid(row=2, column=0, sticky=tk.NW, pady=4)
+        ToolTip(
+            bc_hints_label,
+            "广播Hints列表：\n-每行一条Hint文本，将按顺序循环发送。\n-可搭配Hints文件使用：若文件存在且配置了路径，则以文件内容为准。"
+        )
+        bc_hints_file_label = tk.Label(bc_frame, text="Hints文件路径(可选):", font=UIFonts.BODY, bg=UIColors.WHITE)
+        bc_hints_file_label.grid(row=1, column=0, sticky=tk.W, pady=4)
+        bc_hints_file_entry = tk.Entry(bc_frame, textvariable=getattr(self, "broadcast_hints_file_var", tk.StringVar(value="")), font=UIFonts.BODY)
+        bc_hints_file_entry.grid(row=1, column=1, sticky=tk.EW, padx=(10, 0), pady=4)
+        ToolTip(
+            bc_hints_file_label,
+            "广播Hints文件路径：\n-可选配置，指向包含Hint文本的UTF-8文本文件。\n-每行一条Hint，若配置了文件，将优先使用文件内容。\n-支持绝对路径或相对于项目根目录的路径。"
+        )
+        tts_label = tk.Label(bc_frame, text="TTS 文本(每行一条):", font=UIFonts.BODY, bg=UIColors.WHITE)
+        tts_label.grid(row=2, column=0, sticky=tk.NW, pady=4)
         tts_text = tk.Text(bc_frame, height=3, width=40, font=UIFonts.BODY)
         tts_text.grid(row=2, column=1, sticky=tk.EW, padx=(10, 0), pady=4)
         tts_text.insert("1.0", getattr(self, "tts_texts_var", tk.StringVar(value="")).get() or "打开设置\n介绍一下北京")
         self._tts_texts_text = tts_text
-        tk.Label(bc_frame, text="TTS 文本文件路径(可选):", font=UIFonts.BODY, bg=UIColors.WHITE).grid(row=3, column=0, sticky=tk.W, pady=4)
-        tk.Entry(bc_frame, textvariable=getattr(self, "tts_texts_file_var", tk.StringVar(value="")), font=UIFonts.BODY).grid(row=3, column=1, sticky=tk.EW, padx=(10, 0), pady=4)
+        ToolTip(
+            tts_label,
+            "TTS 文本列表：\n-每行一条，将依次通过 PC 端 TTS 播放。\n-建议使用短句，方便设备识别（如“打开设置”、“介绍一下北京”）。\n-若配置了 TTS 文本文件，将优先使用文件内容。"
+        )
+        tts_file_label = tk.Label(bc_frame, text="TTS 文本文件路径(可选):", font=UIFonts.BODY, bg=UIColors.WHITE)
+        tts_file_label.grid(row=3, column=0, sticky=tk.W, pady=4)
+        tts_file_entry = tk.Entry(bc_frame, textvariable=getattr(self, "tts_texts_file_var", tk.StringVar(value="")), font=UIFonts.BODY)
+        tts_file_entry.grid(row=3, column=1, sticky=tk.EW, padx=(10, 0), pady=4)
+        ToolTip(
+            tts_file_label,
+            "TTS 文本文件路径：\n-可选配置，指向包含 TTS 文本的 UTF-8 文本文件。\n-每行一条，将依次播放。\n-支持绝对路径或相对于项目根目录的路径。"
+        )
+        # TTS 结束词 / 唤醒词及等待时间配置
+        end_phrase_label = tk.Label(bc_frame, text="结束词(可选):", font=UIFonts.BODY, bg=UIColors.WHITE)
+        end_phrase_label.grid(row=4, column=0, sticky=tk.W, pady=4)
+        end_phrase_entry = tk.Entry(
+            bc_frame,
+            textvariable=getattr(self, "tts_end_phrase_var", tk.StringVar(value="")),
+            font=UIFonts.BODY,
+        )
+        end_phrase_entry.grid(row=4, column=1, sticky=tk.EW, padx=(10, 0), pady=4)
+        ToolTip(
+            end_phrase_label,
+            "结束词：\n-每条 TTS 语料开始前可选播放的结束词/收尾指令。\n-例如“本轮测试结束”、“上一条结束”等。\n-留空则不播放结束词。"
+        )
+
+        wake_phrase_label = tk.Label(bc_frame, text="唤醒词(可选):", font=UIFonts.BODY, bg=UIColors.WHITE)
+        wake_phrase_label.grid(row=5, column=0, sticky=tk.W, pady=4)
+        wake_phrase_entry = tk.Entry(
+            bc_frame,
+            textvariable=getattr(self, "tts_wake_phrase_var", tk.StringVar(value="")),
+            font=UIFonts.BODY,
+        )
+        wake_phrase_entry.grid(row=5, column=1, sticky=tk.EW, padx=(10, 0), pady=4)
+        ToolTip(
+            wake_phrase_label,
+            "唤醒词：\n-每条 TTS 语料前的唤醒指令，例如“你好，小助手”。\n-留空则不播放唤醒词。"
+        )
+
+        wake_delay_label = tk.Label(bc_frame, text="唤醒后等待(秒):", font=UIFonts.BODY, bg=UIColors.WHITE)
+        wake_delay_label.grid(row=6, column=0, sticky=tk.W, pady=4)
+        wake_delay_entry = tk.Entry(
+            bc_frame,
+            textvariable=getattr(self, "tts_wake_delay_var", tk.StringVar(value="2")),
+            font=UIFonts.BODY,
+            width=10,
+        )
+        wake_delay_entry.grid(row=6, column=1, sticky=tk.W, padx=(10, 0), pady=4)
+        ToolTip(
+            wake_delay_label,
+            "唤醒后等待时间：\n-单位：秒，默认 2 秒。\n-播放完唤醒词后，等待多少秒再播放实际测试语料。"
+        )
+
         # 响应监控参数（广播/TTS 共用，仅 logcat 模式，发送后立即开始监控）
-        tk.Label(bc_frame, text="最大等待出现(秒):", font=UIFonts.BODY, bg=UIColors.WHITE).grid(row=4, column=0, sticky=tk.W, pady=4)
-        tk.Entry(bc_frame, textvariable=getattr(self, "response_monitor_max_wait_appear_var", tk.StringVar(value="6")), font=UIFonts.BODY, width=10).grid(row=4, column=1, sticky=tk.W, padx=(10, 0), pady=4)
-        tk.Label(bc_frame, text="检测间隔(秒):", font=UIFonts.BODY, bg=UIColors.WHITE).grid(row=5, column=0, sticky=tk.W, pady=4)
-        tk.Entry(bc_frame, textvariable=getattr(self, "response_monitor_check_interval_var", tk.StringVar(value="0.1")), font=UIFonts.BODY, width=10).grid(row=5, column=1, sticky=tk.W, padx=(10, 0), pady=4)
-        tk.Label(bc_frame, text="最大等待消失(秒):", font=UIFonts.BODY, bg=UIColors.WHITE).grid(row=6, column=0, sticky=tk.W, pady=4)
-        tk.Entry(bc_frame, textvariable=getattr(self, "response_monitor_max_wait_disappear_var", tk.StringVar(value="300")), font=UIFonts.BODY, width=10).grid(row=6, column=1, sticky=tk.W, padx=(10, 0), pady=4)
-        tk.Label(bc_frame, text="最大失败次数:", font=UIFonts.BODY, bg=UIColors.WHITE).grid(row=7, column=0, sticky=tk.W, pady=4)
-        tk.Entry(bc_frame, textvariable=getattr(self, "response_monitor_max_failure_count_var", tk.StringVar(value="0")), font=UIFonts.BODY, width=10).grid(row=7, column=1, sticky=tk.W, padx=(10, 0), pady=4)
-        ToolTip(broadcast_tts_card, "广播模式：adb broadcast 发送 hint；TTS 模式：PC 端播放语音，设备麦克风接收。响应监控：仅基于 logcat 关键字与时间参数统计响应与展示时长。")
+        max_appear_label = tk.Label(bc_frame, text="最大等待出现(秒):", font=UIFonts.BODY, bg=UIColors.WHITE)
+        max_appear_label.grid(row=7, column=0, sticky=tk.W, pady=4)
+        max_appear_entry = tk.Entry(bc_frame, textvariable=getattr(self, "response_monitor_max_wait_appear_var", tk.StringVar(value="6")), font=UIFonts.BODY, width=10)
+        max_appear_entry.grid(row=7, column=1, sticky=tk.W, padx=(10, 0), pady=4)
+        ToolTip(
+            max_appear_label,
+            "最大等待出现时间：\n-单位：秒。\n-在发送Hint/TTS 后，最多等待多少秒内出现“响应已显示”的标志。\n-典型取值 3–10 秒，过小可能误判 ANR。"
+        )
+        check_interval_label = tk.Label(bc_frame, text="检测间隔(秒):", font=UIFonts.BODY, bg=UIColors.WHITE)
+        check_interval_label.grid(row=8, column=0, sticky=tk.W, pady=4)
+        check_interval_entry = tk.Entry(bc_frame, textvariable=getattr(self, "response_monitor_check_interval_var", tk.StringVar(value="0.1")), font=UIFonts.BODY, width=10)
+        check_interval_entry.grid(row=8, column=1, sticky=tk.W, padx=(10, 0), pady=4)
+        ToolTip(
+            check_interval_label,
+            "检测间隔：\n-单位：秒。\n-控制轮询 logcat 的频率，间隔越小监控越精细，但 logcat 开销越大。\n-建议范围 0.05–1.0。"
+        )
+        max_disappear_label = tk.Label(bc_frame, text="最大等待消失(秒):", font=UIFonts.BODY, bg=UIColors.WHITE)
+        max_disappear_label.grid(row=9, column=0, sticky=tk.W, pady=4)
+        max_disappear_entry = tk.Entry(bc_frame, textvariable=getattr(self, "response_monitor_max_wait_disappear_var", tk.StringVar(value="300")), font=UIFonts.BODY, width=10)
+        max_disappear_entry.grid(row=9, column=1, sticky=tk.W, padx=(10, 0), pady=4)
+        ToolTip(
+            max_disappear_label,
+            "最大等待消失时间：\n-单位：秒。\n-控制“响应卡片/界面”在出现后，最多允许停留多久仍未消失。\n-超过该时间将视为超时（timeout_disappear）。"
+        )
+        anr_threshold_label = tk.Label(bc_frame, text="连续 ANR/无响应次数阈值:", font=UIFonts.BODY, bg=UIColors.WHITE)
+        anr_threshold_label.grid(row=10, column=0, sticky=tk.W, pady=4)
+        anr_threshold_entry = tk.Entry(
+            bc_frame,
+            textvariable=getattr(self, "response_monitor_anr_recover_threshold_var", tk.StringVar(value="1")),
+            font=UIFonts.BODY,
+            width=10,
+        )
+        anr_threshold_entry.grid(row=10, column=1, sticky=tk.W, padx=(10, 0), pady=4)
+        ToolTip(
+            anr_threshold_label,
+            "连续 ANR/无响应次数阈值：\n-0：禁用自动杀进程并重拉应用，仅记录 ANR。\n-正整数 N：连续 N 次 timeout_appear/timeout_disappear/error 后才触发自动重拉。\n示例：1=首次无响应即重拉；3=连续 3 次无响应才重拉。"
+        )
+        ToolTip(broadcast_tts_card, "广播模式：adb broadcast 发送Hint；TTS 模式：PC 端播放语音，设备麦克风接收。响应监控：仅基于 logcat 关键字与时间参数统计响应与展示时长。")
 
         # 4) 测试选项
         opts_card = self.create_card_grid(content, "⚙️ 测试选项", row=1, column=1, sticky="nsew", padx=(10, 0), pady=(0, 10))
         opts = [
-            ("建立性能基线", self.baseline_establish_var),
-            ("与基线对比", self.baseline_compare_var),
-            ("禁用Mock Server", self.no_mock_server_var),
-            ("禁用网络代理", self.no_network_proxy_var),
-            ("直接使用Fallback事件注入", self.use_fallback_only_var),
+            ("建立性能基线", self.baseline_establish_var,
+             "建立性能基线：\n-在本次测试结束后，将当前性能结果保存为基线。\n-适合在版本较稳定时执行，用于后续版本对比。"),
+            ("与基线对比", self.baseline_compare_var,
+             "与基线对比：\n-将本次测试结果与历史基线进行对比，生成对比报告。\n-建议在已有基线的前提下勾选。"),
+            ("禁用Mock Server", self.no_mock_server_var,
+             "禁用 Mock Server：\n-不再启用 Mock Server 注入或回放流量。\n-适合联调真实后端环境时使用。"),
+            ("禁用网络代理", self.no_network_proxy_var,
+             "禁用网络代理：\n-不通过 HTTP 代理转发流量。\n-避免与其他网络调试工具冲突。"),
+            ("直接使用Fallback事件注入", self.use_fallback_only_var,
+             "直接使用 Fallback 事件注入：\n-跳过 adb monkey，改用 adb input tap/swipe/key 等方式注入事件。\n-适合 Monkey 不稳定或不支持的环境。"),
         ]
-        for i, (text, var) in enumerate(opts):
-            tk.Checkbutton(
+        for i, (text, var, tip) in enumerate(opts):
+            cb = tk.Checkbutton(
                 opts_card,
                 text=text,
                 variable=var,
                 bg=UIColors.WHITE,
                 font=UIFonts.BODY,
                 cursor="hand2",
-            ).grid(row=i // 2, column=i % 2, sticky=tk.W, padx=6, pady=6)
+            )
+            cb.grid(row=i // 2, column=i % 2, sticky=tk.W, padx=6, pady=6)
+            ToolTip(cb, tip)
         opts_card.grid_columnconfigure(0, weight=1)
         opts_card.grid_columnconfigure(1, weight=1)
 
@@ -5224,22 +5781,27 @@ class MonkeyTestGUI:
         mask_form.grid_columnconfigure(3, weight=1)
 
         tk.Label(mask_form, text="上边缘:", font=UIFonts.BODY, bg=UIColors.WHITE).grid(row=0, column=0, sticky=tk.W, pady=4)
-        tk.Entry(mask_form, width=8, textvariable=self.monkey_mask_top_var, font=UIFonts.BODY).grid(
-            row=0, column=1, sticky=tk.W, padx=(2, 10), pady=4
-        )
+        mask_top_entry = tk.Entry(mask_form, width=8, textvariable=self.monkey_mask_top_var, font=UIFonts.BODY)
+        mask_top_entry.grid(row=0, column=1, sticky=tk.W, padx=(2, 10), pady=4)
         tk.Label(mask_form, text="%   下边缘:", font=UIFonts.BODY, bg=UIColors.WHITE).grid(row=0, column=2, sticky=tk.W, pady=4)
-        tk.Entry(mask_form, width=8, textvariable=self.monkey_mask_bottom_var, font=UIFonts.BODY).grid(
-            row=0, column=3, sticky=tk.W, padx=(2, 10), pady=4
-        )
+        mask_bottom_entry = tk.Entry(mask_form, width=8, textvariable=self.monkey_mask_bottom_var, font=UIFonts.BODY)
+        mask_bottom_entry.grid(row=0, column=3, sticky=tk.W, padx=(2, 10), pady=4)
 
         tk.Label(mask_form, text="左边缘:", font=UIFonts.BODY, bg=UIColors.WHITE).grid(row=1, column=0, sticky=tk.W, pady=4)
-        tk.Entry(mask_form, width=8, textvariable=self.monkey_mask_left_var, font=UIFonts.BODY).grid(
-            row=1, column=1, sticky=tk.W, padx=(2, 10), pady=4
-        )
+        mask_left_entry = tk.Entry(mask_form, width=8, textvariable=self.monkey_mask_left_var, font=UIFonts.BODY)
+        mask_left_entry.grid(row=1, column=1, sticky=tk.W, padx=(2, 10), pady=4)
         tk.Label(mask_form, text="%   右边缘:", font=UIFonts.BODY, bg=UIColors.WHITE).grid(row=1, column=2, sticky=tk.W, pady=4)
-        tk.Entry(mask_form, width=8, textvariable=self.monkey_mask_right_var, font=UIFonts.BODY).grid(
-            row=1, column=3, sticky=tk.W, padx=(2, 10), pady=4
+        mask_right_entry = tk.Entry(mask_form, width=8, textvariable=self.monkey_mask_right_var, font=UIFonts.BODY)
+        mask_right_entry.grid(row=1, column=3, sticky=tk.W, padx=(2, 10), pady=4)
+
+        mask_tip = (
+            "Monkey 遮罩区域（百分比 0.0–100.0）：\n"
+            "-定义 Monkey 可点击区域相对于屏幕的上下左右边界百分比。\n"
+            "-例如：上/下均为 10.0，左/右为 0.0，表示上下各保留 10% 不点击，中间 80% 为可点击区。\n"
+            "-建议保留 5–10% 以避免点到状态栏、导航栏等系统区域。"
         )
+        for w in (mask_top_entry, mask_bottom_entry, mask_left_entry, mask_right_entry):
+            ToolTip(w, mask_tip)
 
         self.create_action_button(
             mask_form,

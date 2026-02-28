@@ -19,7 +19,7 @@
 | 功能模块 | 实现状态 | 核心文件 | 说明 |
 |----------|----------|----------|------|
 | 核心Python脚本封装 | ✅ 已实现 | `utils/*.py` | 性能数据采集、ADB操作、日志分析等通用函数 |
-| 系统健壮性测试 | ✅ 已实现 | `utils/extended_monkey.py` | 12-72小时Monkey压力测试 |
+| Monkey 模式压力测试 | ✅ 已实现 | `utils/extended_monkey.py` | 12-72小时Monkey压力测试 |
 | 异常恢复测试 | ✅ 已实现 | `utils/exception_recovery.py` | 网络异常、数据异常测试 |
 | 性能测试 | ✅ 已实现 | `utils/performance_monitor.py` | 冷启动、响应延迟、资源消耗监控 |
 | Mock Server | ✅ 已实现 | `utils/mock_server.py` | FastAPI实现的云端数据模拟服务 |
@@ -130,7 +130,7 @@ python main.py --stability -s device_sn --pytest
 ```
 main.py (入口)
 ├── 稳定性测试框架 (StabilityTestFramework)
-│   ├── 系统健壮性测试 (ExtendedMonkeyTest)
+│   ├── Monkey 模式压力测试 (ExtendedMonkeyTest)
 │   ├── 异常恢复测试 (ExceptionRecoveryTest)
 │   ├── 性能测试 (PerformanceMonitor)
 │   └── 基线管理 (BaselineManager)
@@ -156,7 +156,7 @@ main.py (入口)
 - ✅ **灵活配置**：丰富的配置选项适应不同测试场景
 
 ### 测试覆盖
-- ✅ **系统健壮性**：12-72小时压力测试，崩溃/ANR检测
+- ✅ **Monkey 模式压力测试**：12-72小时压力测试，崩溃/ANR检测
 - ✅ **性能监控**：冷启动时间、响应延迟、CPU/内存使用率
 - ✅ **异常恢复**：网络断开/弱网、数据异常、服务异常
 - ✅ **网络模拟**：支持Root和非Root设备的网络条件模拟

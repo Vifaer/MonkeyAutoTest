@@ -115,7 +115,7 @@ python main.py --stability -s device -p app.apk
 
 # 专项测试
 python main.py --stability --performance-only -s device -p app.apk  # 仅性能测试
-python main.py --stability --robustness-only -s device -p app.apk   # 仅健壮性测试
+python main.py --stability --robustness-only -s device -p app.apk   # 仅 Monkey 压力测试
 
 # 自定义配置
 python main.py --stability -s device -p app.apk --config my_config.json
@@ -403,7 +403,7 @@ dist/MonkeyTestGUI.exe
      - 完整测试套件：运行所有测试模块
      - 模块化测试：可选择性启用特定模块
    - **模块选择**（模块化测试时）：
-     - 🏗️ 系统健壮性测试（长时间压力测试）
+     - 🏗️ Monkey 模式压力测试（长时间压力测试）
      - 🔄 异常恢复测试（网络/数据异常）
      - 📊 完整性能测试（响应+资源）
      - ⚡ 仅响应性能测试（冷启动、延迟）
@@ -501,7 +501,7 @@ dist/MonkeyTestGUI.exe
 
 | 模块 | 适用场景 | 耗时 | 说明 |
 |------|----------|------|------|
-| 系统健壮性 | 验证应用基本稳定性 | 12-72小时 | 通过长时间Monkey测试验证应用稳定性 |
+| Monkey 模式压力测试 | 验证应用基本稳定性 | 12-72小时 | 通过长时间Monkey测试验证应用稳定性 |
 | 异常恢复 | 测试网络/数据异常处理 | 中等 | 模拟网络异常、数据异常等场景 |
 | 完整性能 | 全面性能评估 | 较长 | 包括响应性能和资源消耗测试 |
 | 仅响应性能 | 快速响应时间检查 | 短 | 专注于冷启动时间和响应延迟 |
@@ -549,7 +549,7 @@ dist/MonkeyTestGUI.exe
 - 邮件通知功能（可选）
 
 ### 车载端侧稳定性测试模式 🆕
-- **系统健壮性测试**：12-72小时长时间压力测试
+- **Monkey 模式压力测试**：12-72小时长时间压力测试
 - **异常恢复测试**：网络断开、弱网、数据异常等场景
 - **性能监控**：启动时间、响应延迟、CPU/内存使用率
 - **Mock服务**：模拟云端API，支持异常数据测试
@@ -590,7 +590,7 @@ dist/MonkeyTestGUI.exe
 
 稳定性测试入口是 `main.py --stability`，核心执行在 `utils/stability_test.py`，按模块执行：
 
-#### 2.1 系统健壮性测试（长时间压力）
+#### 2.1 Monkey 模式压力测试（长时间压力）
 
 **怎么施压**
 - 通过 `utils/extended_monkey.py:ExtendedMonkeyTest` 执行 **12–72 小时长时 Monkey**，并按小时拆成多个阶段（避免单进程过久难以管理）。

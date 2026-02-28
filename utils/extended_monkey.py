@@ -23,6 +23,7 @@ class ExtendedMonkeyTest:
         self.device = device
         self.package = package
         self.config = config
+        self._stress_monitor = StressMonitor(device, package, config)
         # 每次真正启动测试前会在 run_long_stress_test 里重新生成一次“按时间戳划分”的运行目录
         # 这里先给出一个兜底路径，避免某些辅助方法在测试启动前访问属性时报错
         self._run_log_dir = os.path.join("logs", str(device.sn))
@@ -104,76 +105,69 @@ class ExtendedMonkeyTest:
         self.log_path = os.path.join(self._run_log_dir, "extended_monkey.log")
         self.logcat_log_path = os.path.join(self._run_log_dir, "logcat_monkey.log")
 
-        # 计算预期结束时间（仅用于结果记录，不直接控制 Monkey 运行时长）
-        end_time = datetime.now() + timedelta(hours=duration_hours)
+        # 统一使用当前运行目录，避免未定义变量
+        run_log_dir = self._get_run_log_dir()
 
+        end_time = datetime.now() + timedelta(hours=duration_hours)
         result = {
             'test_type': 'long_stress',
             'duration_hours': duration_hours,
             'start_time': datetime.now().isoformat(),
             'end_time': end_time.isoformat(),
+            # 计划/配置参数（供报告展示与回溯）
+            'event_count': event_count,
+            'planned_event_count': event_count,
+            'throttle_ms': throttle,
             'crashes': 0,
             'anrs': 0,
+            # 性能采样（由监控线程写入，条目形如 timestamp/app_cpu_pct/...）
             'performance_data': [],
+            # 分阶段结果（条目形如 phase/start_time/end_time/events_executed/...）
+            'phase_results': [],
             'log_summary': {},
-            'run_log_dir': self._run_log_dir,  # 供报告中的 performance_sampling 可视化使用
+            'run_log_dir': run_log_dir,
+            'monkey_tool_bug_count': 0,
+            'monkey_tool_bug_types': {},
         }
-        # monkey 工具缺陷统计（例如 permission NPE）
-        result['monkey_tool_bug_count'] = 0
-        result['monkey_tool_bug_types'] = {}
 
-        # 初始化日志文件（确保目录存在）
-        log_dir = os.path.dirname(self.log_path)
+        # 初始化日志文件
+        self._init_log_file(duration_hours)
+        
+        # 计算采样间隔和日志路径
+        sampling_interval = self._compute_sampling_interval(duration_hours)
+        performance_log_path = os.path.join(run_log_dir, "performance_sampling.jsonl")
+
+        # 启动后台监控线程
+        monitor_thread = self._start_monitoring_thread(result, sampling_interval, performance_log_path)
+        
+        # 启动 logcat 日志抓取线程（全量系统日志，供后续异常/性能分析使用）
+        logcat_thread = self._start_logcat_capture()
+
+        # 启动基于 PID 的应用日志采集线程（app.log），包含实时业务日志与 Crash/ANR 相关信息
         try:
-            if log_dir and not os.path.exists(log_dir):
-                os.makedirs(log_dir, exist_ok=True)
+            app_log_path = os.path.join(run_log_dir, "app.log")
+            self._stress_monitor.start_app_log_capture(app_log_path)
         except Exception as e:
-            logging.warning(f"创建日志目录失败 {log_dir}: {e}")
+            logging.warning(f"启动应用日志采集失败（app.log）: {e}")
 
-        with open(self.log_path, 'w', encoding='utf-8') as f:
-            f.write(f"Extended Monkey Test Start: {datetime.now()}\n")
-            f.write(f"Duration: {duration_hours} hours\n")
-            f.write(f"Package: {self.package.name}\n")
-            f.write("-" * 50 + "\n")
-
-        # 采样间隔：基础1s；>0.5h 时按比例增大（1h->2s，2h->4s，12h->24s）
-        import math
-        sampling_interval = 1
-        if duration_hours > 0.5:
-            sampling_interval = max(1, math.ceil(duration_hours / 0.5))
-        performance_log_path = os.path.join(self._run_log_dir, "performance_sampling.jsonl")
-        fallback_log_path = os.path.join(self._run_log_dir, "input_fallback.log")
+        # 启动设备异常目录监控（/data/anr, /data/tombstones）
+        try:
+            self._stress_monitor.start_exception_file_monitor(run_log_dir)
+        except Exception as e:
+            logging.warning(f"启动设备异常目录监控失败（可忽略）: {e}")
 
         try:
-            # 启动后台监控线程
-            monitor_thread = self._start_monitoring_thread(result, sampling_interval, performance_log_path)
-            
-            # 启动 logcat 日志抓取线程
-            logcat_thread = self._start_logcat_capture()
-
-            # 检查是否直接使用Fallback（跳过传统Monkey）。注：传入的 config 即为 long_stress 段，无 long_stress 子键
+            # 检查是否直接使用Fallback
             use_fallback_only = bool(self.config.get('use_fallback_only', False))
             if use_fallback_only:
-                logging.info("配置为直接使用Fallback事件注入，跳过传统Monkey命令")
-                # 直接使用fallback进行压力测试
-                import random
-                seed = random.randint(0, 65535)
-                fallback_log_path = os.path.join(self._run_log_dir, "input_fallback_direct.log")
-                total_duration_seconds = duration_hours * 3600.0
-                fallback_result = self._run_input_fallback(
-                    duration_seconds=total_duration_seconds,
-                    throttle_ms=int(throttle),
-                    seed=seed,
-                    log_path=fallback_log_path
-                )
-                # 记录fallback结果到result中
-                result['fallback_direct'] = True
-                result['fallback_events'] = fallback_result.get('events_injected', 0)
-                result['fallback_duration'] = fallback_result.get('duration_seconds', 0.0)
+                self._run_fallback_only(duration_hours, throttle, result)
             else:
                 # 执行分阶段Monkey测试
                 self._run_phased_monkey_test(duration_hours, throttle, event_count, result)
-
+        except Exception as e:
+            logging.error(f"长时间压力测试失败: {str(e)}")
+            result['error'] = str(e)
+        finally:
             # 停止监控和logcat
             self._stop_logcat.set()
             self._stop_monitor.set()
@@ -181,13 +175,14 @@ class ExtendedMonkeyTest:
                 logcat_thread.join(timeout=5)
             monitor_thread.join(timeout=10)
 
-        except Exception as e:
-            logging.error(f"长时间压力测试失败: {str(e)}")
-            result['error'] = str(e)
+            # 若捕获到设备侧 ANR/tombstone，则在结束时导出 bugreport（可选失败，不影响主流程）
+            try:
+                self._stress_monitor.maybe_collect_bugreport(run_log_dir, reason="test_end")
+            except Exception as e:
+                logging.warning("导出 bugreport 失败（可忽略）: %s", e)
 
-        finally:
+            # 记录实际结束时间并生成异常摘要与性能汇总
             result['actual_end_time'] = datetime.now().isoformat()
-            # 将异常日志单独落盘
             try:
                 start_dt = datetime.fromisoformat(result.get('start_time', '').replace('Z', '+00:00'))
                 if start_dt.tzinfo:
@@ -195,13 +190,73 @@ class ExtendedMonkeyTest:
             except Exception:
                 start_dt = datetime.now() - timedelta(hours=float(result.get('duration_hours', 12)))
             end_dt = datetime.now()
-            exc_path = os.path.join(self._get_run_log_dir(), "exceptions.log")
-            StressMonitor.extract_exceptions_to_file(
-                self.logcat_log_path, exc_path, start_dt, end_dt, self.package.name
-            )
+            # 兼容稳定性总控对 exceptions.log 的增量刷新逻辑：此处不再重复生成，
+            # 异常明细由 StabilityTest 周期性从 logcat_* 或 app.log 中提取。
             self._analyze_test_results(result)
 
         return result
+
+    def _init_log_file(self, duration_hours: float) -> None:
+        """
+        初始化本次 Monkey 长压测试的主日志文件。
+
+        目标：
+        - 确保运行目录与日志文件存在
+        - 在日志开头写入一次概要信息，便于排查
+        """
+        try:
+            log_dir = self._get_run_log_dir()
+            if log_dir and not os.path.exists(log_dir):
+                os.makedirs(log_dir, exist_ok=True)
+        except Exception as e:
+            logging.warning(f"创建长压日志目录失败（忽略继续）: {e}")
+
+        try:
+            with open(self.log_path, "a", encoding="utf-8", errors="replace") as f:
+                f.write(f"Extended Monkey Long Stress Test Start: {datetime.now().isoformat()}\n")
+                f.write(f"Device: {self.device.sn}, Package: {self.package.name}\n")
+                f.write(f"Planned duration: {duration_hours} hours\n")
+                f.write("-" * 60 + "\n")
+        except Exception as e:
+            logging.debug(f"初始化长压日志文件失败（可忽略）: {e}")
+
+    def _compute_sampling_interval(self, duration_hours: float) -> float:
+        """
+        根据计划测试时长估算性能采样间隔（秒）。
+
+        粗略策略即可：
+        - 短测（≤1h）：更细粒度采样，约 5s 一次
+        - 中长测（1–6h）：10s 一次
+        - 超长测（>6h）：30s 一次，避免采样数据过大
+        """
+        try:
+            h = float(duration_hours)
+        except Exception:
+            h = 12.0
+
+        if h <= 1:
+            return 5.0
+        if h <= 6:
+            return 10.0
+        return 30.0
+
+    def _run_fallback_only(self, duration_hours: float, throttle: int, result: dict) -> None:
+        """直接使用Fallback事件注入（跳过传统Monkey）"""
+        logging.info("配置为直接使用Fallback事件注入，跳过传统Monkey命令")
+        import random
+        seed = random.randint(0, 65535)
+        # 直接复用 extended_monkey.log 作为 fallback 日志输出，避免生成额外文件
+        fallback_log_path = self.log_path
+        total_duration_seconds = duration_hours * 3600.0
+        fallback_result = self._run_input_fallback(
+            duration_seconds=total_duration_seconds,
+            throttle_ms=int(throttle),
+            seed=seed,
+            log_path=fallback_log_path
+        )
+        result['fallback_direct'] = True
+        result['fallback_events'] = fallback_result.get('events_injected', 0)
+        result['fallback_duration'] = fallback_result.get('duration_seconds', 0.0)
 
     def _run_input_fallback(self, duration_seconds: float, throttle_ms: int, seed: int, log_path: str):
         """
@@ -238,7 +293,7 @@ class ExtendedMonkeyTest:
             pass
 
         try:
-            f = open(log_path, "a", encoding="utf-8")
+            f = open(log_path, "a", encoding="utf-8", errors="replace")
         except Exception:
             f = None
 
@@ -269,9 +324,9 @@ class ExtendedMonkeyTest:
             if now - last_foreground_check >= foreground_check_interval:
                 last_foreground_check = now
                 try:
-                    if not self._is_app_in_foreground():
+                    if not self._stress_monitor.is_app_in_foreground():
                         _log("[fallback] 检测到待测应用不在前台，主动拉起")
-                        self._ensure_app_in_foreground_for_fallback()
+                        self._stress_monitor.ensure_app_in_foreground()
                 except Exception as e:
                     logging.debug(f"[fallback] 前台检测/拉起异常: {e}")
             # 每 60 秒打一次进度，避免长时间无日志
@@ -429,71 +484,12 @@ class ExtendedMonkeyTest:
     def _ensure_app_in_foreground_for_fallback(self):
         """
         确保待测应用处于前台（fallback 注入前或压力测试期间守护线程调用）。
-
-        按顺序尝试多种拉起方式，每种方式执行后等待约 0.8s 再轮询前台状态；
-        任一步检测到前台即返回；全部尝试后仍非前台则记录 INFO 并返回（尽力而为）。
+        委托给 StressMonitor.ensure_app_in_foreground()。
         """
         try:
-            pkg = getattr(self.package, "name", None) or getattr(self.package, "package", None)
-            if isinstance(self.package, str):
-                pkg = pkg or self.package
-            activity = getattr(self.package, "activity", None) if hasattr(self.package, "activity") else None
-
-            if not pkg:
-                logging.warning("[fallback] 无法确定包名，跳过前台唤醒步骤")
-                return
-
-            wait_seconds = 5.0
-            try:
-                cfg_val = self.config.get("fallback_launch_wait_seconds")
-                if cfg_val is not None:
-                    wait_seconds = max(1.0, float(cfg_val))
-            except Exception:
-                pass
-
-            poll_interval = 0.5
-            settle_delay = 0.8  # 拉起命令执行后稍等再检测，便于窗口管理器更新
-
-            # 策略顺序：先 MAIN/LAUNCHER（不依赖 activity），再显式 -n pkg/activity，最后 monkey
-            strategies = []
-            strategies.append((
-                "am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p " + pkg,
-                f"adb -s {self.device.sn} shell am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p {pkg}",
-                10,
-            ))
-            if activity:
-                strategies.append((
-                    f"am start -W -n {pkg}/{activity}",
-                    f"adb -s {self.device.sn} shell am start -W -n {pkg}/{activity}",
-                    15,
-                ))
-            strategies.append((
-                "monkey -p " + pkg + " -c LAUNCHER 1",
-                f"adb -s {self.device.sn} shell monkey -p {pkg} -c android.intent.category.LAUNCHER 1",
-                10,
-            ))
-
-            for desc, cmd, timeout in strategies:
-                logging.info(f"[fallback] 尝试拉起应用到前台: {desc}")
-                out = run_cmd(cmd, timeout=timeout)
-                if out is None:
-                    logging.debug("[fallback] 该次命令超时，尝试下一方式")
-                elif isinstance(out, str) and ("Error" in out or "Exception" in out or "not found" in out.lower()):
-                    logging.debug(f"[fallback] 该次命令可能失败: {out[:200]}")
-                time.sleep(settle_delay)
-                deadline = time.time() + wait_seconds
-                while time.time() < deadline:
-                    if self._is_app_in_foreground():
-                        logging.info("[fallback] 检测到待测应用已在前台，继续执行")
-                        return
-                    time.sleep(poll_interval)
-                # 本策略未在限定时间内检测到前台，尝试下一策略
-
-            logging.info(
-                "[fallback] 已尝试所有拉起方式，将继续执行后续操作（若前台检测与设备输出格式不一致，可忽略）"
-            )
+            self._stress_monitor.ensure_app_in_foreground()
         except Exception as e:
-            logging.warning(f"[fallback] 前台唤醒应用失败（继续执行 fallback）: {e}")
+            logging.warning("[fallback] 前台唤醒应用失败（继续执行 fallback）: %s", e)
 
     def _ensure_foreground_during_monkey(self, process: subprocess.Popen, phase_duration_seconds: float):
         """
@@ -505,11 +501,11 @@ class ExtendedMonkeyTest:
         start_ts = time.time()
         while process.poll() is None and (time.time() - start_ts) < phase_duration_seconds:
             try:
-                if not self._is_app_in_foreground():
+                if not self._stress_monitor.is_app_in_foreground():
                     logging.info("[foreground-guard] 检测到待测应用不在前台，主动拉起应用到前台")
                     self._ensure_app_in_foreground_for_fallback()
                     time.sleep(1.0)  # 给设备时间完成窗口切换后再做一次验证
-                    if self._is_app_in_foreground():
+                    if self._stress_monitor.is_app_in_foreground():
                         logging.info("[foreground-guard] 拉起后确认待测应用已在前台，下一轮 2s 后再次检测")
                     else:
                         logging.info("[foreground-guard] 拉起后仍检测到应用不在前台，下一轮 2s 后将再次尝试")
@@ -749,11 +745,17 @@ class ExtendedMonkeyTest:
             )
 
             # 记录阶段结果
+            # 注意：performance_data 仅用于性能采样；分阶段结果写入 phase_results
+            planned = phase_result.get('events', 0)
+            executed = phase_result.get('events_completed')
+            if executed is None:
+                executed = planned
             phase_payload = {
                 'phase': phase + 1,
                 'start_time': phase_result['start_time'],
                 'end_time': phase_result['end_time'],
-                'events_executed': phase_result['events'],
+                'events_planned': planned,
+                'events_executed': executed,
                 'crashes_in_phase': phase_result['crashes'],
                 'anrs_in_phase': phase_result['anrs']
             }
@@ -767,7 +769,9 @@ class ExtendedMonkeyTest:
                 if phase_result.get("fallback"):
                     phase_payload["fallback"] = phase_result.get("fallback")
 
-            result['performance_data'].append(phase_payload)
+            if 'phase_results' not in result or not isinstance(result.get('phase_results'), list):
+                result['phase_results'] = []
+            result['phase_results'].append(phase_payload)
 
             result['crashes'] += phase_result['crashes']
             result['anrs'] += phase_result['anrs']
@@ -1326,38 +1330,18 @@ class ExtendedMonkeyTest:
                 os.makedirs(log_dir, exist_ok=True)
 
             # 打开文件（追加），逐条 flush，降低丢失风险
-            log_file = open(perf_log_path, 'a', encoding='utf-8')
+            log_file = open(perf_log_path, 'a', encoding='utf-8', errors='replace')
             while True:
                 try:
                     if self._stop_monitor.is_set():
                         break
 
                     # 前台/后台判定（以采样时应用所处状态为准）
-                    is_fg = self._is_app_in_foreground()
-                    mode = "foreground" if is_fg else "background"
-
-                    # 监控CPU使用率
-                    cpu_usage = self._get_cpu_usage()
-
-                    # 监控内存使用率
-                    mem_usage = self._get_memory_usage()
-
-                    # 记录性能数据（应用级 PSS：KB/MB）
-                    memory_mb = round(mem_usage / 1024.0, 2) if mem_usage > 0 else 0.0
-                    perf_data = {
-                        'timestamp': datetime.now().isoformat(),
-                        'app_cpu_pct': cpu_usage,
-                        'app_memory_pss_kb': mem_usage,
-                        'app_memory_pss_mb': memory_mb,
-                        'app_foreground_mode': mode,
-                        'device_sn': self.device.sn,
-                        'package': self.package.name,
-                    }
-
-                    result['performance_data'].append(perf_data)
+                    perf_data = self._stress_monitor._sample_performance_once()
+                    result["performance_data"].append(perf_data)
                     # 实时写入文件，减少异常丢失风险
-                    import json
-                    log_file.write(json.dumps(perf_data, ensure_ascii=False) + "\n")
+                    import json as _json
+                    log_file.write(_json.dumps(perf_data, ensure_ascii=False) + "\n")
                     log_file.flush()
                     try:
                         os.fsync(log_file.fileno())
@@ -1381,102 +1365,6 @@ class ExtendedMonkeyTest:
 
         return monitor_thread
 
-    def _get_cpu_usage(self):
-        """获取CPU使用率（多种方法尝试，提高兼容性）"""
-        pkg = getattr(self.package, "name", None) or getattr(self.package, "package", None)
-        if not pkg:
-            return 0.0
-        
-        # 方法1: top -n 1 -d 1（约 1 秒采样，避免 -d 0 瞬时采样导致常为 0%）
-        try:
-            cmd = f"adb -s {self.device.sn} shell top -n 1 -d 1"
-            result = run_cmd(cmd, timeout=5)
-            if result and isinstance(result, str):
-                for line in result.splitlines():
-                    if pkg in line:
-                        parts = line.split()
-                        for token in parts:
-                            if token.endswith('%'):
-                                cpu_str = token.rstrip('%')
-                                try:
-                                    cpu_val = float(cpu_str)
-                                    if cpu_val >= 0 and cpu_val <= 100:
-                                        return cpu_val
-                                except ValueError:
-                                    pass
-        except Exception:
-            pass
-        
-        # 方法2: dumpsys cpuinfo（部分设备更可靠）
-        try:
-            cmd = f"adb -s {self.device.sn} shell dumpsys cpuinfo | grep {pkg}"
-            result = run_cmd(cmd, timeout=3)
-            if result and isinstance(result, str):
-                import re
-                # 查找百分比，格式可能是 "XX%"
-                match = re.search(r'(\d+\.?\d*)%', result)
-                if match:
-                    cpu_val = float(match.group(1))
-                    if cpu_val >= 0 and cpu_val <= 100:
-                        return cpu_val
-        except Exception:
-            pass
-        
-        # 方法3: ps + top（组合方式，部分ROM需要）
-        try:
-            # 先获取进程PID
-            cmd = f"adb -s {self.device.sn} shell ps | grep {pkg}"
-            result = run_cmd(cmd, timeout=3)
-            if result and isinstance(result, str):
-                for line in result.splitlines():
-                    if pkg in line:
-                        parts = line.split()
-                        if len(parts) >= 2:
-                            pid = parts[1]
-                            # 用top查看该PID的CPU
-                            cmd2 = f"adb -s {self.device.sn} shell top -n 1 -d 1 -p {pid}"
-                            result2 = run_cmd(cmd2, timeout=5)
-                            if result2 and isinstance(result2, str):
-                                for line2 in result2.splitlines():
-                                    if pid in line2:
-                                        parts2 = line2.split()
-                                        for token in parts2:
-                                            if token.endswith('%'):
-                                                cpu_str = token.rstrip('%')
-                                                try:
-                                                    cpu_val = float(cpu_str)
-                                                    if cpu_val >= 0 and cpu_val <= 100:
-                                                        return cpu_val
-                                                except ValueError:
-                                                    pass
-        except Exception:
-            pass
-
-        return 0.0
-
-    def _get_memory_usage(self):
-        """获取内存使用率（PSS，单位：KB），返回KB值（后续转换为MB显示）"""
-        pkg = getattr(self.package, "name", None) or getattr(self.package, "package", None)
-        if not pkg:
-            return 0
-        
-        cmd = f"adb -s {self.device.sn} shell dumpsys meminfo {pkg}"
-        result = run_cmd(cmd, timeout=5)
-
-        if result and isinstance(result, str):
-            try:
-                for line in result.splitlines():
-                    if "TOTAL PSS:" in line:
-                        after = line.split("TOTAL PSS:")[1].strip()
-                        num_str = after.split()[0]
-                        # 移除可能的逗号分隔符
-                        num_str = num_str.replace(',', '')
-                        return int(num_str)
-            except Exception:
-                pass
-
-        return 0
-
     def _get_run_log_dir(self):
         """
         获取当前测试运行对应的日志目录。
@@ -1489,36 +1377,6 @@ class ExtendedMonkeyTest:
             return d
         # 兜底：按设备 SN 返回一个稳定路径
         return os.path.join("logs", str(self.device.sn))
-
-    def _is_app_in_foreground(self):
-        """
-        判断待测应用是否在前台：先查 window 焦点，再查 activity 栈顶，提高兼容性。
-        """
-        pkg = getattr(self.package, "name", None) or getattr(self.package, "package", None)
-        if not pkg:
-            return False
-        try:
-            # 方式1：dumpsys window windows 中的 mCurrentFocus / mFocusedApp
-            cmd = f"adb -s {self.device.sn} shell dumpsys window windows"
-            out = run_cmd(cmd, timeout=3)
-            if isinstance(out, str):
-                for line in out.splitlines():
-                    line = line.strip()
-                    if "mCurrentFocus" in line or "mFocusedApp" in line:
-                        if pkg in line:
-                            return True
-            # 方式2：dumpsys activity activities 中的 resumed 栈顶（部分机型焦点行格式不同）
-            cmd = f"adb -s {self.device.sn} shell dumpsys activity activities"
-            out = run_cmd(cmd, timeout=3)
-            if isinstance(out, str):
-                for line in out.splitlines():
-                    line = line.strip()
-                    if "mResumedActivity" in line or "resumed" in line.lower():
-                        if pkg in line:
-                            return True
-        except Exception:
-            return False
-        return False
 
     def _cleanup_app_state(self):
         """清理应用状态"""
@@ -1535,11 +1393,13 @@ class ExtendedMonkeyTest:
         如果发现太多崩溃或ANR，提前结束
         """
         # 如果单小时内崩溃超过5次或ANR超过3次，停止测试
-        recent_performance = result.get('performance_data', [])
-        if len(recent_performance) >= 120:  # 1小时的数据
-            recent_hour_data = recent_performance[-120:]
-            recent_crashes = sum(item.get('crashes_in_phase', 0) for item in recent_hour_data if 'crashes_in_phase' in item)
-            recent_anrs = sum(item.get('anrs_in_phase', 0) for item in recent_hour_data if 'anrs_in_phase' in item)
+        # 基于阶段统计判断是否需要提前结束（避免误用性能采样列表）
+        recent_phases = result.get('phase_results', [])
+        if len(recent_phases) >= 1:
+            # 取最近阶段汇总（阶段粒度比性能采样更稳定）
+            recent_hour_data = recent_phases[-max(1, min(5, len(recent_phases))):]
+            recent_crashes = sum(int(item.get('crashes_in_phase', 0) or 0) for item in recent_hour_data if isinstance(item, dict))
+            recent_anrs = sum(int(item.get('anrs_in_phase', 0) or 0) for item in recent_hour_data if isinstance(item, dict))
 
             if recent_crashes >= 5 or recent_anrs >= 3:
                 return True

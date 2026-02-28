@@ -1,10 +1,9 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+import logging
 import os
 import subprocess
-import datetime
-import signal
 from pathlib import Path
 
 
@@ -59,29 +58,31 @@ def run(cmd, timeout=10):
     运行带超时的 shell 命令。
     - 对 `adb ...` 命令：自动解析可用的 adb.exe（内置 or 环境变量 or PATH），替换命令前缀；
     - 返回值统一为 str（优先 utf-8 / gbk 解码），避免上层拿到 bytes 导致解析异常。
+    - 超时返回 None；非零退出返回包含 stderr 的字符串；解码失败使用 errors="replace" 兜底。
     """
-    # 兼容：通过环境变量 / 内置工具统一指定 adb 可执行文件路径
     stripped = cmd.lstrip()
     if stripped.startswith("adb "):
         adb_path = _resolve_adb_path()
         if adb_path:
-            # 尽量保持原命令结构，处理带空格路径
-            quoted = f"\"{adb_path}\"" if " " in adb_path and not adb_path.startswith("\"") else adb_path
-            # 仅替换第一个 adb 单词
+            quoted = f'"{adb_path}"' if " " in adb_path and not adb_path.startswith('"') else adb_path
             cmd = cmd.replace("adb", quoted, 1)
 
     try:
-        # 用 subprocess.run 处理 timeout，并在 Windows 下避免 os.kill(SIGKILL) 不兼容
         result = subprocess.run(
             cmd,
             shell=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=timeout
+            timeout=timeout,
         )
     except subprocess.TimeoutExpired:
+        logging.debug("Command timeout: %s", cmd[:100])
         return None
+    except subprocess.CalledProcessError as e:
+        logging.warning("Command failed with non-zero exit: %s, stderr: %s", cmd[:100], (e.stderr or b"")[:200])
+        data = e.stderr or e.stdout or b""
     except Exception as e:
+        logging.warning("Command execution error: %s, %s", cmd[:100], str(e))
         return f"error: {e}"
 
     out = result.stdout or b""
@@ -92,9 +93,15 @@ def run(cmd, timeout=10):
     for enc in ("utf-8", "gbk"):
         try:
             return data.decode(enc, errors="replace")
+        except UnicodeDecodeError:
+            continue
         except Exception:
             continue
     try:
         return data.decode(errors="replace")
-    except Exception:
+    except UnicodeDecodeError:
+        logging.warning("Failed to decode command output, using replacement: %s", cmd[:100])
+        return data.decode(errors="replace")
+    except Exception as e:
+        logging.warning("Unexpected decode error: %s", str(e))
         return str(data)

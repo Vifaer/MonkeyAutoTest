@@ -7,6 +7,7 @@
 """
 
 import os
+import re
 import json
 import time
 import logging
@@ -14,29 +15,48 @@ import subprocess
 import threading
 import collections
 from datetime import datetime, timedelta
+from typing import Any, Dict, Optional
 
 from utils.timeout_command import run as run_cmd
+
+# 内存中保留的性能采样条数上限，超出时保留最近一段，避免长时间压力测试 OOM
+MAX_PERF_SAMPLES_IN_MEMORY = 20000
+TRIM_PERF_SAMPLES_TO = 10000
 
 
 class StressMonitor:
     """压力测试监控器，提供前台检测、性能采样、logcat 采集与崩溃/ANR 分析"""
 
-    def __init__(self, device, package, config=None):
+    def __init__(
+        self,
+        device: Any,
+        package: Any,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> None:
         self.device = device
         self.package = package
         self.config = config or {}
         self._stop_monitor = threading.Event()
         self._stop_logcat = threading.Event()
         self._logcat_process = None
+        # 应用 PID 过滤日志（app.log）相关
+        self._stop_app_log = threading.Event()
+        self._app_log_process = None
+        # 设备异常目录监控结果（用于测试结束时触发 bugreport）
+        self._device_exception_found = threading.Event()
+        self._bugreport_lock = threading.Lock()
+        self._bugreport_path: Optional[str] = None
         # 设备时间与本机时间差（秒），用于将 logcat 时间戳对齐到本机时间轴，减少统计误差
         self._device_time_offset = None
         # ERROR 日志监控
         self._error_monitor_stop = threading.Event()
+        # CPU 核数缓存（用于将单进程CPU占比归一化到整机核数）
+        self._cpu_core_count = None
 
-    def _get_package_name(self):
+    def _get_package_name(self) -> str:
         return getattr(self.package, "name", None) or getattr(self.package, "package", None) or ""
 
-    def is_app_in_foreground(self):
+    def is_app_in_foreground(self) -> bool:
         """判断待测应用是否在前台"""
         pkg = self._get_package_name()
         if not pkg:
@@ -62,7 +82,7 @@ class StressMonitor:
             pass
         return False
 
-    def ensure_app_in_foreground(self):
+    def ensure_app_in_foreground(self) -> None:
         """确保待测应用处于前台，不在则拉起"""
         pkg = self._get_package_name()
         if not pkg:
@@ -96,85 +116,100 @@ class StressMonitor:
                 time.sleep(poll_interval)
         logging.info("[stress-monitor] 已尝试所有拉起方式，将继续执行")
 
-    def get_cpu_usage(self):
+    def _parse_top_output_for_cpu(
+        self, top_output: str, pkg: str
+    ) -> tuple[float, float]:
+        """
+        从一次 top -n 1 -d 1 输出中同时解析设备总 CPU 与目标进程 CPU。
+        返回 (app_cpu_pct, device_cpu_total_pct)；解析不到时对应值为 0.0。
+        减少 adb 调用次数：单次 top 即可得到两项指标（设备格式稳定时）。
+        """
+        app_cpu = 0.0
+        device_cpu = 0.0
+        if not top_output or not isinstance(top_output, str):
+            return (app_cpu, device_cpu)
+        lines = top_output.splitlines()
+        for line in lines:
+            # 首行常为 "User 12%, Kernel 5%, IOW 0%, IRQ 0%"
+            m = re.search(r"User\s*(\d+)%", line, re.I)
+            if m:
+                user = int(m.group(1))
+                kernel = 0
+                mk = re.search(r"Kernel\s*(\d+)%", line, re.I)
+                if mk:
+                    kernel = int(mk.group(1))
+                total = user + kernel
+                if 0 <= total <= 100:
+                    device_cpu = float(total)
+                break
+        if device_cpu == 0.0:
+            for line in lines:
+                if re.match(r"^\s*CPU\s*:", line) or "Total:" in line:
+                    m = re.search(r"(\d+(?:\.\d+)?)\s*%", line)
+                    if m:
+                        device_cpu = float(m.group(1))
+                        break
+        for line in lines:
+            if pkg in line:
+                parts = line.split()
+                for token in parts:
+                    if token.endswith("%"):
+                        try:
+                            v = float(token.rstrip("%"))
+                            if 0 <= v <= 100:
+                                app_cpu = v
+                                break
+                        except ValueError:
+                            pass
+                break
+        return (app_cpu, device_cpu)
+
+    def get_cpu_usage(self) -> float:
         """
         获取待测应用 CPU 使用率（%）。
-
-        使用 top -n 1 -d 1 进行约 1 秒采样再输出，避免 -d 0 瞬时采样导致多数为 0%。
-        若 top 未列出该进程（如后台被折叠）或解析失败，则尝试 dumpsys cpuinfo 作为回退。
+        使用 top -n 1 -d 1 进行约 1 秒采样；若 top 未列出该进程则尝试 dumpsys cpuinfo。
         """
         pkg = self._get_package_name()
         if not pkg:
             return 0.0
         try:
-            # 使用 -d 1 让 top 采样约 1 秒再输出，否则 -d 0 瞬时采样常为 0%
             cmd = f"adb -s {self.device.sn} shell top -n 1 -d 1"
             result = run_cmd(cmd, timeout=5)
             if result and isinstance(result, str):
-                for line in result.splitlines():
-                    if pkg in line:
-                        parts = line.split()
-                        for token in parts:
-                            if token.endswith('%'):
-                                try:
-                                    cpu_val = float(token.rstrip('%'))
-                                    if 0 <= cpu_val <= 100:
-                                        return cpu_val
-                                except ValueError:
-                                    pass
-            # 回退：dumpsys cpuinfo 会列出各进程 CPU，部分 ROM 在后台也会包含目标包
+                app_cpu, _ = self._parse_top_output_for_cpu(result, pkg)
+                if app_cpu > 0:
+                    return app_cpu
             cmd2 = f"adb -s {self.device.sn} shell dumpsys cpuinfo"
             result2 = run_cmd(cmd2, timeout=5)
             if result2 and isinstance(result2, str):
-                import re
                 for line in result2.splitlines():
                     if pkg in line:
-                        # 格式常见为 "12% 12345/com.svw.avatar: 8% user + 4% kernel"
                         m = re.search(r"(\d+(?:\.\d+)?)\s*%", line)
                         if m:
                             try:
-                                cpu_val = float(m.group(1))
-                                if 0 <= cpu_val <= 100:
-                                    return cpu_val
+                                v = float(m.group(1))
+                                if 0 <= v <= 100:
+                                    return v
                             except ValueError:
                                 pass
         except Exception:
             pass
         return 0.0
 
-    def get_device_cpu_total(self):
+    def get_device_cpu_total(self) -> float:
         """
         获取设备总体 CPU 使用率（0–100%）。从 top 首行或 dumpsys cpuinfo 解析。
-        说明：应用 CPU（app_cpu_pct）为单进程占比，多核下可能超过 100%；设备总 CPU 为整机平均，
-        故可能出现 app_cpu_pct > device_cpu_pct，属正常现象。
         """
         try:
             cmd = f"adb -s {self.device.sn} shell top -n 1 -d 1"
             result = run_cmd(cmd, timeout=5)
             if result and isinstance(result, str):
-                import re
-                lines = result.splitlines()
-                for line in lines:
-                    # 首行常为 "User 12%, Kernel 5%, IOW 0%, IRQ 0%"
-                    m = re.search(r"User\s*(\d+)%", line, re.I)
-                    if m:
-                        user = int(m.group(1))
-                        kernel = 0
-                        mk = re.search(r"Kernel\s*(\d+)%", line, re.I)
-                        if mk:
-                            kernel = int(mk.group(1))
-                        total = user + kernel
-                        if 0 <= total <= 100:
-                            return float(total)
-                for line in lines:
-                    if re.match(r"^\s*CPU\s*:", line) or "Total:" in line:
-                        m = re.search(r"(\d+(?:\.\d+)?)\s*%", line)
-                        if m:
-                            return float(m.group(1))
+                _, device_cpu = self._parse_top_output_for_cpu(result, "")
+                if device_cpu > 0:
+                    return device_cpu
             cmd2 = f"adb -s {self.device.sn} shell dumpsys cpuinfo"
             result2 = run_cmd(cmd2, timeout=5)
             if result2 and isinstance(result2, str):
-                import re
                 m = re.search(r"Total:\s*(\d+(?:\.\d+)?)\s*%", result2)
                 if m:
                     return float(m.group(1))
@@ -182,13 +217,43 @@ class StressMonitor:
             pass
         return 0.0
 
-    def get_device_memory_total_mb(self):
+    def get_cpu_core_count(self) -> int:
+        """
+        获取设备 CPU 核心数。优先解析 /proc/cpuinfo 中 processor 行数，失败时回退为 1。
+        结果会缓存到实例属性，避免每次采样都触发 adb。
+        """
+        if isinstance(getattr(self, "_cpu_core_count", None), int) and self._cpu_core_count > 0:
+            return self._cpu_core_count
+        cores = 0
+        try:
+            out = run_cmd(f"adb -s {self.device.sn} shell cat /proc/cpuinfo", timeout=5)
+            if isinstance(out, str):
+                for line in out.splitlines():
+                    if line.lower().startswith("processor"):
+                        cores += 1
+        except Exception:
+            cores = 0
+        if cores <= 0:
+            try:
+                out2 = run_cmd(f"adb -s {self.device.sn} shell nproc", timeout=3)
+                if isinstance(out2, str):
+                    last = out2.strip().splitlines()[-1].strip()
+                    v = int(last)
+                    if v > 0:
+                        cores = v
+            except Exception:
+                cores = 0
+        if cores <= 0:
+            cores = 1
+        self._cpu_core_count = cores
+        return cores
+
+    def get_device_memory_total_mb(self) -> float:
         """
         获取设备总体已用内存（MB）。用于与应用 PSS 区分，表示整机已用 RAM。
         优先使用 /proc/meminfo 的 MemTotal - MemFree（更稳定）；若失败则尝试 dumpsys meminfo。
         若 dumpsys 解析值过小（< 50 MB）则视为异常，回退到 /proc/meminfo。
         """
-        import re
         # 1) /proc/meminfo 最可靠：MemTotal - MemFree = 已用内存 (kB)
         try:
             cmd2 = f"adb -s {self.device.sn} shell cat /proc/meminfo"
@@ -235,7 +300,7 @@ class StressMonitor:
             pass
         return 0.0
 
-    def get_memory_usage(self):
+    def get_memory_usage(self) -> int:
         """获取内存使用量 PSS（KB）"""
         pkg = self._get_package_name()
         if not pkg:
@@ -253,51 +318,82 @@ class StressMonitor:
                 pass
         return 0
 
-    def start_monitoring_thread(self, result, interval_seconds, perf_log_path):
+    def _sample_performance_once(self) -> Dict[str, Any]:
+        """
+        执行一次性能采样，返回单条性能数据字典。
+        单次 top 输出同时解析应用 CPU 与设备总 CPU，减少 adb 调用。
+        """
+        is_fg = self.is_app_in_foreground()
+        mode = "foreground" if is_fg else "background"
+        pkg = self._get_package_name()
+        app_cpu_raw = 0.0
+        device_cpu_pct = 0.0
+        try:
+            cmd = f"adb -s {self.device.sn} shell top -n 1 -d 1"
+            top_out = run_cmd(cmd, timeout=5)
+            if top_out and isinstance(top_out, str):
+                app_cpu_raw, device_cpu_pct = self._parse_top_output_for_cpu(top_out, pkg)
+        except Exception:
+            pass
+        if app_cpu_raw == 0.0 and pkg:
+            app_cpu_raw = self.get_cpu_usage()
+        if device_cpu_pct == 0.0:
+            device_cpu_pct = self.get_device_cpu_total()
+        cores = self.get_cpu_core_count()
+        app_cpu_pct = round(app_cpu_raw / float(cores), 2) if cores > 0 else app_cpu_raw
+        mem_usage = self.get_memory_usage()
+        memory_mb = round(mem_usage / 1024.0, 2) if mem_usage > 0 else 0.0
+        device_memory_used_mb = self.get_device_memory_total_mb()
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "app_cpu_pct": app_cpu_pct,
+            "app_memory_pss_kb": mem_usage,
+            "app_memory_pss_mb": memory_mb,
+            "app_foreground_mode": mode,
+            "device_cpu_pct": device_cpu_pct,
+            "device_memory_used_mb": device_memory_used_mb,
+            "device_sn": self.device.sn,
+            "package": pkg,
+        }
+
+    def start_monitoring_thread(
+        self,
+        result: Dict[str, Any],
+        interval_seconds: float,
+        perf_log_path: str,
+    ) -> threading.Thread:
         """启动后台监控线程：每 interval_seconds 采样 CPU/内存并写入 JSONL"""
-        def monitor():
+        def monitor() -> None:
             log_dir = os.path.dirname(perf_log_path)
             if log_dir and not os.path.exists(log_dir):
                 os.makedirs(log_dir, exist_ok=True)
-            log_file = open(perf_log_path, 'a', encoding='utf-8')
-            while True:
-                try:
-                    if self._stop_monitor.is_set():
-                        break
-                    is_fg = self.is_app_in_foreground()
-                    mode = "foreground" if is_fg else "background"
-                    cpu_usage = self.get_cpu_usage()
-                    mem_usage = self.get_memory_usage()
-                    memory_mb = round(mem_usage / 1024.0, 2) if mem_usage > 0 else 0.0
-                    device_cpu_pct = self.get_device_cpu_total()
-                    device_memory_used_mb = self.get_device_memory_total_mb()
-                    perf_data = {
-                        'timestamp': datetime.now().isoformat(),
-                        'app_cpu_pct': cpu_usage,
-                        'app_memory_pss_kb': mem_usage,
-                        'app_memory_pss_mb': memory_mb,
-                        'app_foreground_mode': mode,
-                        'device_cpu_pct': device_cpu_pct,
-                        'device_memory_used_mb': device_memory_used_mb,
-                        'device_sn': self.device.sn,
-                        'package': self._get_package_name(),
-                    }
-                    result['performance_data'].append(perf_data)
-                    log_file.write(json.dumps(perf_data, ensure_ascii=False) + "\n")
-                    log_file.flush()
-                    try:
-                        os.fsync(log_file.fileno())
-                    except Exception:
-                        pass
-                    time.sleep(interval_seconds)
-                except Exception as e:
-                    logging.warning(f"性能监控出错: {str(e)}")
-                    time.sleep(interval_seconds)
+            log_file = open(perf_log_path, "a", encoding="utf-8", errors="replace")
             try:
-                log_file.flush()
-                log_file.close()
-            except Exception:
-                pass
+                while True:
+                    try:
+                        if self._stop_monitor.is_set():
+                            break
+                        perf_data = self._sample_performance_once()
+                        result["performance_data"].append(perf_data)
+                        # 长时间运行限制内存中列表长度，报告可从 JSONL 读取完整数据
+                        if len(result["performance_data"]) > MAX_PERF_SAMPLES_IN_MEMORY:
+                            result["performance_data"] = result["performance_data"][-TRIM_PERF_SAMPLES_TO:]
+                        log_file.write(json.dumps(perf_data, ensure_ascii=False) + "\n")
+                        log_file.flush()
+                        try:
+                            os.fsync(log_file.fileno())
+                        except Exception:
+                            pass
+                        time.sleep(interval_seconds)
+                    except Exception as e:
+                        logging.warning("性能监控出错: %s", str(e))
+                        time.sleep(interval_seconds)
+            finally:
+                try:
+                    log_file.flush()
+                    log_file.close()
+                except Exception:
+                    pass
         t = threading.Thread(target=monitor, daemon=True)
         t.start()
         return t
@@ -376,6 +472,7 @@ class StressMonitor:
         """停止监控与 logcat"""
         self._stop_monitor.set()
         self._stop_logcat.set()
+        self._stop_app_log.set()
         self._error_monitor_stop.set()
         if self._logcat_process and self._logcat_process.poll() is None:
             try:
@@ -384,6 +481,554 @@ class StressMonitor:
             except Exception:
                 pass
         self._logcat_process = None
+        if self._app_log_process and self._app_log_process.poll() is None:
+            try:
+                self._app_log_process.terminate()
+                self._app_log_process.wait(timeout=2)
+            except Exception:
+                pass
+        self._app_log_process = None
+
+    # -------------------- 设备异常目录（/data/anr, /data/tombstones）监控 --------------------
+
+    def clear_device_exception_dirs(self) -> None:
+        """
+        测试前清空设备异常目录，排除历史干扰日志：
+        - /data/anr
+        - /data/tombstones
+
+        注意：部分设备需要 root 才能访问/清理；失败仅记录 warning，不中断测试。
+        """
+        for d in ("/data/anr", "/data/tombstones"):
+            try:
+                cmd = f"adb -s {self.device.sn} shell rm -f {d}/*"
+                out = run_cmd(cmd, timeout=8)
+                # run_cmd 返回 None 表示超时，字符串中包含错误关键字则视为失败，否则视为成功
+                if out is None:
+                    logging.warning("[device-exc] 清理目录失败（命令超时）: %s", d)
+                else:
+                    s = str(out).strip()
+                    if any(err in s for err in ("Permission denied", "Operation not permitted", "No such file or directory")):
+                        logging.warning("[device-exc] 清理目录失败（adb 返回错误）%s: %s", d, s[:200])
+                    else:
+                        logging.info("[device-exc] 清理目录成功: %s", d)
+            except Exception as e:
+                logging.warning("[device-exc] 清理目录失败（可忽略）%s: %s", d, e)
+
+    def start_exception_file_monitor(self, run_log_dir: str, interval_seconds: float = 10.0) -> threading.Thread:
+        """
+        测试期间监控设备异常目录 /data/anr 与 /data/tombstones：
+        - 增量发现新文件
+        - 判断内容是否属于待测应用（通过包名匹配）
+        - 将原始文件内容转储到本地 logs/<sn>/<ts>/anr|tombstones
+        - 将元数据写入 device_exceptions.log，并在 app.log 末尾追加概要行
+
+        优先使用 adb pull 进行转储（更高效），pull 失败时保留 cat 兜底。
+        """
+        pkg = self._get_package_name().strip()
+        if not pkg or not run_log_dir:
+            t = threading.Thread(target=lambda: None, daemon=True)
+            t.start()
+            return t
+
+        try:
+            os.makedirs(run_log_dir, exist_ok=True)
+        except Exception:
+            pass
+
+        processed_anr = set()
+        processed_tomb = set()
+
+        def _list_remote(remote_dir: str) -> list:
+            try:
+                out = run_cmd(f"adb -s {self.device.sn} shell ls {remote_dir}", timeout=6)
+                if not isinstance(out, str):
+                    return []
+                names = []
+                for line in out.splitlines():
+                    s = line.strip()
+                    if not s or s in (".", ".."):
+                        continue
+                    # ls 可能返回错误信息，简单过滤
+                    if "No such file" in s or "Permission denied" in s:
+                        continue
+                    names.append(s)
+                return names
+            except Exception:
+                return []
+
+        def _pull_remote(remote_path: str, local_path: str) -> bool:
+            """
+            优先使用 adb pull 将设备文件转储到本地。
+            注意：部分设备/目录需要 root 权限，pull 可能失败。
+            """
+            try:
+                run_cmd(f'adb -s {self.device.sn} pull "{remote_path}" "{local_path}"', timeout=30)
+                return os.path.isfile(local_path) and os.path.getsize(local_path) > 0
+            except Exception:
+                return False
+
+        def _read_remote_cat(remote_path: str) -> str:
+            """pull 失败时的兜底读取方式（adb shell cat）"""
+            try:
+                out = run_cmd(f"adb -s {self.device.sn} shell cat {remote_path}", timeout=20)
+                return out if isinstance(out, str) else ""
+            except Exception:
+                return ""
+
+        def _read_local(local_path: str) -> str:
+            try:
+                with open(local_path, "r", encoding="utf-8", errors="replace") as f:
+                    return f.read()
+            except Exception:
+                return ""
+
+        def _is_match(content: str) -> bool:
+            if not content:
+                return False
+            if f"Cmd line: {pkg}" in content:
+                return True
+            if f">>> {pkg} <<<" in content:
+                return True
+            return False
+
+        def _write_index(exc_type: str, src_path: str, local_path: str) -> None:
+            now = datetime.now().isoformat()
+            idx_path = os.path.join(run_log_dir, "device_exceptions.log")
+            line = f"[{now}] type={exc_type} pkg={pkg} src={src_path} local={local_path}\n"
+            try:
+                with open(idx_path, "a", encoding="utf-8", errors="replace") as f:
+                    f.write(line)
+            except Exception:
+                pass
+            # 同步概要到 app.log，供报告实时展示
+            try:
+                app_path = os.path.join(run_log_dir, "app.log")
+                with open(app_path, "a", encoding="utf-8", errors="replace") as f:
+                    f.write(f"# [device-exception] {line}")
+            except Exception:
+                pass
+            # 标记：本次运行中已发现设备侧异常文件
+            try:
+                self._device_exception_found.set()
+            except Exception:
+                pass
+
+        def _worker() -> None:
+            while not self._stop_monitor.is_set():
+                try:
+                    for remote_dir, local_subdir, processed, exc_type in (
+                        ("/data/anr", "anr", processed_anr, "ANR"),
+                        ("/data/tombstones", "tombstones", processed_tomb, "Crash"),
+                    ):
+                        names = _list_remote(remote_dir)
+                        if not names:
+                            continue
+                        for name in names:
+                            if name in processed:
+                                continue
+                            processed.add(name)
+                            src_path = f"{remote_dir}/{name}"
+                            local_dir = os.path.join(run_log_dir, local_subdir)
+                            try:
+                                os.makedirs(local_dir, exist_ok=True)
+                            except Exception:
+                                pass
+                            local_path = os.path.join(local_dir, name)
+                            pulled = _pull_remote(src_path, local_path)
+                            if pulled:
+                                content = _read_local(local_path)
+                                if not _is_match(content):
+                                    # 非目标应用相关：删除本地文件，避免污染
+                                    try:
+                                        os.remove(local_path)
+                                    except Exception:
+                                        pass
+                                    continue
+                                # 为本地文件补齐源路径头（pull 得到的原始文件不包含）
+                                try:
+                                    if not content.startswith("# src:"):
+                                        with open(local_path, "w", encoding="utf-8", errors="replace") as f:
+                                            f.write(f"# src: {src_path}\n")
+                                            f.write(content)
+                                except Exception:
+                                    pass
+                                _write_index(exc_type, src_path, local_path)
+                                continue
+
+                            # pull 失败：兜底 cat（仅当匹配才落盘）
+                            content = _read_remote_cat(src_path)
+                            if not _is_match(content):
+                                continue
+                            try:
+                                with open(local_path, "w", encoding="utf-8", errors="replace") as f:
+                                    f.write(f"# src: {src_path}\n")
+                                    f.write(content)
+                            except Exception as e:
+                                logging.warning("[device-exc] 写入本地异常文件失败 %s: %s", local_path, e)
+                                continue
+                            _write_index(exc_type, src_path, local_path)
+                except Exception as e:
+                    logging.debug("[device-exc] 监控线程异常（忽略继续）: %s", e)
+                # 轮询间隔
+                try:
+                    time.sleep(max(1.0, float(interval_seconds)))
+                except Exception:
+                    time.sleep(10.0)
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        return t
+
+    @staticmethod
+    def collect_bugreport_if_needed(
+        device_sn: str,
+        package_name: str,
+        run_log_dir: str,
+        timeout_seconds: int = 900,
+        reason: str = "",
+    ) -> Optional[str]:
+        """
+        若设备侧存在与目标应用相关的 ANR/tombstone（通过内容包名匹配），则导出 bugreport 到本地：
+          logs/<sn>/<ts>/bugreport/bugreport_<sn>_<YYYYMMDD_HHMMSS>.zip
+
+        - 该函数可在“测试完成”或“外部手动停止（子进程被杀）后”由 GUI 进程调用
+        - 失败仅返回 None，不抛异常（避免影响主流程）
+        """
+        sn = (device_sn or "").strip()
+        pkg = (package_name or "").strip()
+        trigger_reason = (reason or "测试结束").strip() or "测试结束"
+
+        logging.info("[bugreport] ---------- 开始检查是否需导出 bugreport ----------")
+        logging.info("[bugreport] 触发原因: %s | 设备: %s | 包名: %s | 日志目录: %s", trigger_reason, sn, pkg, run_log_dir)
+
+        if not sn or not pkg or not run_log_dir:
+            logging.warning("[bugreport] 参数不完整（设备/包名/日志目录为空），跳过导出")
+            return None
+        if not os.path.isdir(run_log_dir):
+            try:
+                os.makedirs(run_log_dir, exist_ok=True)
+            except Exception as e:
+                logging.warning("[bugreport] 无法创建日志目录 %s: %s", run_log_dir, e)
+                return None
+
+        # 若已存在 bugreport 文件，直接返回一个（避免重复采集）
+        try:
+            bd = os.path.join(run_log_dir, "bugreport")
+            if os.path.isdir(bd):
+                existing = [fn for fn in os.listdir(bd) if fn.lower().endswith(".zip")]
+                if existing:
+                    path = os.path.join(bd, sorted(existing)[-1])
+                    logging.info("[bugreport] 已存在本次运行的 bugreport 文件，跳过重复导出: %s", path)
+                    logging.info("[bugreport] ---------- 检查结束（使用已有文件）----------")
+                    return path
+        except Exception as e:
+            logging.debug("[bugreport] 检查已存在 bugreport 时异常: %s", e)
+
+        def _list_remote(remote_dir: str) -> list:
+            try:
+                out = run_cmd(f"adb -s {sn} shell ls {remote_dir}", timeout=6)
+                if not isinstance(out, str):
+                    return []
+                names = []
+                for line in out.splitlines():
+                    s = line.strip()
+                    if not s or s in (".", ".."):
+                        continue
+                    if "No such file" in s or "Permission denied" in s:
+                        continue
+                    names.append(s)
+                return names
+            except Exception:
+                return []
+
+        def _remote_file_matches(remote_path: str) -> bool:
+            """
+            轻量判断是否与目标应用相关：
+            - ANR: Cmd line: <pkg>
+            - tombstone: >>> <pkg> <<<
+            说明：仅依赖设备侧可读权限；若权限不足，返回 False（不触发 bugreport）。
+            """
+            try:
+                # 设备侧 grep（可能不存在/权限不足），失败时返回 False
+                p1 = f'Cmd line: {pkg}'
+                out1 = run_cmd(f'adb -s {sn} shell grep -m 1 -F "{p1}" "{remote_path}"', timeout=8)
+                if isinstance(out1, str) and p1 in out1:
+                    return True
+                p2 = f">>> {pkg} <<<"
+                out2 = run_cmd(f'adb -s {sn} shell grep -m 1 -F "{p2}" "{remote_path}"', timeout=8)
+                if isinstance(out2, str) and p2 in out2:
+                    return True
+            except Exception:
+                return False
+            return False
+
+        # 1) 终局检查：设备侧是否存在与 pkg 匹配的异常文件
+        matched = []
+        try:
+            for remote_dir in ("/data/anr", "/data/tombstones"):
+                for name in _list_remote(remote_dir):
+                    rp = f"{remote_dir}/{name}"
+                    if _remote_file_matches(rp):
+                        matched.append(rp)
+        except Exception as e:
+            logging.warning("[bugreport] 扫描设备异常目录时出错: %s", e)
+            matched = []
+
+        if not matched:
+            logging.info("[bugreport] 未发现与目标包名 [%s] 相关的 ANR/tombstone 文件，无需导出 bugreport", pkg)
+            logging.info("[bugreport] ---------- 检查结束（无需导出）----------")
+            return None
+
+        logging.info("[bugreport] 发现与目标包名 [%s] 相关的异常文件，共 %d 个:", pkg, len(matched))
+        for rp in matched[:20]:
+            logging.info("[bugreport]   - %s", rp)
+        if len(matched) > 20:
+            logging.info("[bugreport]   - ... 及其他 %d 个", len(matched) - 20)
+
+        # 2) 导出 bugreport
+        try:
+            bug_dir = os.path.join(run_log_dir, "bugreport")
+            os.makedirs(bug_dir, exist_ok=True)
+        except Exception as e:
+            logging.warning("[bugreport] 创建 bugreport 目录失败: %s", e)
+            return None
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_zip = os.path.join(bug_dir, f"bugreport_{sn}_{ts}.zip")
+        logging.info("[bugreport] 开始导出 bugreport（目标: %s），过程可能需数分钟，请稍候...", out_zip)
+
+        export_ok = False
+        export_error = ""
+        try:
+            out = run_cmd(f'adb -s {sn} bugreport "{out_zip}"', timeout=int(timeout_seconds))
+            if out is None:
+                export_error = "命令超时（未在限定时间内完成）"
+            elif isinstance(out, str) and (
+                "error" in out.lower() or "permission denied" in out.lower() or "not found" in out.lower()
+            ):
+                export_error = out.strip()[:300]
+            elif os.path.isfile(out_zip) and os.path.getsize(out_zip) > 0:
+                export_ok = True
+            else:
+                export_error = "未生成有效 zip 文件或文件为空"
+        except Exception as e:
+            export_error = str(e)
+
+        if not export_ok:
+            logging.warning("[bugreport] 导出失败: %s", export_error or "未知原因")
+            logging.info("[bugreport] ---------- bugreport 导出流程结束（失败）----------")
+            return None
+
+        size_mb = os.path.getsize(out_zip) / (1024 * 1024)
+        logging.info("[bugreport] 导出成功，文件: %s（大小: %.1f MB）", out_zip, size_mb)
+
+        # 3) 写入索引与 app.log，供报告标记与定位
+        try:
+            idx_path = os.path.join(run_log_dir, "device_exceptions.log")
+            with open(idx_path, "a", encoding="utf-8", errors="replace") as f:
+                f.write(
+                    f"[{datetime.now().isoformat()}] type=BUGREPORT pkg={pkg} local={out_zip} reason={reason} matched={len(matched)}\n"
+                )
+        except Exception:
+            pass
+        try:
+            app_path = os.path.join(run_log_dir, "app.log")
+            with open(app_path, "a", encoding="utf-8", errors="replace") as f:
+                f.write(
+                    f"# [bugreport] local={out_zip} reason={reason} matched={len(matched)}\n"
+                )
+                for rp in matched[:20]:
+                    f.write(f"# [bugreport] matched_src={rp}\n")
+        except Exception:
+            pass
+        try:
+            with open(os.path.join(bug_dir, "bugreport_path.txt"), "w", encoding="utf-8", errors="replace") as f:
+                f.write(out_zip)
+                f.write("\n")
+        except Exception:
+            pass
+
+        logging.info("[bugreport] ---------- bugreport 检查与导出流程结束 ----------")
+        return out_zip
+
+    def maybe_collect_bugreport(self, run_log_dir: str, reason: str = "") -> Optional[str]:
+        """
+        实例方法封装：在测试结束时调用。
+        - 若监控期间已发现异常文件（或终局扫描发现），则导出 bugreport
+        """
+        pkg = self._get_package_name().strip()
+        sn = getattr(getattr(self, "device", None), "sn", "") or ""
+        trigger_reason = (reason or "测试结束").strip() or "测试结束"
+
+        logging.info("[bugreport] 测试结束/停止时尝试导出 bugreport（原因: %s）", trigger_reason)
+
+        try:
+            with self._bugreport_lock:
+                if self._bugreport_path and os.path.isfile(self._bugreport_path):
+                    logging.info("[bugreport] 使用已导出的 bugreport，跳过重复导出: %s", self._bugreport_path)
+                    return self._bugreport_path
+                out = self.collect_bugreport_if_needed(sn, pkg, run_log_dir, reason=trigger_reason)
+                if out:
+                    self._bugreport_path = out
+                    logging.info("[bugreport] 本次导出结果: 成功，路径: %s", out)
+                else:
+                    logging.info("[bugreport] 本次导出结果: 未触发或未发现相关异常文件，未生成新 bugreport")
+                return out
+        except Exception as e:
+            logging.warning("[bugreport] 导出过程发生异常: %s", e)
+            return None
+
+    # -------------------- 应用 PID 基础工具 --------------------
+
+    def _get_app_pid(self) -> Optional[int]:
+        """
+        通过包名获取当前应用 PID。
+
+        优先使用 pidof，失败时回退到 ps 解析。
+        """
+        pkg = self._get_package_name().strip()
+        if not pkg:
+            return None
+        try:
+            # 尝试 pidof
+            cmd = f"adb -s {self.device.sn} shell pidof {pkg}"
+            out = run_cmd(cmd, timeout=3)
+            if isinstance(out, str):
+                parts = out.strip().split()
+                if parts:
+                    try:
+                        return int(parts[0])
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        try:
+            # 回退到 ps 解析
+            cmd = f"adb -s {self.device.sn} shell ps -A | grep {pkg}"
+            out = run_cmd(cmd, timeout=5)
+            if isinstance(out, str):
+                for line in out.splitlines():
+                    line = line.strip()
+                    if not line or pkg not in line:
+                        continue
+                    parts = line.split()
+                    # 通用 ps：USER PID ... NAME
+                    for token in parts:
+                        if token.isdigit():
+                            try:
+                                return int(token)
+                            except Exception:
+                                continue
+        except Exception:
+            pass
+        return None
+
+    def start_app_log_capture(self, app_log_path: str) -> threading.Thread:
+        """
+        启动基于 PID 的应用日志抓取线程：adb logcat --pid <pid> -v threadtime -> app.log。
+
+        - 每 2 秒检查一次 PID，应用重启时自动切换到新 PID。
+        - 日志以 UTF-8 写入，确保中文显示正常。
+        """
+        pkg = self._get_package_name().strip()
+        if not pkg:
+            logging.warning("[app-log] 未指定包名，跳过应用日志采集")
+            # 返回一个空线程占位，避免调用方出错
+            t = threading.Thread(target=lambda: None, daemon=True)
+            t.start()
+            return t
+
+        self._stop_app_log.clear()
+
+        def _worker() -> None:
+            last_pid = None
+            while not (self._stop_monitor.is_set() or self._stop_app_log.is_set()):
+                try:
+                    pid = self._get_app_pid()
+                    if not pid:
+                        time.sleep(2.0)
+                        continue
+                    last_pid = pid
+                    try:
+                        from utils.timeout_command import _resolve_adb_path
+                        adb_path = _resolve_adb_path() or "adb"
+                    except Exception:
+                        adb_path = "adb"
+                    cmd = [
+                        adb_path,
+                        "-s",
+                        self.device.sn,
+                        "logcat",
+                        "--pid",
+                        str(pid),
+                        "-v",
+                        "threadtime",
+                    ]
+                    logging.info("[app-log] 启动应用日志采集: pid=%s", pid)
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                    self._app_log_process = proc
+                    # 确保目录存在
+                    log_dir = os.path.dirname(app_log_path)
+                    if log_dir and not os.path.exists(log_dir):
+                        try:
+                            os.makedirs(log_dir, exist_ok=True)
+                        except Exception:
+                            pass
+                    with open(app_log_path, "a", encoding="utf-8", errors="replace") as f:
+                        last_check = time.time()
+                        while not (self._stop_monitor.is_set() or self._stop_app_log.is_set()):
+                            if proc.poll() is not None:
+                                break
+                            try:
+                                line = proc.stdout.readline()
+                                if line:
+                                    f.write(line)
+                                    f.flush()
+                            except Exception:
+                                break
+                            # 定期检查 PID 是否变化
+                            now = time.time()
+                            if now - last_check >= 2.0:
+                                last_check = now
+                                new_pid = self._get_app_pid()
+                                if new_pid and new_pid != pid:
+                                    msg = (
+                                        f"# [app-log] PID changed from {pid} to {new_pid} "
+                                        f"at {datetime.now().isoformat()}\n"
+                                    )
+                                    f.write(msg)
+                                    f.flush()
+                                    logging.info("[app-log] 检测到 PID 变化: %s -> %s，重启 logcat", pid, new_pid)
+                                    break
+                            time.sleep(0.05)
+                    # 结束当前 logcat 进程
+                    if proc.poll() is None:
+                        try:
+                            proc.terminate()
+                            proc.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            try:
+                                proc.kill()
+                                proc.wait(timeout=1)
+                            except Exception:
+                                pass
+                    self._app_log_process = None
+                    # 若是 PID 变化导致的中断，则继续外层 while 重新获取 PID
+                except Exception as e:
+                    logging.debug(f"[app-log] 日志采集异常: {e}")
+                    time.sleep(2.0)
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        return t
 
     def start_error_log_monitor(self, package_name: str = None, log_tags=None, min_restart_interval: float = 10.0):
         """
@@ -425,32 +1070,44 @@ class StressMonitor:
                     errors="replace",
                 )
                 while not self._error_monitor_stop.is_set() and proc.poll() is None:
-                    line = proc.stdout.readline()
-                    if not line:
-                        break
-                    stripped = line.strip()
-                    if not stripped:
-                        continue
-                    parts = stripped.split()
-                    # threadtime 格式：MM-DD HH:MM:SS.mmm PID TID priority TAG: msg
-                    level = parts[4] if len(parts) > 4 else ""
-                    if level != "E":
-                        continue
-                    if pkg not in stripped and "AndroidRuntime" not in stripped:
-                        continue
-                    now_ts = time.time()
-                    if now_ts - last_restart_ts < max(1.0, float(min_restart_interval or 0)):
-                        continue
-                    last_restart_ts = now_ts
-                    logging.warning(f"[error-monitor] 检测到 ERROR 日志，尝试自动拉起应用: {stripped[:200]}")
                     try:
-                        self.ensure_app_in_foreground()
+                        line = proc.stdout.readline()
+                        if not line:
+                            break
+                        stripped = line.strip()
+                        if not stripped:
+                            continue
+                        parts = stripped.split()
+                        # threadtime 格式：MM-DD HH:MM:SS.mmm PID TID priority TAG: msg
+                        level = parts[4] if len(parts) > 4 else ""
+                        if level != "E":
+                            continue
+                        if pkg not in stripped and "AndroidRuntime" not in stripped:
+                            continue
+                        now_ts = time.time()
+                        if now_ts - last_restart_ts < max(1.0, float(min_restart_interval or 0)):
+                            continue
+                        last_restart_ts = now_ts
+                        logging.warning("[error-monitor] 检测到 ERROR 日志，尝试自动拉起应用: %s", stripped[:200])
+                        try:
+                            self.ensure_app_in_foreground()
+                        except Exception as e:
+                            logging.warning("[error-monitor] 自动拉起应用失败: %s", e)
                     except Exception as e:
-                        logging.warning(f"[error-monitor] 自动拉起应用失败: {e}")
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
+                        logging.debug("[error-monitor] readline 异常: %s", e)
+                        break
+                if proc.poll() is None:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            proc.kill()
+                            proc.wait(timeout=1)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
             except Exception as e:
                 logging.debug(f"[error-monitor] 启动 ERROR 监控失败: {e}")
 
@@ -538,7 +1195,7 @@ class StressMonitor:
 
             with open(output_path, 'w', encoding='utf-8', errors='replace') as fout:
                 fout.write(f"# 异常日志提取: {start_str} ~ {end_str}, 包名: {pkg}\n")
-                fout.write("# 包含: 崩溃(Crash)、ANR、ERROR 级别日志\n")
+                fout.write("# 包含: 崩溃(Crash)、ANR、以及 E 级别仅限 AndroidRuntime 或本应用 TAG 的日志（规则等同 adb logcat -s <pkg>:V AndroidRuntime:E）\n")
                 fout.write("-" * 60 + "\n")
 
                 i = 0
@@ -566,9 +1223,16 @@ class StressMonitor:
                     )
                     is_error = False
                     if include_error_level and in_range:
+                        # 按原始规则 adb logcat -s com.svw.avatar:V AndroidRuntime:E 筛选：
+                        # 仅将 AndroidRuntime:E 或应用 TAG(包名):E 视为异常，不因其它 TAG 的 E 且含包名就写入
+                        # threadtime 格式：MM-DD HH:MM:SS.mmm PID TID priority TAG: msg
                         parts = stripped.split()
-                        if len(parts) >= 5 and parts[4] == "E" and pkg in stripped:
-                            is_error = True
+                        level = parts[4] if len(parts) > 4 else ""
+                        tag = parts[5].rstrip(":") if len(parts) > 5 else ""
+                        if level == "E" and pkg in stripped:
+                            # 只保留 AndroidRuntime 或应用自身 TAG 的 E 级别，排除如 DisplaySceneMonitorService 等
+                            if tag == "AndroidRuntime" or tag == pkg:
+                                is_error = True
 
                     if is_crash or is_anr:
                         fout.write(raw)
@@ -594,8 +1258,13 @@ class StressMonitor:
 
                     i += 1
 
-            if written > 0:
-                logging.info(f"异常日志已写入 {output_path}，共 {written} 条")
+            # if written > 0:
+            #     logging.info(f"异常日志已写入 {output_path}，共 {written} 条")
+            # else:
+            #     # 无匹配记录时写入简单说明，便于排查为什么 exceptions.log 为空
+            #     with open(output_path, 'a', encoding='utf-8', errors='replace') as fout2:
+            #         fout2.write("# 本时间窗内未检测到与包名相关的 Crash/ANR/ERROR 日志；"
+            #                     "可能原因：logcat 文件为空、时间戳格式不匹配或包名过滤过严。\n")
             return written
         except Exception as e:
             logging.warning(f"提取异常日志失败: {e}")
@@ -659,7 +1328,6 @@ class StressMonitor:
         """
         if not line or len(line) < 19:
             return None
-        import re
         # 1) YYYY-MM-DD HH:MM:SS(.mmm)?
         m = re.match(r"^(?P<y>\d{4})-(?P<m>\d{2})-(?P<d>\d{2}) (?P<h>\d{2}):(?P<mi>\d{2}):(?P<s>\d{2})(?:\.(?P<ms>\d{1,6}))?", line)
         if m:
@@ -756,17 +1424,29 @@ class StressMonitor:
                     text=True, encoding='utf-8', errors='replace'
                 )
                 while not stop_logcat.is_set() and proc.poll() is None:
-                    line = proc.stdout.readline()
-                    if not line:
+                    try:
+                        line = proc.stdout.readline()
+                        if not line:
+                            break
+                        # 以关键字为主匹配；tag_filter 仅作为“可选的缩小范围”条件，避免因 tag 不一致导致漏检
+                        if (appear_text in line or disappear_text in line) and (not tag_filter or tag_filter in line):
+                            with line_lock:
+                                lines.append(line.strip())
+                    except Exception as e:
+                        logging.debug("[response-monitor] readline 异常: %s", e)
                         break
-                    # 以关键字为主匹配；tag_filter 仅作为“可选的缩小范围”条件，避免因 tag 不一致导致漏检
-                    if (appear_text in line or disappear_text in line) and (not tag_filter or tag_filter in line):
-                        with line_lock:
-                            lines.append(line.strip())
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
+                if proc.poll() is None:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            proc.kill()
+                            proc.wait(timeout=1)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
             except Exception as e:
                 logging.debug(f"[response-monitor] logcat 读取异常: {e}")
 

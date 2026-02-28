@@ -65,13 +65,41 @@ class TTSStressTest:
         self._run_log_dir = os.path.join("logs", str(device.sn))
         self.log_path = ""
         self.logcat_log_path = ""
-        # 连续无响应计数与自动恢复阈值
+        # 连续无响应计数与自动恢复阈值（0 表示禁用自动恢复）
         rm_cfg = (config or {}).get("response_monitor") or {}
         try:
-            self.max_failure_count = int(float(rm_cfg.get("max_failure_count", 0) or 0))
+            raw = rm_cfg.get("anr_recover_threshold", 1)
+            if raw is None or raw == "":
+                raw = 1
+            threshold = int(float(raw))
         except Exception:
-            self.max_failure_count = 0
+            # 非法配置时退回默认 1（保留原有“1 次即重拉”的默认行为）
+            threshold = 1
+        if threshold < 0:
+            threshold = 0  # 允许 0 表示禁用自动恢复
+        self.anr_recover_threshold = threshold
         self._consecutive_no_response = 0
+        logging.info("[response-monitor] anr_recover_threshold=%s (0=仅记录ANR不自动恢复)", self.anr_recover_threshold)
+
+        # TTS 前后缀：结束词 / 唤醒词 及唤醒后等待时间（秒）
+        cfg = config or {}
+        try:
+            self.end_phrase = (cfg.get("end_phrase") or "").strip()
+        except Exception:
+            self.end_phrase = ""
+        try:
+            self.wake_phrase = (cfg.get("wake_phrase") or "").strip()
+        except Exception:
+            self.wake_phrase = ""
+        try:
+            raw_delay = cfg.get("wake_delay_seconds", 2)
+            if raw_delay is None or raw_delay == "":
+                raw_delay = 2
+            self.wake_delay = float(raw_delay)
+        except Exception:
+            self.wake_delay = 2.0
+        if self.wake_delay < 0:
+            self.wake_delay = 0.0
 
     def _load_texts(self):
         """加载语音文本列表：优先 texts_file（文本文件），否则 texts（每行一条），否则默认"""
@@ -159,6 +187,11 @@ class TTSStressTest:
 
         monitor_thread = monitor.start_monitoring_thread(result, 2, perf_log_path)
         logcat_thread = monitor.start_logcat_capture(self.logcat_log_path)
+        # 监控设备异常目录（/data/anr, /data/tombstones）
+        try:
+            monitor.start_exception_file_monitor(self._run_log_dir)
+        except Exception:
+            pass
 
         end_time = datetime.now() + timedelta(hours=duration_hours)
         start_time = datetime.now()
@@ -199,6 +232,31 @@ class TTSStressTest:
                 text_index += 1
                 text_send_time = datetime.now()
                 try:
+                    # 每条主测试文本前按需插入结束词和唤醒词
+                    if tts_available:
+                        try:
+                            if getattr(self, "end_phrase", ""):
+                                if self._play_tts(self.end_phrase):
+                                    msg = f"[TTS] 播放结束词: {self.end_phrase[:50]}"
+                                    logging.info(msg)
+                                    with open(self.log_path, "a", encoding="utf-8") as f:
+                                        f.write(msg + "\n")
+                                time.sleep(0.3)
+                        except Exception as _e:
+                            logging.debug(f"TTS 结束词播放异常: {_e}")
+                        try:
+                            if getattr(self, "wake_phrase", ""):
+                                if self._play_tts(self.wake_phrase):
+                                    msg = f"[TTS] 播放唤醒词: {self.wake_phrase[:50]}"
+                                    logging.info(msg)
+                                    with open(self.log_path, "a", encoding="utf-8") as f:
+                                        f.write(msg + "\n")
+                                delay = float(getattr(self, "wake_delay", 2.0) or 0.0)
+                                if delay > 0:
+                                    time.sleep(delay)
+                        except Exception as _e:
+                            logging.debug(f"TTS 唤醒词播放异常: {_e}")
+
                     if tts_available and self._play_tts(text):
                         result["tts_played"] += 1
                         # logging 已带 [时间] 前缀，这里只保留业务信息
@@ -224,6 +282,22 @@ class TTSStressTest:
                                     f"显示时长={monitor_result.get('display_duration', 0):.2f}秒"
                                     f"{model_suffix}"
                                 )
+                            elif self.anr_recover_threshold == 0:
+                                # 阈值=0：仅记录到 response_monitoring，不计 ANR，不自动恢复，直接下一条
+                                status = monitor_result['status']
+                                err_msg = monitor_result.get('error') or status
+                                logging.warning(
+                                    "[response-monitor] TTS #%d 无响应（%s，已跳过；阈值=0 不统计 ANR）",
+                                    result['tts_played'], err_msg
+                                )
+                                rm_cfg = (self.config or {}).get('response_monitor') or {}
+                                logging.info(
+                                    "[response-monitor] 超时明细: text_index=%s, status=%s, error=%s, "
+                                    "max_wait_appear=%s, max_wait_disappear=%s, check_interval=%s",
+                                    result['tts_played'], status, err_msg,
+                                    rm_cfg.get('max_wait_for_appear'), rm_cfg.get('max_wait_for_disappear'),
+                                    rm_cfg.get('check_interval')
+                                )
                             elif monitor_result['status'] == 'timeout_appear':
                                 result['anrs'] += 1
                                 result['anr_events'].append({
@@ -233,6 +307,14 @@ class TTSStressTest:
                                     'reason': monitor_result.get('error') or monitor_result['status'],
                                 })
                                 logging.warning(f"[response-monitor] TTS #{result['tts_played']} 无响应（ANR）")
+                                rm_cfg = (self.config or {}).get('response_monitor') or {}
+                                logging.info(
+                                    "[response-monitor] 超时明细: text_index=%s, status=timeout_appear, error=%s, "
+                                    "max_wait_appear=%s, max_wait_disappear=%s, check_interval=%s",
+                                    result['tts_played'], monitor_result.get('error'),
+                                    rm_cfg.get('max_wait_for_appear'), rm_cfg.get('max_wait_for_disappear'),
+                                    rm_cfg.get('check_interval')
+                                )
                             else:
                                 result['anrs'] += 1
                                 result['anr_events'].append({
@@ -242,6 +324,14 @@ class TTSStressTest:
                                     'reason': monitor_result.get('error') or monitor_result['status'],
                                 })
                                 logging.warning(f"[response-monitor] TTS #{result['tts_played']} 监控异常: {monitor_result.get('error', 'unknown')}")
+                                rm_cfg = (self.config or {}).get('response_monitor') or {}
+                                logging.info(
+                                    "[response-monitor] 超时明细: text_index=%s, status=%s, error=%s, "
+                                    "max_wait_appear=%s, max_wait_disappear=%s, check_interval=%s",
+                                    result['tts_played'], monitor_result.get('status'), monitor_result.get('error'),
+                                    rm_cfg.get('max_wait_for_appear'), rm_cfg.get('max_wait_for_disappear'),
+                                    rm_cfg.get('check_interval')
+                                )
                             
                             with open(self.log_path, "a", encoding="utf-8") as f:
                                 line = (
@@ -253,13 +343,15 @@ class TTSStressTest:
                                     line += f", 模型={model_name}"
                                 f.write(line + "\n")
 
-                            # 检测到 ANR/error 后立即恢复：杀进程、重启前台、等待 10 秒
+                            # 检测到 ANR/error 后按阈值决定是否自动恢复（阈值=0 不恢复、不计数）
                             if monitor_result['status'] == 'success':
                                 self._consecutive_no_response = 0
                             elif monitor_result['status'] in ('timeout_appear', 'timeout_disappear', 'error'):
-                                self._consecutive_no_response += 1
-                                self._restart_service_and_wait()
-                                self._consecutive_no_response = 0
+                                if self.anr_recover_threshold > 0:
+                                    self._consecutive_no_response += 1
+                                    if self._consecutive_no_response >= self.anr_recover_threshold:
+                                        self._restart_service_and_wait()
+                                        self._consecutive_no_response = 0
 
                             _emit_progress()
                             
@@ -303,16 +395,17 @@ class TTSStressTest:
                 logcat_thread.join(timeout=5)
             monitor_thread.join(timeout=10)
 
+        # 若捕获到设备侧 ANR/tombstone，则在结束时导出 bugreport（可选失败，不影响主流程）
+        try:
+            monitor.maybe_collect_bugreport(self._run_log_dir, reason="test_end")
+        except Exception as e:
+            logging.warning("导出 bugreport 失败（可忽略）: %s", e)
+
         result["actual_end_time"] = datetime.now().isoformat()
         end_time = datetime.now()
         crash_anr = monitor.analyze_logcat_for_crashes_anrs(start_time, end_time)
         result["crashes"] = crash_anr["crashes"]
         result["anrs"] = crash_anr["anrs"]
-        # 将异常日志单独落盘
-        exc_path = os.path.join(self._run_log_dir, "exceptions.log")
-        StressMonitor.extract_exceptions_to_file(
-            self.logcat_log_path, exc_path, start_time, end_time,
-            self.package.name
-        )
+        # 异常日志已通过稳定性总控周期性写入 app.log，此处不再单独生成 exceptions.log
         logging.info(f"TTS 压力测试完成，播放 {result['tts_played']} 条，崩溃 {result['crashes']}，ANR {result['anrs']}")
         return result

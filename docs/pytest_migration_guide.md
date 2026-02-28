@@ -17,7 +17,7 @@
 ```
 tests/
 ├── __init__.py
-├── test_system_robustness.py    # 系统健壮性测试
+├── test_system_robustness.py    # Monkey 模式压力测试
 ├── test_exception_recovery.py   # 异常恢复测试
 └── test_performance.py          # 性能测试
 ```
@@ -48,7 +48,7 @@ pytest tests/ --device-sn device_sn --apk-path path/to/app.apk
 **现在**：使用 pytest markers 和命令行参数
 
 ```bash
-# 仅运行系统健壮性测试
+# 仅运行 Monkey 模式压力测试
 pytest tests/ -m system_robustness
 
 # 仅运行性能测试
@@ -113,7 +113,7 @@ pytest 使用标记来组织和过滤测试：
 | 标记 | 说明 | 示例 |
 |------|------|------|
 | `@pytest.mark.stability` | 稳定性测试 | 所有稳定性相关测试 |
-| `@pytest.mark.system_robustness` | 系统健壮性测试 | 长时间压力测试 |
+| `@pytest.mark.system_robustness` | Monkey 模式压力测试 | 长时间压力测试 |
 | `@pytest.mark.exception_recovery` | 异常恢复测试 | 网络异常、数据异常测试 |
 | `@pytest.mark.performance` | 性能测试 | 性能指标测试 |
 | `@pytest.mark.performance_response` | 响应性能测试 | 冷启动、响应延迟测试 |
@@ -128,7 +128,7 @@ pytest 使用标记来组织和过滤测试：
 # 运行所有稳定性测试
 pytest tests/ -m stability
 
-# 运行系统健壮性测试（排除慢速测试）
+# 运行 Monkey 模式压力测试（排除慢速测试）
 pytest tests/ -m "system_robustness and not slow"
 
 # 运行性能测试
@@ -173,7 +173,7 @@ pytest 支持以下自定义参数（通过 `conftest.py` 定义）：
 | `--device-sn` | 设备序列号 | `--device-sn emulator-5554` |
 | `--apk-path` | APK 包本地路径 | `--apk-path path/to/app.apk` |
 | `--apk-url` | APK 包网络地址 | `--apk-url http://example.com/app.apk` |
-| `--module-robustness` | 启用系统健壮性测试模块 | `--module-robustness` |
+| `--module-robustness` | 启用 Monkey 模式压力测试模块 | `--module-robustness` |
 | `--module-recovery` | 启用异常恢复测试模块 | `--module-recovery` |
 | `--module-performance` | 启用完整性能测试模块 | `--module-performance` |
 | `--module-response` | 启用响应性能测试模块 | `--module-response` |

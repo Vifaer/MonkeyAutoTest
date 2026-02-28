@@ -30,7 +30,7 @@ if sys.platform == 'win32':
 from utils import addition
 from utils import ProjectLog
 from utils.stability_test import StabilityTestRunner
-from utils.config_io import read_json
+from utils.config_io import read_json, load_stability_config as load_unified_config
 
 
 def init_param():
@@ -90,7 +90,7 @@ def init_param():
         # 确定启用的测试模块
         enabled_modules = []
         if args.robustness_only:
-            enabled_modules.append('system_robustness')
+            enabled_modules.append('monkey_stress')
         if args.recovery_only:
             enabled_modules.append('exception_recovery')
         if args.performance_only:
@@ -174,7 +174,7 @@ def build_pytest_args(params):
 
     # 模块到标记的映射配置
     MODULE_MARKER_MAP = {
-        'system_robustness': 'system_robustness',
+        'monkey_stress': 'monkey_stress',
         'exception_recovery': 'exception_recovery',
         'performance_all': 'performance',
         'performance_response': 'performance',
@@ -184,7 +184,7 @@ def build_pytest_args(params):
     }
 
     MODULE_ARG_MAP = {
-        'system_robustness': '--module-robustness',
+        'monkey_stress': '--module-robustness',
         'exception_recovery': '--module-recovery',
         'performance_all': '--module-performance',
         'performance_response': '--module-response',
@@ -262,75 +262,26 @@ def run_stability_test(params):
 
 
 def load_stability_config(params):
-    """加载稳定性测试配置"""
-    config = {
-        'long_stress': {
-            'duration_hours': params['duration'],
-            'throttle': 700,
-            'event_count': 100000,
-            'use_fallback_only': params.get('use_fallback_only', False)  # 直接使用Fallback事件注入
-        },
-        'performance': {
-            'sample_interval': 30,
-            'monitor_duration': 3600
-        },
-        'network': {
-            'proxy_host': '127.0.0.1',
-            'proxy_port': 8080,
-            'weak_net_delay': 500
-        },
-        'mock_server': {
-            'enabled': params['use_mock_server'],
-            'host': '127.0.0.1',
-            'port': 8080
-        },
-        'network_proxy': {
-            'enabled': params['use_network_proxy'],
-            'type': 'mitmproxy',  # 或 'charles'
-            'method': params.get('network_method', 'root')  # 网络模拟方法
-        }
-    }
-
-    # 如果指定了配置文件，合并配置
-    if params.get('config_path'):
-        try:
-            with open(params['config_path'], 'r', encoding='utf-8') as f:
-                file_config = json.load(f)
-            # 递归合并配置
-            config = merge_configs(config, file_config)
-            logging.info(f"已加载配置文件: {params['config_path']}")
-        except Exception as e:
-            logging.warning(f"加载配置文件失败: {str(e)}")
-
-    # 与GUI持久化配置联动：如果存在 conf/test_ui_config.json，则将其中的 mock_server / monkey_mask 段合并进来
-    try:
-        gui_cfg_path = os.path.join("conf", "test_ui_config.json")
-        gui_cfg = read_json(gui_cfg_path, default={})
-        if isinstance(gui_cfg, dict):
-            ms = gui_cfg.get("mock_server")
-            if isinstance(ms, dict):
-                if "mock_server" not in config or not isinstance(config["mock_server"], dict):
-                    config["mock_server"] = {}
-                # GUI配置优先覆盖默认 host/port/mode/rules_path 等
-                config["mock_server"].update(ms)
-                logging.info(f"已从GUI配置合并Mock Server设置: {ms}")
-
-            # GUI 中配置的 monkey 遮罩区域（百分比），合并到 long_stress.monkey_mask 中
-            mm = gui_cfg.get("monkey_mask")
-            if isinstance(mm, dict):
-                try:
-                    ls = config.get("long_stress")
-                    if not isinstance(ls, dict):
-                        ls = {}
-                    # 只写入一个子 dict，具体解析/容错交给 ExtendedMonkeyTest 内部处理
-                    ls["monkey_mask"] = mm
-                    config["long_stress"] = ls
-                    logging.info(f"已从GUI配置合并 Monkey 遮罩区域设置: {mm}")
-                except Exception as _e:
-                    logging.warning(f"合并 Monkey 遮罩区域配置失败: {_e}")
-    except Exception as e:
-        logging.warning(f"从GUI配置加载Mock Server设置失败: {e}")
-
+    """加载稳定性测试配置（CLI入口，适配参数）"""
+    # 使用统一的配置加载函数
+    config = load_unified_config(config_path=params.get('config_path'))
+    
+    # CLI 参数覆盖
+    if 'duration' in params:
+        config.setdefault('long_stress', {})['duration_hours'] = params['duration']
+    
+    if 'use_fallback_only' in params:
+        config.setdefault('long_stress', {})['use_fallback_only'] = params['use_fallback_only']
+    
+    if 'use_mock_server' in params:
+        config.setdefault('mock_server', {})['enabled'] = params['use_mock_server']
+    
+    if 'use_network_proxy' in params:
+        config.setdefault('network_proxy', {})['enabled'] = params['use_network_proxy']
+    
+    if 'network_method' in params:
+        config.setdefault('network_proxy', {})['method'] = params.get('network_method', 'root')
+    
     return config
 
 

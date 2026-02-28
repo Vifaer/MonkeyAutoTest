@@ -15,7 +15,7 @@ from enum import Enum
 
 class TestModule(Enum):
     """测试模块枚举"""
-    SYSTEM_ROBUSTNESS = "system_robustness"
+    MONKEY_STRESS = "monkey_stress"
     EXCEPTION_RECOVERY = "exception_recovery"
     PERFORMANCE_RESPONSE = "performance_response"
     PERFORMANCE_RESOURCE = "performance_resource"
@@ -49,7 +49,7 @@ class ModularStabilityTest:
         # 默认启用所有模块（保持向后兼容性）
         if enabled_modules is None:
             self.enabled_modules = [
-                TestModule.SYSTEM_ROBUSTNESS,
+                TestModule.MONKEY_STRESS,
                 TestModule.EXCEPTION_RECOVERY,
                 TestModule.PERFORMANCE_ALL
             ]
@@ -126,6 +126,13 @@ class ModularStabilityTest:
         # 初始化设备日志
         self.device_log.init()
 
+        # 测试前清理设备异常目录（/data/anr, /data/tombstones），避免历史干扰
+        try:
+            from utils.stress_monitor import StressMonitor
+            StressMonitor(self.device, self.package, self.config.get('performance', {})).clear_device_exception_dirs()
+        except Exception as e:
+            logging.warning("[device-exc] 清理设备异常目录失败（可忽略继续）: %s", e)
+
         # 应用安装和准备（所有测试都需要）
         self._prepare_application()
 
@@ -159,44 +166,72 @@ class ModularStabilityTest:
         self._live_report_thread.start()
         logging.info(f"实时报告已启动，每 {LIVE_REPORT_UPDATE_INTERVAL} 秒更新: {self._live_report_path}")
 
-        # 根据启用的模块运行相应测试
-        if TestModule.SYSTEM_ROBUSTNESS in self.enabled_modules:
-            self._live_state['current_phase'] = 'system_robustness'
-            self._run_system_robustness_test()
-            self._live_state['modules_done'].append('system_robustness')
-            rb = self.test_results.get('tests', {}).get('system_robustness', {})
+        # 根据启用的模块运行相应测试；单模块失败时记录 error 并继续后续模块
+        if TestModule.MONKEY_STRESS in self.enabled_modules:
+            self._live_state['current_phase'] = 'monkey_stress'
+            try:
+                self._run_monkey_stress_test()
+            except Exception as e:
+                logging.exception("Monkey 模式压力测试模块异常")
+                self.test_results.setdefault('tests', {})['monkey_stress'] = {'error': str(e)}
+            self._live_state['modules_done'].append('monkey_stress')
+            rb = self.test_results.get('tests', {}).get('monkey_stress', {})
             self._live_state['run_log_dir'] = rb.get('run_log_dir', '') or self._live_state.get('run_log_dir', '')
 
         if TestModule.EXCEPTION_RECOVERY in self.enabled_modules:
             self._live_state['current_phase'] = 'exception_recovery'
-            self._run_exception_recovery_test()
+            try:
+                self._run_exception_recovery_test()
+            except Exception as e:
+                logging.exception("异常恢复测试模块异常")
+                self.test_results.setdefault('tests', {})['exception_recovery'] = {'error': str(e)}
             self._live_state['modules_done'].append('exception_recovery')
 
         if TestModule.PERFORMANCE_ALL in self.enabled_modules:
             self._live_state['current_phase'] = 'performance'
-            self._run_performance_test()
+            try:
+                self._run_performance_test()
+            except Exception as e:
+                logging.exception("完整性能测试模块异常")
+                self.test_results.setdefault('tests', {})['performance'] = {'error': str(e)}
             self._live_state['modules_done'].append('performance')
         else:
             if TestModule.PERFORMANCE_RESPONSE in self.enabled_modules:
                 self._live_state['current_phase'] = 'performance'
-                self._run_response_performance_test()
+                try:
+                    self._run_response_performance_test()
+                except Exception as e:
+                    logging.exception("响应性能测试模块异常")
+                    self.test_results.setdefault('tests', {})['performance_response'] = {'error': str(e)}
                 self._live_state['modules_done'].append('performance_response')
 
             if TestModule.PERFORMANCE_RESOURCE in self.enabled_modules:
                 self._live_state['current_phase'] = 'performance'
-                self._run_resource_consumption_test()
+                try:
+                    self._run_resource_consumption_test()
+                except Exception as e:
+                    logging.exception("资源消耗测试模块异常")
+                    self.test_results.setdefault('tests', {})['performance_resource'] = {'error': str(e)}
                 self._live_state['modules_done'].append('performance_resource')
 
         if TestModule.BROADCAST_STRESS in self.enabled_modules:
             self._live_state['current_phase'] = 'broadcast_stress'
-            self._run_broadcast_stress_test()
+            try:
+                self._run_broadcast_stress_test()
+            except Exception as e:
+                logging.exception("广播压力测试模块异常")
+                self.test_results.setdefault('tests', {})['broadcast_stress'] = {'error': str(e)}
             self._live_state['modules_done'].append('broadcast_stress')
             bc = self.test_results.get('tests', {}).get('broadcast_stress', {})
             self._live_state['run_log_dir'] = bc.get('run_log_dir', '') or self._live_state.get('run_log_dir', '')
 
         if TestModule.TTS_STRESS in self.enabled_modules:
             self._live_state['current_phase'] = 'tts_stress'
-            self._run_tts_stress_test()
+            try:
+                self._run_tts_stress_test()
+            except Exception as e:
+                logging.exception("TTS 压力测试模块异常")
+                self.test_results.setdefault('tests', {})['tts_stress'] = {'error': str(e)}
             self._live_state['modules_done'].append('tts_stress')
             ts = self.test_results.get('tests', {}).get('tts_stress', {})
             self._live_state['run_log_dir'] = ts.get('run_log_dir', '') or self._live_state.get('run_log_dir', '')
@@ -221,7 +256,7 @@ class ModularStabilityTest:
         """
         # 定义模块依赖关系
         module_dependencies = {
-            TestModule.SYSTEM_ROBUSTNESS: [],
+            TestModule.MONKEY_STRESS: [],
             TestModule.EXCEPTION_RECOVERY: [],
             TestModule.PERFORMANCE_RESPONSE: [],
             TestModule.PERFORMANCE_RESOURCE: [],
@@ -376,23 +411,31 @@ class ModularStabilityTest:
 
         logging.info(f"应用 {self.package.name} 验证成功（模式：{'已安装' if installed_only else 'APK安装'}）")
 
-    def _run_system_robustness_test(self):
-        """运行系统健壮性测试"""
-        logging.info("开始系统健壮性测试...")
+    def _run_monkey_stress_test(self):
+        """运行 Monkey 模式压力测试"""
+        logging.info("开始 Monkey 模式压力测试...")
 
         from utils.extended_monkey import ExtendedMonkeyTest
         monkey_test = ExtendedMonkeyTest(self.device, self.package, self.config['long_stress'])
 
         result = monkey_test.run_long_stress_test()
-        self.test_results['tests']['system_robustness'] = result
+        self.test_results['tests']['monkey_stress'] = result
 
-        logging.info("系统健壮性测试完成")
+        logging.info("Monkey 模式压力测试完成")
 
     def _run_broadcast_stress_test(self):
         """运行广播模式压力测试"""
         logging.info("开始广播模式压力测试...")
         from utils.broadcast_stress import BroadcastStressTest
-        cfg = self.config.get('broadcast_stress', self.config.get('long_stress', {}))
+        # 基础配置：优先使用 broadcast_stress 段，其次复用 long_stress
+        base_cfg = self.config.get('broadcast_stress', self.config.get('long_stress', {})) or {}
+        cfg = dict(base_cfg)
+
+        # 将顶层 response_monitor 合并进模块配置（如果模块内部尚未显式配置）
+        global_rm = self.config.get('response_monitor')
+        if isinstance(global_rm, dict) and 'response_monitor' not in cfg:
+            cfg['response_monitor'] = global_rm
+
         broadcast_test = BroadcastStressTest(self.device, self.package, cfg)
 
         def _progress_cb(partial_result: dict):
@@ -413,7 +456,15 @@ class ModularStabilityTest:
         """运行 TTS 模式压力测试"""
         logging.info("开始 TTS 模式压力测试...")
         from utils.tts_stress import TTSStressTest
-        cfg = self.config.get('tts_stress', self.config.get('long_stress', {}))
+        # 基础配置：优先使用 tts_stress 段，其次复用 long_stress
+        base_cfg = self.config.get('tts_stress', self.config.get('long_stress', {})) or {}
+        cfg = dict(base_cfg)
+
+        # 将顶层 response_monitor 合并进模块配置（如果模块内部尚未显式配置）
+        global_rm = self.config.get('response_monitor')
+        if isinstance(global_rm, dict) and 'response_monitor' not in cfg:
+            cfg['response_monitor'] = global_rm
+
         tts_test = TTSStressTest(self.device, self.package, cfg)
 
         def _progress_cb(partial_result: dict):
@@ -473,8 +524,8 @@ class ModularStabilityTest:
             try:
                 # 确定测试类型
                 test_type = "comprehensive"
-                if "system_robustness" in phase_info:
-                    test_type = "system_robustness"
+                if "monkey_stress" in phase_info:
+                    test_type = "monkey_stress"
                 elif "exception_recovery" in phase_info:
                     test_type = "exception_recovery"
                 elif "performance" in phase_info:
@@ -512,11 +563,78 @@ class ModularStabilityTest:
             try:
                 self._live_state['test_results_snapshot'] = dict(self.test_results)
                 tests = self.test_results.get('tests', {})
-                for key in ('system_robustness', 'broadcast_stress', 'tts_stress'):
+                for key in ('monkey_stress', 'broadcast_stress', 'tts_stress'):
                     r = tests.get(key, {})
                     if r and r.get('run_log_dir'):
                         self._live_state['run_log_dir'] = r.get('run_log_dir', '')
                         break
+
+                # 实时刷新 exceptions.log：按当前阶段与 run_log_dir 重算窗口 [模块start_time, now]，
+                # 并追加框架侧 ANR 事件（response-monitor 判定的 Hint/TTS 无响应），方便统一排查。
+                run_log_dir = self._live_state.get('run_log_dir') or ''
+                current_phase = self._live_state.get('current_phase')
+                if run_log_dir and current_phase in ('monkey_stress', 'broadcast_stress', 'tts_stress'):
+                    try:
+                        from utils.stress_monitor import StressMonitor
+                        now_dt = datetime.now()
+                        if current_phase == 'monkey_stress':
+                            mod = tests.get('monkey_stress') or {}
+                            logcat_name = "logcat_monkey.log"
+                        elif current_phase == 'broadcast_stress':
+                            mod = tests.get('broadcast_stress') or {}
+                            logcat_name = "logcat_broadcast.log"
+                        else:  # tts_stress
+                            mod = tests.get('tts_stress') or {}
+                            logcat_name = "logcat_tts.log"
+                        start_str = mod.get('start_time') or self.test_results.get('start_time')
+                        start_dt = None
+                        if isinstance(start_str, str):
+                            try:
+                                start_dt = datetime.fromisoformat(start_str.replace('Z', '+00:00'))
+                                if start_dt.tzinfo:
+                                    start_dt = start_dt.replace(tzinfo=None)
+                            except Exception:
+                                start_dt = None
+                        if start_dt is None:
+                            # 回退：按 12 小时窗口
+                            start_dt = now_dt - timedelta(hours=float(mod.get('duration_hours', 12) or 12))
+                        logcat_path = os.path.join(run_log_dir, logcat_name)
+                        exc_path = os.path.join(run_log_dir, "app.log")
+                        if os.path.exists(logcat_path):
+                            # 1) 先基于 logcat 重算系统级 Crash/ANR/ERROR，输出到 app.log（应用日志）
+                            StressMonitor.extract_exceptions_to_file(
+                                logcat_path, exc_path, start_dt, now_dt, self.package.name
+                            )
+                            # 2) 再追加框架侧 ANR 事件（response-monitor 超时判定）
+                            try:
+                                fw_anr_blocks = []
+                                for mod_key, label in (('broadcast_stress', '广播压力'), ('tts_stress', 'TTS 压力')):
+                                    mod_res = tests.get(mod_key) or {}
+                                    events = mod_res.get('anr_events') or []
+                                    if not events:
+                                        continue
+                                    lines = [f"# {label}测试 ANR 事件（共 {len(events)} 条，来源：response-monitor timeout）\n"]
+                                    for ev in events:
+                                        idx = ev.get('hint_index') or ev.get('text_index') or '?'
+                                        t_str = ev.get('time', '')
+                                        reason = ev.get('reason', '')
+                                        preview = ev.get('hint_preview') or ev.get('text_preview') or ''
+                                        lines.append(
+                                            f"Hint/TTS #{idx} 无响应（框架ANR），time={t_str}, "
+                                            f"reason={reason}, preview={preview}\n"
+                                        )
+                                    fw_anr_blocks.append("".join(lines))
+                                if fw_anr_blocks:
+                                    with open(exc_path, 'a', encoding='utf-8', errors='replace') as ef:
+                                        ef.write("\n# 以下为框架侧 ANR 事件（未必伴随系统级 ANR 日志）\n")
+                                        for block in fw_anr_blocks:
+                                            ef.write(block)
+                            except Exception:
+                                # 追加失败不影响主流程
+                                pass
+                    except Exception as exc:
+                        logging.debug(f"实时刷新 exceptions.log 失败: {exc}")
+
                 if self.report_generator and self._live_report_path:
                     self.report_generator.update_live_report(self._live_state, self._live_report_path)
             except Exception as e:
@@ -572,7 +690,7 @@ class ModularStabilityTest:
     def _get_app_version(self):
         """获取应用版本"""
         try:
-            with open("conf/project.json", 'r', encoding='utf-8') as f:
+            with open("conf/project.json", 'r', encoding='utf-8', errors='replace') as f:
                 config = json.load(f)
 
             for version_key in config:
@@ -630,7 +748,7 @@ class ModularStabilityTest:
 class StabilityTestFramework:
     """
     车载端侧应用稳定性测试框架
-    支持多种测试类型：系统健壮性、异常恢复、性能测试
+    支持多种测试类型：Monkey 模式压力测试、异常恢复、性能测试
     """
 
     def __init__(self, device_sn, package, config=None, baseline_options=None):
@@ -679,7 +797,7 @@ class StabilityTestFramework:
     def run_comprehensive_test(self):
         """
         运行完整的稳定性测试套件
-        包括系统健壮性、异常恢复、性能测试
+        包括 Monkey 模式压力测试、异常恢复、性能测试
         """
         logging.info("开始执行车载端侧应用稳定性测试")
 
@@ -689,7 +807,14 @@ class StabilityTestFramework:
         # 1. 应用安装和准备
         self._prepare_application()
 
-        # 2. 系统健壮性测试
+        # 测试前清理设备异常目录（/data/anr, /data/tombstones），避免历史干扰
+        try:
+            from utils.stress_monitor import StressMonitor
+            StressMonitor(self.device, self.package, self.config.get('performance', {})).clear_device_exception_dirs()
+        except Exception as e:
+            logging.warning("清理设备异常目录失败（可忽略继续）: %s", e)
+
+        # 2. Monkey 模式压力测试
         self._run_system_robustness_test()
 
         # 3. 异常恢复测试
@@ -710,9 +835,9 @@ class StabilityTestFramework:
         self.test_results['tests'] = {}
 
     def run_system_robustness(self):
-        """运行系统健壮性测试并返回该模块结果 dict"""
-        self._run_system_robustness_test()
-        return self.test_results.get('tests', {}).get('system_robustness', {})
+        """运行 Monkey 模式压力测试并返回该模块结果 dict"""
+        self._run_monkey_stress_test()
+        return self.test_results.get('tests', {}).get('monkey_stress', {})
 
     def run_exception_recovery(self):
         """运行异常恢复测试并返回该模块结果 dict"""
@@ -759,17 +884,17 @@ class StabilityTestFramework:
 
         logging.info(f"应用 {self.package.name} 验证成功（模式：{'已安装' if installed_only else 'APK安装'}）")
 
-    def _run_system_robustness_test(self):
-        """运行系统健壮性测试"""
-        logging.info("开始系统健壮性测试...")
+    def _run_monkey_stress_test(self):
+        """运行 Monkey 模式压力测试"""
+        logging.info("开始 Monkey 模式压力测试...")
 
         from utils.extended_monkey import ExtendedMonkeyTest
         monkey_test = ExtendedMonkeyTest(self.device, self.package, self.config['long_stress'])
 
         result = monkey_test.run_long_stress_test()
-        self.test_results['tests']['system_robustness'] = result
+        self.test_results['tests']['monkey_stress'] = result
 
-        logging.info("系统健壮性测试完成")
+        logging.info("Monkey 模式压力测试完成")
 
     def _run_exception_recovery_test(self):
         """运行异常恢复测试"""
@@ -835,7 +960,7 @@ class StabilityTestFramework:
         # 从配置文件获取版本信息
         try:
             import json
-            with open("conf/project.json", 'r', encoding='utf-8') as f:
+            with open("conf/project.json", 'r', encoding='utf-8', errors='replace') as f:
                 config = json.load(f)
 
             # 查找当前使用的版本配置

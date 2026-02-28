@@ -23,16 +23,16 @@
   },
   "stability_test": {
     "name": "车载端侧应用稳定性测试",
-    "description": "包含系统健壮性、异常恢复与完整性能的稳定性测试方案。",
+    "description": "包含 Monkey 模式压力测试、异常恢复与完整性能的稳定性测试方案。",
     "auto_get_apk": false,
     "modular_config": {
       "enabled_modules": [
-        "system_robustness",
+        "monkey_stress",
         "exception_recovery",
         "performance_all"
       ],
       "module_dependencies": {
-        "system_robustness": [],
+        "monkey_stress": [],
         "exception_recovery": ["mock_server"],
         "performance_response": [],
         "performance_resource": [],
@@ -106,13 +106,13 @@
     }
   },
   "robustness_only_test": {
-    "name": "仅系统健壮性测试",
-    "description": "仅执行长时间压力与系统健壮性测试。",
+    "name": "仅 Monkey 模式压力测试",
+    "description": "仅执行长时间压力与 Monkey 模式压力测试。",
     "auto_get_apk": false,
     "modular_config": {
-      "enabled_modules": ["system_robustness"],
+      "enabled_modules": ["monkey_stress"],
       "module_dependencies": {
-        "system_robustness": []
+        "monkey_stress": []
       }
     },
     "stability_config": {

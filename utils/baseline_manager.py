@@ -158,10 +158,10 @@ class BaselineManager:
         if 'tests' in test_results:
             tests = test_results['tests']
 
-            # 系统健壮性
-            if 'system_robustness' in tests:
-                robust_result = tests['system_robustness']
-                metrics['system_robustness'] = {
+            # Monkey 模式压力测试
+            if 'monkey_stress' in tests:
+                robust_result = tests['monkey_stress']
+                metrics['monkey_stress'] = {
                     'crashes': robust_result.get('crashes', 0),
                     'anrs': robust_result.get('anrs', 0),
                     'test_duration_hours': robust_result.get('duration_hours', 0)
@@ -243,14 +243,14 @@ class BaselineManager:
         # 崩溃和ANR对比（数值越低越好）
         if 'system_robustness' in current and 'system_robustness' in baseline:
             comparison['crashes'] = self._compare_metric(
-                current['system_robustness']['crashes'],
-                baseline['system_robustness']['crashes'],
+                current['monkey_stress']['crashes'],
+                baseline['monkey_stress']['crashes'],
                 0,  # 理想值为0
                 'lower_better'
             )
             comparison['anrs'] = self._compare_metric(
-                current['system_robustness']['anrs'],
-                baseline['system_robustness']['anrs'],
+                current['monkey_stress']['anrs'],
+                baseline['monkey_stress']['anrs'],
                 0,
                 'lower_better'
             )

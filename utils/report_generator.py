@@ -4,7 +4,7 @@
 """
 统一测试报告生成模块
 
-支持的报告类型：传统Monkey、稳定性测试、系统健壮性、性能测试、异常恢复测试等。
+支持的报告类型：传统Monkey、稳定性测试、Monkey 模式压力测试、性能测试、异常恢复测试等。
 所有报告使用统一的格式、结构和内容规范，并支持测试过程中的实时报告更新。
 """
 
@@ -40,7 +40,7 @@ except Exception:
 # 支持的测试类型（用于统一报告入口）
 TEST_TYPE_MONKEY = "monkey"
 TEST_TYPE_COMPREHENSIVE = "comprehensive"
-TEST_TYPE_SYSTEM_ROBUSTNESS = "system_robustness"
+TEST_TYPE_MONKEY_STRESS = "monkey_stress"
 TEST_TYPE_EXCEPTION_RECOVERY = "exception_recovery"
 TEST_TYPE_PERFORMANCE = "performance"
 TEST_TYPE_BROADCAST_STRESS = "broadcast_stress"
@@ -127,12 +127,12 @@ class StabilityReportGenerator:
                         package_name: str = None,
                         **kwargs) -> str:
         """
-        统一报告生成入口。所有类型的测试（传统Monkey、稳定性、系统健壮性、性能、异常恢复）
+        统一报告生成入口。所有类型的测试（传统Monkey、稳定性、Monkey 模式压力测试、性能、异常恢复）
         均通过此方法生成报告，确保格式、结构和内容一致。
 
         Args:
             test_results: 测试结果数据（可为原始结构，内部会规范化）
-            test_type: 测试类型 monkey/comprehensive/system_robustness/exception_recovery/performance
+            test_type: 测试类型 monkey/comprehensive/monkey_stress/exception_recovery/performance
             is_intermediate: 是否为阶段性/临时报告
             device_sn: 设备序列号（可选，从 test_results 推断）
             package_name: 应用包名（可选，从 test_results 推断）
@@ -164,7 +164,7 @@ class StabilityReportGenerator:
             is_intermediate: 是否为阶段性报告（临时报告）
             device_sn: 设备序列号
             package_name: 应用包名
-            test_type: 测试类型（comprehensive/system_robustness/exception_recovery/performance）
+            test_type: 测试类型（comprehensive/monkey_stress/exception_recovery/performance）
 
         Returns:
             报告文件路径
@@ -267,7 +267,7 @@ class StabilityReportGenerator:
             device_sn: 设备序列号
             package_name: 应用包名
             test_type: 测试类型
-            phase_info: 阶段信息（如 "phase_1", "system_robustness_completed"）
+            phase_info: 阶段信息（如 "phase_1", "monkey_stress_completed"）
         
         Returns:
             报告文件路径
@@ -395,7 +395,7 @@ class StabilityReportGenerator:
         # 从 test_results_snapshot 汇总各模块的崩溃/ANR（含广播、TTS 压力测试进行中的实时数据）
         snapshot = live_state.get('test_results_snapshot') or {}
         tests = snapshot.get('tests', {})
-        modules_for_crash_anr = ('system_robustness', 'broadcast_stress', 'tts_stress')
+        modules_for_crash_anr = ('monkey_stress', 'broadcast_stress', 'tts_stress')
         live_state['crashes_so_far'] = sum(tests.get(m, {}).get('crashes', 0) for m in modules_for_crash_anr)
         live_state['anrs_so_far'] = sum(tests.get(m, {}).get('anrs', 0) for m in modules_for_crash_anr)
         html_content = self._build_unified_report_html(live_state)
@@ -445,7 +445,7 @@ class StabilityReportGenerator:
             return []
         try:
             lines = []
-            with open(jsonl_path, 'r', encoding='utf-8') as f:
+            with open(jsonl_path, 'r', encoding='utf-8', errors='replace') as f:
                 for line in f:
                     line = line.strip()
                     if line:
@@ -485,7 +485,9 @@ class StabilityReportGenerator:
         """
         读取运行目录下主日志文件的最后若干行。
         为兼容不同模块，按优先级尝试多种日志文件名：
-        - extended_monkey.log      系统健壮性/Monkey 长压
+        - extended_monkey.log      Monkey 模式压力测试/Monkey 长压
+        - input_fallback_direct.log  Monkey fallback-only（直接 input 注入）
+        - input_fallback_phase_*.log Monkey 单阶段 fallback（补齐剩余时长）
         - broadcast_stress.log     广播压力测试
         - tts_stress.log           TTS 压力测试
         - exception_recovery.log   异常恢复测试
@@ -494,6 +496,64 @@ class StabilityReportGenerator:
         """
         if not run_log_dir or not os.path.isdir(run_log_dir):
             return []
+
+        def _tail(path: str, n: int) -> List[str]:
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    lines = f.readlines()
+                return lines[-n:] if len(lines) > n else lines
+            except Exception:
+                return []
+
+        def _head_until_sep(path: str, max_lines: int = 20) -> List[str]:
+            """读取日志头部，直到分隔线（----）或达到上限。用于补齐上下文信息。"""
+            try:
+                out: List[str] = []
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    for _ in range(max_lines):
+                        line = f.readline()
+                        if not line:
+                            break
+                        out.append(line)
+                        if "----" in line:
+                            break
+                return out
+            except Exception:
+                return []
+
+        # 优先：若存在 input fallback 日志，则在摘要中同时展示 extended_monkey.log 头部 + fallback 尾部，
+        # 以便报告中呈现类似：
+        # Extended Monkey ... Start
+        # Device ...
+        # Planned duration ...
+        # ----
+        # 2026-... [fallback] ...
+        ext_log = os.path.join(run_log_dir, "extended_monkey.log")
+        direct_fb = os.path.join(run_log_dir, "input_fallback_direct.log")
+        if os.path.isfile(direct_fb):
+            head = _head_until_sep(ext_log) if os.path.isfile(ext_log) else []
+            tail = _tail(direct_fb, tail_lines)
+            merged = head + tail
+            return merged[-max(len(merged), 1):] if merged else []
+
+        # 次优先：阶段 fallback（选择最新一个 phase fallback log）
+        try:
+            phase_logs = []
+            for fn in os.listdir(run_log_dir):
+                if fn.startswith("input_fallback_phase_") and fn.endswith(".log"):
+                    full = os.path.join(run_log_dir, fn)
+                    if os.path.isfile(full):
+                        phase_logs.append(full)
+            if phase_logs:
+                latest = max(phase_logs, key=os.path.getmtime)
+                head = _head_until_sep(ext_log) if os.path.isfile(ext_log) else []
+                tail = _tail(latest, tail_lines)
+                merged = head + tail
+                return merged[-max(len(merged), 1):] if merged else []
+        except Exception:
+            pass
+
+        # 其他模块：按固定候选读取
         candidates = [
             "extended_monkey.log",
             "broadcast_stress.log",
@@ -501,21 +561,12 @@ class StabilityReportGenerator:
             "exception_recovery.log",
             "performance.log",
         ]
-        log_path = ""
         for name in candidates:
             p = os.path.join(run_log_dir, name)
-            if os.path.exists(p):
-                log_path = p
-                break
-        if not log_path:
-            return []
-        try:
-            with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
-                all_lines = f.readlines()
-            return all_lines[-tail_lines:] if len(all_lines) > tail_lines else all_lines
-        except Exception as e:
-            logging.debug(f"读取日志尾部失败: {e}")
-            return []
+            if os.path.isfile(p):
+                lines = _tail(p, tail_lines)
+                return lines
+        return []
 
     def _build_log_links_html(self, run_log_dir: str) -> str:
         """
@@ -527,6 +578,8 @@ class StabilityReportGenerator:
             return '<p class="log-links">日志目录不可用</p>'
         # 文件名 -> 锚文本（每个文件独立锚文本以便区分）
         log_candidates = [
+            ("app.log", "应用日志"),
+            ("device_exceptions.log", "设备异常摘要（/data/anr & /data/tombstones）"),
             ("extended_monkey.log", "Monkey日志"),
             ("broadcast_stress.log", "广播测试日志"),
             ("tts_stress.log", "TTS测试日志"),
@@ -538,7 +591,6 @@ class StabilityReportGenerator:
             ("logcat_performance_resource.log", "性能 Logcat"),
             ("logcat_exception_recovery.log", "异常恢复 Logcat"),
             ("performance_sampling.jsonl", "性能日志"),
-            ("exceptions.log", "崩溃/ANR异常日志"),
         ]
         rel_base = ("../" + run_log_dir.replace("\\", "/")).rstrip("/")
         links = []
@@ -549,17 +601,88 @@ class StabilityReportGenerator:
                 links.append(
                     f'<a href="{self._escape_html(href)}" target="_blank" rel="noopener noreferrer">{self._escape_html(anchor)}</a>'
                 )
+
+        # 动态追加：input fallback 分阶段日志（input_fallback_phase_N.log）
+        try:
+            phase_files = []
+            for fn in os.listdir(run_log_dir):
+                if fn.startswith("input_fallback_phase_") and fn.endswith(".log"):
+                    full = os.path.join(run_log_dir, fn)
+                    if os.path.isfile(full):
+                        phase_files.append(fn)
+            def _phase_key(x: str) -> int:
+                try:
+                    import re as _re
+                    m = _re.search(r"input_fallback_phase_(\d+)\.log$", x)
+                    return int(m.group(1)) if m else 0
+                except Exception:
+                    return 0
+            for fn in sorted(phase_files, key=_phase_key):
+                href = f"{rel_base}/{fn}"
+                # 友好展示阶段号
+                phase_no = _phase_key(fn)
+                anchor = f"Input Fallback（Phase {phase_no}）" if phase_no else f"Input Fallback（{fn}）"
+                links.append(
+                    f'<a href="{self._escape_html(href)}" target="_blank" rel="noopener noreferrer">{self._escape_html(anchor)}</a>'
+                )
+        except Exception:
+            pass
+
+        # 动态追加：ANR / tombstones 转储文件（如有则链接到一个示例文件）
+        try:
+            for subdir, anchor in (("anr", "ANR 文件（/data/anr 转储）"), ("tombstones", "Crash Tombstones（/data/tombstones 转储）")):
+                d = os.path.join(run_log_dir, subdir)
+                if not os.path.isdir(d):
+                    continue
+                files = [fn for fn in os.listdir(d) if os.path.isfile(os.path.join(d, fn))]
+                if not files:
+                    continue
+                # 链接到一个示例文件，用户可据此打开目录下其它文件
+                fn0 = sorted(files)[0]
+                href = f"{rel_base}/{subdir}/{fn0}"
+                links.append(
+                    f'<a href="{self._escape_html(href)}" target="_blank" rel="noopener noreferrer">{self._escape_html(anchor)}</a>'
+                )
+        except Exception:
+            pass
+
+        # 动态追加：bugreport（如有则链接到一个示例 zip）
+        try:
+            bd = os.path.join(run_log_dir, "bugreport")
+            if os.path.isdir(bd):
+                zips = [
+                    fn
+                    for fn in os.listdir(bd)
+                    if os.path.isfile(os.path.join(bd, fn)) and fn.lower().endswith(".zip")
+                ]
+                if zips:
+                    fn0 = sorted(zips)[-1]
+                    href = f"{rel_base}/bugreport/{fn0}"
+                    links.append(
+                        f'<a href="{self._escape_html(href)}" target="_blank" rel="noopener noreferrer">Bugreport（系统诊断）</a>'
+                    )
+        except Exception:
+            pass
         if not links:
             return '<p class="log-links">暂无可用日志文件（日志暂不可用）</p>'
         return '<p class="log-links">' + " | ".join(links) + "</p>"
 
     def _build_exceptions_section_html(self, run_log_dir: str, max_lines: int = 50) -> str:
-        """若存在 exceptions.log，读取最后 N 条并在报告中展示。"""
+        """
+        若存在异常日志，读取最后 N 条并在报告中展示。
+
+        优先使用 app.log（新的应用日志文件），否则回退到旧版 exceptions.log。
+        """
         if not run_log_dir or not os.path.isdir(run_log_dir):
             return ""
-        exc_path = os.path.join(run_log_dir, "exceptions.log")
+        # 优先 app.log
+        exc_path = os.path.join(run_log_dir, "app.log")
         if not os.path.isfile(exc_path):
-            return ""
+            # 回退：兼容旧版 exceptions.log
+            legacy = os.path.join(run_log_dir, "exceptions.log")
+            if not os.path.isfile(legacy):
+                return ""
+            exc_path = legacy
         try:
             with open(exc_path, 'r', encoding='utf-8', errors='replace') as f:
                 lines = f.readlines()
@@ -570,12 +693,56 @@ class StabilityReportGenerator:
             if not content:
                 return ""
             escaped = self._escape_html(content).replace("\n", "<br>")
+            # 附加：设备异常摘要（若存在）
+            extra_html = ""
+            try:
+                dev_idx = os.path.join(run_log_dir, "device_exceptions.log")
+                if os.path.isfile(dev_idx):
+                    with open(dev_idx, "r", encoding="utf-8", errors="replace") as df:
+                        dlines = df.readlines()
+                    if dlines:
+                        dtail = dlines[-20:] if len(dlines) > 20 else dlines
+                        extra = self._escape_html("".join(dtail).strip()).replace("\n", "<br>")
+                        if extra:
+                            extra_html = f"""
+        <div class="section">
+            <h3>系统级 ANR/Crash 摘要（/data 转储）</h3>
+            <p style="color: #6c757d; font-size: 0.9em;">以下为 device_exceptions.log 最近 {len(dtail)} 行</p>
+            <div class="log-box">{extra}</div>
+        </div>
+                            """
+            except Exception:
+                extra_html = ""
+
+            # 附加：bugreport（若存在）
+            try:
+                bd = os.path.join(run_log_dir, "bugreport")
+                if os.path.isdir(bd):
+                    zips = [
+                        fn
+                        for fn in os.listdir(bd)
+                        if os.path.isfile(os.path.join(bd, fn)) and fn.lower().endswith(".zip")
+                    ]
+                    if zips:
+                        fn0 = sorted(zips)[-1]
+                        rel_base = ("../" + run_log_dir.replace("\\", "/")).rstrip("/")
+                        href = f"{rel_base}/bugreport/{fn0}"
+                        extra_html = (extra_html or "") + f"""
+        <div class="section">
+            <h3>Bugreport（系统诊断）</h3>
+            <p style="color: #6c757d; font-size: 0.9em;">检测到设备侧 ANR/Crash 后已导出 bugreport：</p>
+            <p><a href="{self._escape_html(href)}" target="_blank" rel="noopener noreferrer">{self._escape_html(fn0)}</a></p>
+        </div>
+                        """
+            except Exception:
+                pass
             return f"""
         <div class="section">
             <h3>异常日志（Crash/ANR/ERROR）</h3>
             <p style="color: #6c757d; font-size: 0.9em;">以下为从 logcat 提取的异常记录（最近 {len(tail)} 条）</p>
             <div class="log-box">{escaped}</div>
         </div>
+        {extra_html}
             """
         except Exception as e:
             logging.debug(f"读取异常日志失败: {e}")
@@ -603,7 +770,7 @@ class StabilityReportGenerator:
 
         phase_display = {
             'idle': '等待开始',
-            'system_robustness': '系统健壮性测试（Monkey/压力）',
+            'monkey_stress': 'Monkey 模式压力测试',
             'exception_recovery': '异常恢复测试',
             'performance': '性能测试',
             'broadcast_stress': '广播模式压力测试',
@@ -752,6 +919,9 @@ class StabilityReportGenerator:
 
         html = """
         <p><strong>最新 10 条采样</strong>（时间倒序；待测应用 + 设备总体）</p>
+        <p style="color:#6c757d;font-size:0.9em;">
+          说明：应用 CPU% 为单进程 CPU%% 按设备 CPU 核数归一化后的结果（约等于占整机算力的百分比），设备 CPU% 为整体 CPU 使用率。
+        </p>
         <table>
             <tr><th>时间</th><th>模式</th><th>应用 CPU%</th><th>应用内存 (MB)</th>""" + header_extra + """</tr>
             """ + (rows_latest if rows_latest else f"<tr><td colspan='{colspan}'>无</td></tr>") + """
@@ -786,7 +956,7 @@ class StabilityReportGenerator:
 
         phase_display = {
             'idle': '等待开始',
-            'system_robustness': '系统健壮性测试（Monkey/压力）',
+            'monkey_stress': 'Monkey 模式压力测试',
             'exception_recovery': '异常恢复测试',
             'performance': '性能测试',
             'broadcast_stress': '广播模式压力测试',
@@ -831,7 +1001,8 @@ class StabilityReportGenerator:
 
         if report_stopped:
             status_badge = '<div style="background: #dc3545; color: #fff; padding: 5px 10px; border-radius: 4px; display: inline-block; margin-left: 10px;">实时报告（已停止）</div>'
-        elif has_snapshot:
+        elif has_snapshot or current_phase != 'idle':
+            # 只要当前阶段不是 idle，或已有 snapshot，就认为测试已经在进行中
             status_badge = '<div style="background: #17a2b8; color: #fff; padding: 5px 10px; border-radius: 4px; display: inline-block; margin-left: 10px;">实时报告（测试进行中）</div>'
         else:
             status_badge = '<div style="background: #6c757d; color: #fff; padding: 5px 10px; border-radius: 4px; display: inline-block;">初始报告</div>'
@@ -872,12 +1043,14 @@ class StabilityReportGenerator:
             <div class="log-box">{log_html}</div>
         </div>
         """
-        # 相关日志超链接（run_log_dir 来自 live_state 或从 device_sn 解析）
+        # 相关日志超链接：仅在无快照时添加到 live_sections，避免与 result_sections 重复
+        # 如果有快照，则统一在 result_sections 中展示，保证报告结构清晰
         device_sn = (device_info.get('sn') or '') if device_info else ''
         log_dir = live_state.get('run_log_dir') or ''
         if not log_dir and device_sn:
             log_dir = self._resolve_latest_run_log_dir(device_sn)
-        if log_dir:
+        if log_dir and not has_snapshot:
+            # 无快照时，在实时区块显示日志链接和异常日志
             live_sections += f"""
         <div class="section">
             <h3>相关日志</h3>
@@ -887,6 +1060,23 @@ class StabilityReportGenerator:
             exc_section = self._build_exceptions_section_html(log_dir)
             if exc_section:
                 live_sections += exc_section
+            # 对于仍在运行中的长压/压力测试，在实时报告中也内嵌资源消耗趋势图表，
+            # 复用统一的 Chart.js 交互能力，数据来源与最终报告一致。
+            try:
+                test_results_for_chart = {
+                    "device_info": device_info,
+                    "tests": {
+                        "monkey_stress": {
+                            "run_log_dir": log_dir,
+                        }
+                    },
+                }
+                charts_html = self._build_performance_sampling_charts_html(test_results_for_chart)
+                if charts_html:
+                    live_sections += charts_html
+            except Exception:
+                # 图表生成失败不影响实时报告其它内容
+                pass
 
         result_sections = ""
         if has_snapshot:
@@ -894,12 +1084,14 @@ class StabilityReportGenerator:
                 summary = self._generate_summary(snapshot)
                 # 收集 run_log_dir（优先 system_robustness / broadcast_stress / tts_stress）
                 tests = snapshot.get('tests', {})
-                run_log_dir = (tests.get('system_robustness') or tests.get('broadcast_stress') or tests.get('tts_stress') or {}).get('run_log_dir', '')
+                run_log_dir = (tests.get('monkey_stress') or tests.get('broadcast_stress') or tests.get('tts_stress') or {}).get('run_log_dir', '')
                 if not run_log_dir:
                     run_log_dir = (tests.get('performance') or {}).get('run_log_dir', '') or (tests.get('exception_recovery') or {}).get('run_log_dir', '')
                 log_links_section = self._build_log_links_html(run_log_dir) if run_log_dir else ''
                 exc_section = self._build_exceptions_section_html(run_log_dir) if run_log_dir else ''
+                errors_section = self._build_module_errors_html(snapshot)
                 result_sections = f"""
+        {errors_section}
         <div class="summary-grid">
             {self._build_summary_cards_html(summary)}
         </div>
@@ -975,6 +1167,40 @@ class StabilityReportGenerator:
     @staticmethod
     def _escape_html(s: str) -> str:
         return (s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;') if s else '')
+
+    @staticmethod
+    def _extract_monkey_phase_rows(monkey_result: Dict[str, Any]) -> list:
+        """
+        提取 Monkey 分阶段结果行。
+
+        新格式优先读取 monkey_result['phase_results']；
+        旧格式/兼容：从 monkey_result['performance_data'] 中过滤出包含 phase/events_executed 等字段的条目，
+        避免把性能采样（timestamp/app_cpu_pct/...）误当成分阶段数据渲染。
+        """
+        if not isinstance(monkey_result, dict):
+            return []
+
+        phases = monkey_result.get("phase_results")
+        if isinstance(phases, list) and phases:
+            return [p for p in phases if isinstance(p, dict)]
+
+        perf_data = monkey_result.get("performance_data") or []
+        if not isinstance(perf_data, list):
+            return []
+
+        out = []
+        for p in perf_data:
+            if not isinstance(p, dict):
+                continue
+            # 分阶段 payload 通常包含 phase / events_executed / crashes_in_phase 等字段
+            if (
+                p.get("phase") is not None
+                or "events_executed" in p
+                or "crashes_in_phase" in p
+                or "anrs_in_phase" in p
+            ):
+                out.append(p)
+        return out
 
     def _generate_json_report(self, test_results: Dict[str, Any], base_filename: str, is_intermediate: bool = False) -> str:
         """生成JSON格式报告"""
@@ -1054,14 +1280,45 @@ class StabilityReportGenerator:
                 'status': 'PASS' if (monkey_result.get('crashes', 0) + monkey_result.get('anrs', 0)) == 0 else 'FAIL',
             }
 
-        # 系统健壮性总结
-        if 'system_robustness' in tests:
-            robust_result = tests['system_robustness']
-            summary['test_overview']['system_robustness'] = {
-                'duration_hours': robust_result.get('duration_hours', 0),
-                'total_crashes': robust_result.get('crashes', 0),
-                'total_anrs': robust_result.get('anrs', 0),
-                'status': self._evaluate_robustness_status(robust_result)
+        # Monkey 模式压力测试总结
+        if 'monkey_stress' in tests:
+            robust_result = tests['monkey_stress'] or {}
+            duration_h = robust_result.get('duration_hours', 0)
+            total_crashes = robust_result.get('crashes', 0)
+            total_anrs = robust_result.get('anrs', 0)
+            # 统计总事件数：优先分阶段统计；fallback-only 时使用 fallback_events；最后回退到 event_count
+            phase_rows = self._extract_monkey_phase_rows(robust_result)
+            total_events = 0
+            if phase_rows:
+                try:
+                    total_events = sum(
+                        int(
+                            (
+                                (p.get("events_completed") if isinstance(p, dict) else None)
+                                or (p.get("events_executed") if isinstance(p, dict) else None)
+                                or (p.get("events") if isinstance(p, dict) else None)
+                                or 0
+                            )
+                            or 0
+                        )
+                        for p in phase_rows
+                    )
+                except Exception:
+                    total_events = 0
+            elif robust_result.get("fallback_direct"):
+                total_events = int(robust_result.get("fallback_events", 0) or 0)
+            else:
+                total_events = int(robust_result.get("event_count", 0) or robust_result.get("planned_event_count", 0) or 0)
+            monkey_tool_bug_count = int(robust_result.get('monkey_tool_bug_count', 0) or 0)
+            monkey_tool_bug_types = robust_result.get('monkey_tool_bug_types') or {}
+            summary['test_overview']['monkey_stress'] = {
+                'duration_hours': duration_h,
+                'total_crashes': total_crashes,
+                'total_anrs': total_anrs,
+                'total_events': total_events,
+                'monkey_tool_bug_count': monkey_tool_bug_count,
+                'monkey_tool_bug_types': monkey_tool_bug_types,
+                'status': self._evaluate_robustness_status(robust_result),
             }
 
         # 广播压力测试总结
@@ -1156,7 +1413,7 @@ class StabilityReportGenerator:
         return summary
 
     def _evaluate_robustness_status(self, robust_result: Dict[str, Any]) -> str:
-        """评估系统健壮性状态"""
+        """评估 Monkey 模式压力测试状态"""
         crashes = robust_result.get('crashes', 0)
         anrs = robust_result.get('anrs', 0)
         duration = robust_result.get('duration_hours', 1)
@@ -1224,8 +1481,8 @@ class StabilityReportGenerator:
         for module_name, module_data in summary.get('test_overview', {}).items():
             if module_name == 'monkey':
                 pass_rates['monkey'] = 1.0 if module_data.get('status') == 'PASS' else 0.0
-            elif module_name == 'system_robustness':
-                pass_rates['system_robustness'] = 1.0 if module_data.get('status') == 'PASS' else 0.0
+            elif module_name == 'monkey_stress':
+                pass_rates['monkey_stress'] = 1.0 if module_data.get('status') == 'PASS' else 0.0
             elif module_name == 'broadcast_stress':
                 pass_rates['broadcast_stress'] = 1.0 if module_data.get('status') == 'PASS' else 0.0
             elif module_name == 'tts_stress':
@@ -1258,15 +1515,24 @@ class StabilityReportGenerator:
 
         tests = test_results.get('tests', {})
 
-        # 检查系统健壮性问题
-        if 'system_robustness' in tests:
-            robust = tests['system_robustness']
+        # 检查 Monkey 模式压力测试问题
+        if 'monkey_stress' in tests:
+            robust = tests['monkey_stress']
             crashes = robust.get('crashes', 0)
             anrs = robust.get('anrs', 0)
             if crashes > 0:
                 issues.append(f"检测到 {crashes} 次应用崩溃")
             if anrs > 0:
                 issues.append(f"检测到 {anrs} 次应用无响应(ANR)")
+            bug_cnt = int(robust.get('monkey_tool_bug_count', 0) or 0)
+            bug_types = robust.get('monkey_tool_bug_types') or {}
+            if bug_cnt > 0:
+                # 仅展示类型 key，次数在详细区块中给出
+                type_list = ", ".join(str(k) for k in bug_types.keys()) if isinstance(bug_types, dict) else ""
+                if type_list:
+                    issues.append(f"Monkey 工具异常 {bug_cnt} 次（类型: {type_list}）")
+                else:
+                    issues.append(f"Monkey 工具异常 {bug_cnt} 次")
 
         # 检查广播/TTS 压力测试
         for key, label in [('broadcast_stress', '广播压力'), ('tts_stress', 'TTS压力')]:
@@ -1521,6 +1787,13 @@ class StabilityReportGenerator:
         .log-links a {{
             margin-right: 8px;
         }}
+        .phase-table-container {{
+            max-height: 400px;
+            overflow-y: auto;
+            /* 独立滚动，不影响页面其他布局 */
+            display: block;
+            margin: 10px 0;
+        }}
     </style>
 </head>
 <body>
@@ -1598,15 +1871,20 @@ class StabilityReportGenerator:
                     </div>
                 </div>
                 """
-            elif module_name == 'system_robustness':
+            elif module_name == 'monkey_stress':
                 status = module_data.get('status', 'UNKNOWN')
                 status_class = "status-pass" if status == 'PASS' else "status-fail"
+                bug_count = int(module_data.get('monkey_tool_bug_count', 0) or 0)
                 html += f"""
                 <div class="summary-card">
-                    <h3>系统健壮性</h3>
+                    <h3>Monkey 模式压力测试</h3>
                     <div class="metric">
                         <span class="metric-name">测试时长</span>
                         <span class="metric-value">{module_data.get('duration_hours', 0)}小时</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-name">事件总数</span>
+                        <span class="metric-value">{module_data.get('total_events', 0)}</span>
                     </div>
                     <div class="metric">
                         <span class="metric-name">崩溃次数</span>
@@ -1615,6 +1893,10 @@ class StabilityReportGenerator:
                     <div class="metric">
                         <span class="metric-name">ANR次数</span>
                         <span class="metric-value">{module_data.get('total_anrs', 0)}</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-name">Monkey 工具异常</span>
+                        <span class="metric-value">{bug_count} 次</span>
                     </div>
                     <div class="metric">
                         <span class="metric-name">状态</span>
@@ -1700,6 +1982,35 @@ class StabilityReportGenerator:
 
         return html
 
+    def _build_module_errors_html(self, test_results: Dict[str, Any]) -> str:
+        """若任意模块结果含 error 字段，则生成醒目的错误区块（红色边框）。"""
+        tests = test_results.get('tests', {}) or {}
+        module_labels = getattr(self, 'TEST_TYPE_LABELS', None) or {
+            'monkey_stress': 'Monkey 模式压力测试',
+            'exception_recovery': '异常恢复测试',
+            'performance': '性能测试',
+            'broadcast_stress': '广播模式压力测试',
+            'tts_stress': 'TTS 模式压力测试',
+        }
+        errors = []
+        for key, data in tests.items():
+            if isinstance(data, dict) and data.get('error'):
+                label = module_labels.get(key, key)
+                errors.append((label, str(data.get('error', ''))))
+        if not errors:
+            return ""
+        rows = "".join(
+            f"<tr><td>{self._escape_html(label)}</td><td>{self._escape_html(msg)}</td></tr>"
+            for label, msg in errors
+        )
+        return f"""
+        <div class="section" style="border: 2px solid #dc3545; background: #fff5f5; border-radius: 6px; padding: 16px;">
+            <h3 style="color: #dc3545;">模块异常/失败</h3>
+            <p>以下模块执行过程中发生异常，请结合日志排查。</p>
+            <table><tr><th>模块</th><th>错误信息</th></tr>{rows}</table>
+        </div>
+        """
+
     def _build_detailed_results_html(self, test_results: Dict[str, Any]) -> str:
         """构建详细结果HTML"""
         html = "<h2>详细测试结果</h2>"
@@ -1780,12 +2091,234 @@ class StabilityReportGenerator:
 """
                 html += "</table>"
 
+        # 广播压力测试详情
+        if 'broadcast_stress' in tests:
+            bc_result = tests['broadcast_stress']
+            response_monitoring = bc_result.get('response_monitoring', [])
+            success_count = sum(1 for r in response_monitoring if r.get('status') == 'success')
+            timeout_appear_count = sum(1 for r in response_monitoring if r.get('status') == 'timeout_appear')
+            timeout_disappear_count = sum(1 for r in response_monitoring if r.get('status') == 'timeout_disappear')
+            response_times = [r.get('response_time') for r in response_monitoring if r.get('response_time') is not None]
+            avg_response_time = sum(response_times) / len(response_times) if response_times else None
+            
+            html += "<h3>广播压力测试</h3><table>"
+            html += "<tr><th>指标</th><th>值</th></tr>"
+            html += f"<tr><td>发送广播数</td><td>{bc_result.get('broadcasts_sent', 0)}</td></tr>"
+            html += f"<tr><td>崩溃次数</td><td>{bc_result.get('crashes', 0)}</td></tr>"
+            html += f"<tr><td>ANR次数</td><td>{bc_result.get('anrs', 0)}</td></tr>"
+            html += f"<tr><td>响应成功</td><td>{success_count}/{len(response_monitoring)}</td></tr>"
+            html += f"<tr><td>响应超时（未出现）</td><td>{timeout_appear_count}</td></tr>"
+            html += f"<tr><td>响应超时（未消失）</td><td>{timeout_disappear_count}</td></tr>"
+            if avg_response_time:
+                html += f"<tr><td>平均响应时间</td><td>{avg_response_time:.2f}秒</td></tr>"
+            html += "</table>"
+
+        # TTS 压力测试详情
+        if 'tts_stress' in tests:
+            tts_result = tests['tts_stress']
+            response_monitoring = tts_result.get('response_monitoring', [])
+            success_count = sum(1 for r in response_monitoring if r.get('status') == 'success')
+            timeout_appear_count = sum(1 for r in response_monitoring if r.get('status') == 'timeout_appear')
+            timeout_disappear_count = sum(1 for r in response_monitoring if r.get('status') == 'timeout_disappear')
+            response_times = [r.get('response_time') for r in response_monitoring if r.get('response_time') is not None]
+            avg_response_time = sum(response_times) / len(response_times) if response_times else None
+            
+            html += "<h3>TTS 压力测试</h3><table>"
+            html += "<tr><th>指标</th><th>值</th></tr>"
+            html += f"<tr><td>播放条数</td><td>{tts_result.get('tts_played', 0)}</td></tr>"
+            html += f"<tr><td>崩溃次数</td><td>{tts_result.get('crashes', 0)}</td></tr>"
+            html += f"<tr><td>ANR次数</td><td>{tts_result.get('anrs', 0)}</td></tr>"
+            html += f"<tr><td>响应成功</td><td>{success_count}/{len(response_monitoring)}</td></tr>"
+            html += f"<tr><td>响应超时（未出现）</td><td>{timeout_appear_count}</td></tr>"
+            html += f"<tr><td>响应超时（未消失）</td><td>{timeout_disappear_count}</td></tr>"
+            if avg_response_time:
+                html += f"<tr><td>平均响应时间</td><td>{avg_response_time:.2f}秒</td></tr>"
+            html += "</table>"
+
+        # Monkey 模式压力测试详情
+        if 'monkey_stress' in tests:
+            monkey_result = tests['monkey_stress']
+            html += "<h3>Monkey 模式压力测试</h3>"
+
+            # 1) 概览表：时长 / 事件总数 / 崩溃 / ANR
+            phase_rows = self._extract_monkey_phase_rows(monkey_result)
+            total_events = 0
+            if phase_rows:
+                try:
+                    total_events = sum(
+                        int(
+                            (
+                                (p.get("events_completed") if isinstance(p, dict) else None)
+                                or (p.get("events_executed") if isinstance(p, dict) else None)
+                                or (p.get("events") if isinstance(p, dict) else None)
+                                or 0
+                            )
+                            or 0
+                        )
+                        for p in phase_rows
+                    )
+                except Exception:
+                    total_events = 0
+            elif monkey_result.get("fallback_direct"):
+                total_events = int(monkey_result.get("fallback_events", 0) or 0)
+            else:
+                total_events = int(monkey_result.get("event_count", 0) or monkey_result.get("planned_event_count", 0) or 0)
+            duration_h = monkey_result.get('duration_hours', 0)
+            total_crashes = monkey_result.get('crashes', 0)
+            total_anrs = monkey_result.get('anrs', 0)
+            html += "<table>"
+            html += "<tr><th>指标</th><th>值</th></tr>"
+            html += f"<tr><td>测试时长</td><td>{duration_h}小时</td></tr>"
+            html += f"<tr><td>事件总数</td><td>{total_events}</td></tr>"
+            html += f"<tr><td>崩溃次数</td><td>{total_crashes}</td></tr>"
+            html += f"<tr><td>ANR次数</td><td>{total_anrs}</td></tr>"
+            html += "</table>"
+
+            # 2) 性能监控概要：复用 log_summary
+            log_summary = monkey_result.get('log_summary') or {}
+            if isinstance(log_summary, dict) and log_summary:
+                html += "<h4>性能监控概要（数据来源：ExtendedMonkeyTest._analyze_test_results）</h4>"
+                html += "<table>"
+                html += "<tr><th>指标</th><th>值</th></tr>"
+                avg_cpu = log_summary.get('average_cpu_usage')
+                peak_cpu = log_summary.get('peak_cpu_usage')
+                if avg_cpu is not None or peak_cpu is not None:
+                    html += f"<tr><td>应用 CPU 使用率</td><td>平均 {avg_cpu:.1f}% / 峰值 {peak_cpu:.1f}%</td></tr>"
+                avg_cpu_fg = log_summary.get('average_cpu_foreground')
+                peak_cpu_fg = log_summary.get('peak_cpu_foreground')
+                avg_cpu_bg = log_summary.get('average_cpu_background')
+                peak_cpu_bg = log_summary.get('peak_cpu_background')
+                if avg_cpu_fg is not None or avg_cpu_bg is not None:
+                    html += (
+                        f"<tr><td>前台 / 后台 CPU</td>"
+                        f"<td>前台 平均 {avg_cpu_fg:.1f}% / 峰值 {peak_cpu_fg:.1f}%；"
+                        f"后台 平均 {avg_cpu_bg:.1f}% / 峰值 {peak_cpu_bg:.1f}%</td></tr>"
+                    )
+                avg_mem = log_summary.get('average_memory_pss')
+                peak_mem = log_summary.get('peak_memory_pss')
+                if avg_mem is not None or peak_mem is not None:
+                    html += f"<tr><td>应用内存 PSS</td><td>平均 {avg_mem:.0f} KB / 峰值 {peak_mem} KB</td></tr>"
+                mem_trend = log_summary.get('memory_trend')
+                mem_slope = log_summary.get('memory_trend_slope_per_sample')
+                if mem_trend is not None:
+                    html += (
+                        f"<tr><td>内存趋势</td>"
+                        f"<td>趋势：{mem_trend}（每采样点斜率 {float(mem_slope or 0.0):.2f} KB）</td></tr>"
+                    )
+                html += "</table>"
+
+            # 3) 分阶段结果表（若有）
+            if phase_rows:
+                html += "<h4>分阶段结果</h4>"
+                html += '<div class="phase-table-container"><table>'
+                html += (
+                    "<tr><th>阶段</th><th>开始时间</th><th>结束时间</th>"
+                    "<th>阶段耗时(秒)</th><th>事件数</th><th>崩溃</th><th>ANR</th><th>Monkey 工具异常 / Fallback</th></tr>"
+                )
+                from datetime import datetime as _dt
+
+                for p in sorted(phase_rows, key=lambda x: (x.get('phase', 0) or 0) if isinstance(x, dict) else 0):
+                    phase_no = p.get('phase') if isinstance(p, dict) else ''
+                    st = p.get('start_time') if isinstance(p, dict) else ''
+                    et = p.get('end_time') if isinstance(p, dict) else ''
+                    events = 0
+                    if isinstance(p, dict):
+                        events = (
+                            p.get('events_completed')
+                            if p.get('events_completed') is not None
+                            else (p.get('events_executed') if p.get('events_executed') is not None else p.get('events'))
+                        )
+                    events = int(events or 0)
+                    c_in_phase = p.get('crashes_in_phase', 0)
+                    a_in_phase = p.get('anrs_in_phase', 0)
+                    # 阶段耗时
+                    try:
+                        if isinstance(st, str) and isinstance(et, str):
+                            st_dt = _dt.fromisoformat(st.replace("Z", "+00:00"))
+                            et_dt = _dt.fromisoformat(et.replace("Z", "+00:00"))
+                            if st_dt.tzinfo:
+                                st_dt = st_dt.replace(tzinfo=None)
+                            if et_dt.tzinfo:
+                                et_dt = et_dt.replace(tzinfo=None)
+                            dur_sec = max(0, int((et_dt - st_dt).total_seconds()))
+                        else:
+                            dur_sec = 0
+                    except Exception:
+                        dur_sec = 0
+                    # 工具异常 / fallback 标记
+                    bug_flag = ""
+                    if p.get("monkey_tool_bug"):
+                        bt = p.get("monkey_tool_bug_type") or "unknown"
+                        bug_flag = f"工具异常: {bt}"
+                    fb = p.get("fallback") or {}
+                    if fb:
+                        fb_events = fb.get("events_injected", 0)
+                        fb_dur = fb.get("duration_seconds", 0.0)
+                        extra = f"fallback: {fb_events} 事件 / {fb_dur:.1f} 秒"
+                        bug_flag = f"{bug_flag}；{extra}" if bug_flag else extra
+                    bug_flag = bug_flag or "-"
+
+                    html += f"""
+<tr>
+  <td>{phase_no}</td>
+  <td>{(st or '')[:19]}</td>
+  <td>{(et or '')[:19]}</td>
+  <td>{dur_sec}</td>
+  <td>{events}</td>
+  <td>{c_in_phase}</td>
+  <td>{a_in_phase}</td>
+  <td>{bug_flag}</td>
+</tr>
+"""
+                html += "</table></div>"
+            elif monkey_result.get("fallback_direct"):
+                # fallback-only：不渲染空/错误的“分阶段表”，给出单行概要（保持表结构与样式一致）
+                st0 = (monkey_result.get("start_time") or "")[:19]
+                et0 = (monkey_result.get("actual_end_time") or monkey_result.get("end_time") or "")[:19]
+                fb_events = int(monkey_result.get("fallback_events", 0) or 0)
+                html += "<h4>分阶段结果</h4>"
+                html += '<div class="phase-table-container"><table>'
+                html += (
+                    "<tr><th>阶段</th><th>开始时间</th><th>结束时间</th>"
+                    "<th>阶段耗时(秒)</th><th>事件数</th><th>崩溃</th><th>ANR</th><th>Monkey 工具异常 / Fallback</th></tr>"
+                )
+                html += f"""
+<tr>
+  <td>Fallback</td>
+  <td>{st0}</td>
+  <td>{et0}</td>
+  <td>0</td>
+  <td>{fb_events}</td>
+  <td>{int(monkey_result.get('crashes', 0) or 0)}</td>
+  <td>{int(monkey_result.get('anrs', 0) or 0)}</td>
+  <td>fallback: {fb_events} 事件</td>
+</tr>
+"""
+                html += "</table></div>"
+
+            # 4) Monkey 工具异常统计（若有）
+            bug_count = int(monkey_result.get('monkey_tool_bug_count', 0) or 0)
+            bug_types = monkey_result.get('monkey_tool_bug_types') or {}
+            if bug_count > 0 and isinstance(bug_types, dict) and bug_types:
+                html += "<h4>Monkey 工具异常统计</h4>"
+                html += "<table>"
+                html += "<tr><th>异常类型</th><th>次数</th></tr>"
+                for bt, cnt in bug_types.items():
+                    html += f"<tr><td>{self._escape_html(str(bt))}</td><td>{int(cnt or 0)}</td></tr>"
+                html += "</table>"
+
         return html
 
     def _build_log_links_and_exceptions_html(self, test_results: Dict[str, Any]) -> str:
         """从 test_results 收集 run_log_dir，构建相关日志超链接及异常日志展示。"""
         tests = test_results.get('tests', {})
-        run_log_dir = (tests.get('system_robustness') or tests.get('broadcast_stress') or tests.get('tts_stress') or {}).get('run_log_dir', '')
+        run_log_dir = (
+            (tests.get('monkey_stress') or {}).get('run_log_dir')
+            or (tests.get('system_robustness') or {}).get('run_log_dir')
+            or (tests.get('broadcast_stress') or {}).get('run_log_dir')
+            or (tests.get('tts_stress') or {}).get('run_log_dir')
+            or ''
+        )
         if not run_log_dir:
             run_log_dir = (tests.get('performance') or {}).get('run_log_dir', '') or (tests.get('exception_recovery') or {}).get('run_log_dir', '')
         if not run_log_dir:
@@ -1832,9 +2365,9 @@ class StabilityReportGenerator:
         html = ""
         device_sn = test_results.get('device_info', {}).get('sn', 'unknown')
 
-        # 优先使用本次运行目录（支持 system_robustness、broadcast_stress、tts_stress）
+        # 优先使用本次运行目录（支持 monkey_stress、broadcast_stress、tts_stress）
         tests = test_results.get('tests', {})
-        run_log_dir = (tests.get('system_robustness') or tests.get('broadcast_stress') or tests.get('tts_stress') or {}).get('run_log_dir')
+        run_log_dir = (tests.get('monkey_stress') or tests.get('broadcast_stress') or tests.get('tts_stress') or {}).get('run_log_dir')
         jsonl_path = os.path.join(run_log_dir, "performance_sampling.jsonl") if run_log_dir else None
 
         # 回退：按设备 SN 查找最近一次的采样文件
@@ -1902,16 +2435,6 @@ class StabilityReportGenerator:
             if not labels:
                 return ""
 
-            # 截取最近 300 个点
-            cap = 300
-            labels_trim = labels[-cap:]
-            cpu_fg_trim = cpu_fg[-cap:]
-            cpu_bg_trim = cpu_bg[-cap:]
-            mem_fg_trim = mem_fg[-cap:]
-            mem_bg_trim = mem_bg[-cap:]
-            device_cpu_trim = device_cpu_list[-cap:] if device_cpu_list else []
-            device_mem_trim = device_mem_list[-cap:] if device_mem_list else []
-
             def _stats(xs):
                 xs2 = [x for x in xs if isinstance(x, (int, float)) and x is not None]
                 if not xs2:
@@ -1948,8 +2471,8 @@ class StabilityReportGenerator:
             new Chart(deviceCpuCtx, {{
                 type: 'line',
                 data: {{
-                    labels: {json.dumps(labels_trim, ensure_ascii=False)},
-                    datasets: [{{ label: '设备 CPU%', data: {json.dumps(device_cpu_trim)}, borderColor: 'rgb(54, 162, 235)', tension: 0.15, fill: false, pointRadius: 0, spanGaps: true }}]
+                    labels: {json.dumps(labels, ensure_ascii=False)},
+                    datasets: [{{ label: '设备 CPU%', data: {json.dumps(device_cpu_list)}, borderColor: 'rgb(54, 162, 235)', tension: 0.15, fill: false, pointRadius: 0, spanGaps: true }}]
                 }},
                 options: {{ responsive: true, maintainAspectRatio: false, plugins: {{ title: {{ display: true, text: '设备总体 CPU 使用率' }} }}, scales: {{ y: {{ beginAtZero: true }} }} }}
             }});
@@ -1957,8 +2480,8 @@ class StabilityReportGenerator:
             new Chart(deviceMemCtx, {{
                 type: 'line',
                 data: {{
-                    labels: {json.dumps(labels_trim, ensure_ascii=False)},
-                    datasets: [{{ label: '设备内存 MB', data: {json.dumps(device_mem_trim)}, borderColor: 'rgb(255, 206, 86)', tension: 0.15, fill: false, pointRadius: 0, spanGaps: true }}]
+                    labels: {json.dumps(labels, ensure_ascii=False)},
+                    datasets: [{{ label: '设备内存 MB', data: {json.dumps(device_mem_list)}, borderColor: 'rgb(255, 206, 86)', tension: 0.15, fill: false, pointRadius: 0, spanGaps: true }}]
                 }},
                 options: {{ responsive: true, maintainAspectRatio: false, plugins: {{ title: {{ display: true, text: '设备总体内存使用 (MB)' }} }}, scales: {{ y: {{ beginAtZero: true }} }} }}
             }});"""
@@ -1967,6 +2490,9 @@ class StabilityReportGenerator:
         <h2>资源消耗趋势图（待测应用 + 设备总体）</h2>
         <div style="background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 6px; padding: 12px; margin: 10px 0;">
           <b>采样统计（数据来源：{os.path.basename(jsonl_path)}）</b>
+          <p style="margin:4px 0;color:#6c757d;font-size:0.9em;">
+            应用 CPU% = 单进程 CPU% / 设备 CPU 核数（归一化到整机核数），设备 CPU% = 整机平均 CPU 使用率。
+          </p>
           <p><b>待测应用（按模式：前台/后台）</b></p>
           <ul style="margin: 8px 0 0 18px;">
             <li>前台：CPU 平均 {fg_cpu_avg:.1f}% / 峰值 {fg_cpu_peak:.1f}%（{fg_n} 点）｜内存 平均 {fg_mem_avg:.1f}MB / 峰值 {fg_mem_peak:.1f}MB（{fg_n_m} 点）</li>
@@ -1984,15 +2510,16 @@ class StabilityReportGenerator:
         {device_charts_html}
         
         <script src="https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@1.2.1/dist/chartjs-plugin-zoom.min.js"></script>
         <script>
             const cpuCtx = document.getElementById('cpuChart').getContext('2d');
             const cpuChart = new Chart(cpuCtx, {{
                 type: 'line',
                 data: {{
-                    labels: {json.dumps(labels_trim, ensure_ascii=False)},
+                    labels: {json.dumps(labels, ensure_ascii=False)},
                     datasets: [{{
                         label: 'CPU（前台）%',
-                        data: {json.dumps(cpu_fg_trim)},
+                        data: {json.dumps(cpu_fg)},
                         borderColor: 'rgb(75, 192, 192)',
                         backgroundColor: 'rgba(75, 192, 192, 0.15)',
                         tension: 0.15,
@@ -2001,7 +2528,7 @@ class StabilityReportGenerator:
                         spanGaps: true
                     }}, {{
                         label: 'CPU（后台）%',
-                        data: {json.dumps(cpu_bg_trim)},
+                        data: {json.dumps(cpu_bg)},
                         borderColor: 'rgb(255, 159, 64)',
                         backgroundColor: 'rgba(255, 159, 64, 0.15)',
                         tension: 0.15,
@@ -2016,7 +2543,18 @@ class StabilityReportGenerator:
                     plugins: {{
                         title: {{ display: true, text: '待测应用 CPU 使用率（按前台/后台）' }},
                         legend: {{ display: true }},
-                        tooltip: {{ mode: 'index', intersect: false }}
+                        tooltip: {{ mode: 'index', intersect: false }},
+                        zoom: {{
+                            zoom: {{
+                                wheel: {{ enabled: true }},
+                                pinch: {{ enabled: true }},
+                                mode: 'x'
+                            }},
+                            pan: {{
+                                enabled: true,
+                                mode: 'x'
+                            }}
+                        }}
                     }},
                     interaction: {{ mode: 'index', intersect: false }},
                     scales: {{
@@ -2025,15 +2563,16 @@ class StabilityReportGenerator:
                     }}
                 }}
             }});
+            cpuCtx.canvas.addEventListener('dblclick', () => cpuChart.resetZoom());
             
             const memoryCtx = document.getElementById('memoryChart').getContext('2d');
             const memoryChart = new Chart(memoryCtx, {{
                 type: 'line',
                 data: {{
-                    labels: {json.dumps(labels_trim, ensure_ascii=False)},
+                    labels: {json.dumps(labels, ensure_ascii=False)},
                     datasets: [{{
                         label: '内存（前台）MB',
-                        data: {json.dumps(mem_fg_trim)},
+                        data: {json.dumps(mem_fg)},
                         borderColor: 'rgb(255, 99, 132)',
                         backgroundColor: 'rgba(255, 99, 132, 0.15)',
                         tension: 0.15,
@@ -2042,7 +2581,7 @@ class StabilityReportGenerator:
                         spanGaps: true
                     }}, {{
                         label: '内存（后台）MB',
-                        data: {json.dumps(mem_bg_trim)},
+                        data: {json.dumps(mem_bg)},
                         borderColor: 'rgb(153, 102, 255)',
                         backgroundColor: 'rgba(153, 102, 255, 0.15)',
                         tension: 0.15,
@@ -2057,7 +2596,18 @@ class StabilityReportGenerator:
                     plugins: {{
                         title: {{ display: true, text: '待测应用内存使用（按前台/后台）' }},
                         legend: {{ display: true }},
-                        tooltip: {{ mode: 'index', intersect: false }}
+                        tooltip: {{ mode: 'index', intersect: false }},
+                        zoom: {{
+                            zoom: {{
+                                wheel: {{ enabled: true }},
+                                pinch: {{ enabled: true }},
+                                mode: 'x'
+                            }},
+                            pan: {{
+                                enabled: true,
+                                mode: 'x'
+                            }}
+                        }}
                     }},
                     interaction: {{ mode: 'index', intersect: false }},
                     scales: {{
@@ -2066,9 +2616,14 @@ class StabilityReportGenerator:
                     }}
                 }}
             }});
+            memoryCtx.canvas.addEventListener('dblclick', () => memoryChart.resetZoom());
             {device_charts_script}
         </script>
-        <p style="color: #6c757d; font-size: 0.9em;">共 {len(labels)} 个采样点（展示最近 {min(cap, len(labels))} 个）。含待测应用与设备总体 CPU/内存。</p>
+        <p style="color: #6c757d; font-size: 0.9em;">
+          共 {len(labels)} 个采样点，图表支持缩放和平移：
+          鼠标滚轮缩放时间轴，按住拖动平移，双击图表重置视图。
+          同时展示待测应用（前台/后台）与设备总体的 CPU / 内存趋势。
+        </p>
         """
         except Exception as e:
             logging.warning(f"生成performance_sampling.jsonl可视化图表失败: {e}")
