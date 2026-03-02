@@ -11,6 +11,7 @@ import re
 from datetime import datetime, timedelta
 from utils.timeout_command import run as run_cmd
 from utils.stress_monitor import StressMonitor
+from utils.run_control import is_paused, wait_while_paused_or_timeout, PAUSE_TIMEOUT_SECONDS
 
 
 class ExtendedMonkeyTest:
@@ -33,66 +34,49 @@ class ExtendedMonkeyTest:
         self._logcat_process = None
         self._stop_logcat = threading.Event()
         self._stop_monitor = threading.Event()
+        self._terminated_due_to_pause_timeout = False
+
+    @staticmethod
+    def _format_duration_hours(duration_hours: float) -> str:
+        """将小时数格式化为可读字符串（如 '6 小时' 或 '30 分钟'）。"""
+        if duration_hours < 1:
+            minutes = duration_hours * 60.0
+            return f"{minutes:g} 分钟 (~{duration_hours:.2f} 小时)"
+        if abs(duration_hours - round(duration_hours)) < 1e-6:
+            return f"{int(round(duration_hours))} 小时"
+        return f"{duration_hours:.1f} 小时"
 
     def run_long_stress_test(self):
         """
         运行长时间压力测试
         """
-        # 容错处理：duration_hours 可能来自 GUI / CLI（字符串或浮点数）
+        # 集中读取并校验运行参数（默认值与边界统一在此处管理）
         raw_duration = self.config.get('duration_hours', 12)
         try:
             duration_hours = float(raw_duration)
         except Exception:
             duration_hours = 12.0
-
         if duration_hours <= 0:
-            logging.warning(f"收到非法测试时长 {raw_duration}，回退使用默认 12 小时")
+            logging.warning("收到非法测试时长 %s，回退使用默认 12 小时", raw_duration)
             duration_hours = 12.0
 
-        throttle = self.config.get('throttle', 700)
-        # 某些 ROM/Monkey 版本在生成 permission/系统键 等事件时会异常，默认降低这些事件比例以提升稳定性
-        pct_permission = self.config.get('pct_permission', 0)
-        pct_anyevent = self.config.get('pct_anyevent', 0)
-        pct_appswitch = self.config.get('pct_appswitch', 0)
-        pct_syskeys = self.config.get('pct_syskeys', 0)
-        
-        # 按时长推算事件数：事件数 ≈ duration_hours * 3600 * 1000 / throttle
-        # 这样可以让 Monkey 理论上跑约等于设定时长
-        # 优先使用计算的事件数（确保GUI配置的时长生效），除非明确指定了 use_config_event_count
-        use_config_event_count = self.config.get('use_config_event_count', False)
-        
-        if use_config_event_count and 'event_count' in self.config and self.config.get('event_count') is not None:
-            event_count = self.config.get('event_count', 100000)
-            logging.info(f"使用配置的事件数: {event_count}（忽略时长计算）")
+        throttle = int(self.config.get('throttle', 700))
+        pct_permission = int(self.config.get('pct_permission', 0))
+        pct_anyevent = int(self.config.get('pct_anyevent', 0))
+        pct_appswitch = int(self.config.get('pct_appswitch', 0))
+        pct_syskeys = int(self.config.get('pct_syskeys', 0))
+        use_config_event_count = bool(self.config.get('use_config_event_count', False))
+
+        duration_str = self._format_duration_hours(duration_hours)
+        if use_config_event_count and self.config.get('event_count') is not None:
+            event_count = max(100, int(self.config.get('event_count', 100000)))
+            logging.info("使用配置的事件数: %s（忽略时长计算）", event_count)
         else:
-            # 根据时长和throttle计算事件数
-            # duration_hours * 3600秒 * 1000毫秒 / throttle毫秒 = 事件数
             calculated_events = int((duration_hours * 3600.0 * 1000.0) / throttle)
-            # 至少保证有100个事件，避免过短
             event_count = max(100, calculated_events)
-            # 日志中同时友好展示"小时/分钟"（提前计算，因为后面需要用到）
-            if duration_hours < 1:
-                minutes = duration_hours * 60.0
-                duration_str = f"{minutes:g} 分钟 (~{duration_hours:.2f} 小时)"
-            else:
-                if abs(duration_hours - round(duration_hours)) < 1e-6:
-                    duration_str = f"{int(round(duration_hours))} 小时"
-                else:
-                    duration_str = f"{duration_hours:.1f} 小时"
-            logging.info(f"根据时长 {duration_str} 和 throttle {throttle}ms 计算事件数: {event_count}")
+            logging.info("根据时长 %s 和 throttle %sms 计算事件数: %s", duration_str, throttle, event_count)
 
-        # 日志中同时友好展示"小时/分钟"（如果之前没计算过）
-        if 'duration_str' not in locals():
-            if duration_hours < 1:
-                minutes = duration_hours * 60.0
-                duration_str = f"{minutes:g} 分钟 (~{duration_hours:.2f} 小时)"
-            else:
-                if abs(duration_hours - round(duration_hours)) < 1e-6:
-                    duration_str = f"{int(round(duration_hours))} 小时"
-                else:
-                    duration_str = f"{duration_hours:.1f} 小时"
-
-        logging.info(f"开始长时间压力测试，持续 {duration_str}，事件数: {event_count}")
+        logging.info("开始长时间压力测试，持续 %s，事件数: %s", duration_str, event_count)
 
         # 为本次测试运行创建独立的时间戳日志目录：logs/设备SN/年月日时分秒
         run_ts = datetime.now().strftime("%Y%m%d%H%M%S")
@@ -319,6 +303,14 @@ class ExtendedMonkeyTest:
         last_progress_log = time.time()
 
         while (time.time() - start) < duration_seconds:
+            # 暂停/继续：若处于暂停则等待，超时 30 分钟则终止
+            if is_paused():
+                if not wait_while_paused_or_timeout(
+                    on_timeout=lambda: None,
+                    stop_event=None,
+                    timeout_seconds=PAUSE_TIMEOUT_SECONDS,
+                ):
+                    break
             now = time.time()
             # 每 2 秒检测并保证待测应用在前台
             if now - last_foreground_check >= foreground_check_interval:
@@ -734,15 +726,28 @@ class ExtendedMonkeyTest:
         events_per_phase = max(1, event_count // total_phases)
 
         for phase in range(total_phases):
+            # 暂停/继续：若处于暂停则等待，超时 30 分钟则终止
+            if is_paused():
+                if not wait_while_paused_or_timeout(
+                    on_timeout=lambda: None,
+                    stop_event=None,
+                    timeout_seconds=PAUSE_TIMEOUT_SECONDS,
+                ):
+                    result["terminated_due_to_pause_timeout"] = True
+                    break
             logging.info(f"执行第 {phase + 1}/{total_phases} 阶段压力测试（目标时长: {phase_duration_seconds:.1f}秒）")
 
             # 清理应用状态
             self._cleanup_app_state()
 
             # 执行单阶段 Monkey 测试（带超时控制）
+            self._terminated_due_to_pause_timeout = False
             phase_result = self._run_single_phase_monkey(
                 phase, throttle, events_per_phase, phase_duration_seconds
             )
+            if getattr(self, "_terminated_due_to_pause_timeout", False):
+                result["terminated_due_to_pause_timeout"] = True
+                break
 
             # 记录阶段结果
             # 注意：performance_data 仅用于性能采样；分阶段结果写入 phase_results
@@ -754,6 +759,7 @@ class ExtendedMonkeyTest:
                 'phase': phase + 1,
                 'start_time': phase_result['start_time'],
                 'end_time': phase_result['end_time'],
+                'actual_duration_seconds': phase_result.get('actual_duration_seconds'),
                 'events_planned': planned,
                 'events_executed': executed,
                 'crashes_in_phase': phase_result['crashes'],
@@ -916,7 +922,7 @@ class ExtendedMonkeyTest:
             )
             guard_thread.start()
 
-            # 主线程监控超时
+            # 主线程监控超时与暂停
             elapsed = 0
             while process.poll() is None:
                 elapsed = time.time() - phase_start_time
@@ -924,6 +930,16 @@ class ExtendedMonkeyTest:
                     logging.warning(f"阶段 {phase + 1} 超过目标时长 {phase_duration_seconds:.1f}秒，强制结束")
                     self._kill_monkey_process(process)
                     break
+                # 暂停/继续：若处于暂停则等待，超时 30 分钟则终止
+                if is_paused():
+                    if not wait_while_paused_or_timeout(
+                        on_timeout=lambda p=process: self._kill_monkey_process(p),
+                        stop_event=None,
+                        timeout_seconds=PAUSE_TIMEOUT_SECONDS,
+                    ):
+                        self._kill_monkey_process(process)
+                        self._terminated_due_to_pause_timeout = True
+                        break
                 time.sleep(0.5)  # 每0.5秒检查一次
             
             # 等待输出线程结束

@@ -6,6 +6,12 @@
 
 支持的报告类型：传统Monkey、稳定性测试、Monkey 模式压力测试、性能测试、异常恢复测试等。
 所有报告使用统一的格式、结构和内容规范，并支持测试过程中的实时报告更新。
+
+数据契约（供 normalize_test_results 与各 _build_* 使用）：
+- test_results: device_info, package_info, tests (各模块 key 如 monkey_stress/broadcast_stress/tts_stress),
+  start_time, end_time, metadata; tests[*].run_log_dir, phase_results, performance_data（Monkey）等。
+- live_state: device_info, package_info, test_params, start_time, current_phase, modules_done,
+  run_log_dir, test_results_snapshot, crashes_so_far, anrs_so_far, performance_snapshot, log_tail.
 """
 
 import json
@@ -87,13 +93,18 @@ def normalize_test_results(raw: Dict[str, Any], test_type: str) -> Dict[str, Any
     Returns:
         规范化后的 test_results，包含 device_info, package_info, tests, start_time 等
     """
+    if not isinstance(raw, dict):
+        raw = {}
+    def _safe_dict(key: str):
+        v = raw.get(key)
+        return v if isinstance(v, dict) else {}
     normalized = {
-        'device_info': raw.get('device_info') or {},
-        'package_info': raw.get('package_info') or {},
-        'tests': raw.get('tests') or {},
+        'device_info': _safe_dict('device_info'),
+        'package_info': _safe_dict('package_info'),
+        'tests': _safe_dict('tests'),
         'start_time': raw.get('start_time') or datetime.now().isoformat(),
-        'end_time': raw.get('end_time', ''),
-        'metadata': raw.get('metadata') or {},
+        'end_time': raw.get('end_time') or '',
+        'metadata': _safe_dict('metadata'),
     }
     # 传统 Monkey 结果：通常只有 device_log 的 anr_cnt/crash_cnt，需放入 tests.monkey
     if test_type == TEST_TYPE_MONKEY:
@@ -351,7 +362,7 @@ class StabilityReportGenerator:
         live_state.setdefault('modules_done', [])
         live_state.setdefault('test_params', {})
         html_content = self._build_unified_report_html(live_state)
-        with open(output_path, 'w', encoding='utf-8') as f:
+        with open(output_path, 'w', encoding='utf-8', errors='replace') as f:
             f.write(html_content)
         # 同时输出轻量级 JSON，供报告查看器解析 project_key / device_sn / package_name
         json_path = os.path.splitext(output_path)[0] + ".json"
@@ -371,7 +382,7 @@ class StabilityReportGenerator:
             "device_info": device_info,
             "package_info": package_info,
         }
-        with open(json_path, 'w', encoding='utf-8') as f:
+        with open(json_path, 'w', encoding='utf-8', errors='replace') as f:
             json.dump(meta, f, indent=2, ensure_ascii=False)
         logging.info(f"初始实时报告已创建: {output_path}")
         return output_path
@@ -399,7 +410,7 @@ class StabilityReportGenerator:
         live_state['crashes_so_far'] = sum(tests.get(m, {}).get('crashes', 0) for m in modules_for_crash_anr)
         live_state['anrs_so_far'] = sum(tests.get(m, {}).get('anrs', 0) for m in modules_for_crash_anr)
         html_content = self._build_unified_report_html(live_state)
-        with open(output_path, 'w', encoding='utf-8') as f:
+        with open(output_path, 'w', encoding='utf-8', errors='replace') as f:
             f.write(html_content)
         # 同步更新轻量级 JSON，供报告查看器解析
         json_path = os.path.splitext(output_path)[0] + ".json"
@@ -422,7 +433,7 @@ class StabilityReportGenerator:
                 "package_info": package_info,
             }
             try:
-                with open(json_path, 'w', encoding='utf-8') as f:
+                with open(json_path, 'w', encoding='utf-8', errors='replace') as f:
                     json.dump(meta, f, indent=2, ensure_ascii=False)
             except Exception:
                 pass
@@ -578,6 +589,7 @@ class StabilityReportGenerator:
             return '<p class="log-links">日志目录不可用</p>'
         # 文件名 -> 锚文本（每个文件独立锚文本以便区分）
         log_candidates = [
+            ("exceptions_extracted.log", "异常日志（Crash/ANR/ERROR）"),
             ("app.log", "应用日志"),
             ("device_exceptions.log", "设备异常摘要（/data/anr & /data/tombstones）"),
             ("extended_monkey.log", "Monkey日志"),
@@ -671,14 +683,16 @@ class StabilityReportGenerator:
         """
         若存在异常日志，读取最后 N 条并在报告中展示。
 
-        优先使用 app.log（新的应用日志文件），否则回退到旧版 exceptions.log。
+        优先使用 exceptions_extracted.log（三模式统一提取的 Crash/ANR/ERROR），
+        其次 app.log（PID 实时应用日志），最后回退到旧版 exceptions.log。
         """
         if not run_log_dir or not os.path.isdir(run_log_dir):
             return ""
-        # 优先 app.log
-        exc_path = os.path.join(run_log_dir, "app.log")
+        # 优先 exceptions_extracted.log（与 adb logcat -s <pkg>:V AndroidRuntime:E 规则一致）
+        exc_path = os.path.join(run_log_dir, "exceptions_extracted.log")
         if not os.path.isfile(exc_path):
-            # 回退：兼容旧版 exceptions.log
+            exc_path = os.path.join(run_log_dir, "app.log")
+        if not os.path.isfile(exc_path):
             legacy = os.path.join(run_log_dir, "exceptions.log")
             if not os.path.isfile(legacy):
                 return ""
@@ -689,7 +703,21 @@ class StabilityReportGenerator:
             if not lines:
                 return ""
             tail = lines[-max_lines:] if len(lines) > max_lines else lines
-            content = "".join(tail).strip()
+            # 过滤掉 GC 噪声行（例如 “Explicit concurrent copying GC freed ...”），仅保留真正的异常相关日志
+            gc_keywords = [
+                "Explicit concurrent copying GC freed",
+                "Background concurrent copying GC freed",
+                "Background young concurrent copying GC freed",
+                "Concurrent mark sweep GC freed",
+                "Concurrent mark compact",
+            ]
+            def _is_gc_noise(line: str) -> bool:
+                lower = line.lower()
+                return any(kw.lower() in lower for kw in gc_keywords)
+            filtered = [ln for ln in tail if not _is_gc_noise(ln)]
+            if not filtered:
+                return ""
+            content = "".join(filtered).strip()
             if not content:
                 return ""
             escaped = self._escape_html(content).replace("\n", "<br>")
@@ -1109,7 +1137,8 @@ class StabilityReportGenerator:
                 logging.debug(f"构建结果区块失败: {e}")
                 result_sections = "<p>结果区块渲染异常</p>"
 
-        footer_text = "测试已结束，以下为完整结果。" if report_stopped else "本报告在测试过程中每分钟自动更新。"
+        # 测试结束后，完整结果已在本页上方给出，这里使用“以上”为用户指引方向
+        footer_text = "测试已结束，以上为完整结果。" if report_stopped else "本报告在测试过程中每分钟自动更新。"
         if has_snapshot and not report_stopped:
             footer_text = "本报告在测试过程中每分钟自动更新，下方为当前已完成的模块结果。"
 
@@ -1239,7 +1268,7 @@ class StabilityReportGenerator:
             'analysis': self._generate_analysis(test_results) if not is_intermediate else {}
         }
 
-        with open(json_path, 'w', encoding='utf-8') as f:
+        with open(json_path, 'w', encoding='utf-8', errors='replace') as f:
             json.dump(report_data, f, indent=2, ensure_ascii=False)
 
         logging.info(f"JSON报告已生成: {json_path}")
@@ -1251,7 +1280,7 @@ class StabilityReportGenerator:
 
         html_content = self._build_html_content(test_results, is_intermediate)
 
-        with open(html_path, 'w', encoding='utf-8') as f:
+        with open(html_path, 'w', encoding='utf-8', errors='replace') as f:
             f.write(html_content)
 
         logging.info(f"HTML报告已生成: {html_path}")
@@ -1515,6 +1544,32 @@ class StabilityReportGenerator:
 
         tests = test_results.get('tests', {})
 
+        def _has_samples(metric: Any) -> bool:
+            """性能指标是否有有效样本（避免未测试/空数据被当成 0 触发告警）。"""
+            if not isinstance(metric, dict):
+                return False
+            ms = metric.get("measurements")
+            if isinstance(ms, list):
+                # 过滤 None/空
+                vals = [m for m in ms if m is not None]
+                return len(vals) > 0
+            # 兼容不同字段命名
+            for k in ("total_runs", "count", "samples", "sample_count"):
+                try:
+                    v = metric.get(k)
+                    if v is not None and int(v) > 0:
+                        return True
+                except Exception:
+                    continue
+            # 若提供了平均值但为 0，仍视为无样本（0 常见于未测/缺省）
+            return False
+
+        def _pos_float(v: Any) -> float:
+            try:
+                return float(v)
+            except Exception:
+                return 0.0
+
         # 检查 Monkey 模式压力测试问题
         if 'monkey_stress' in tests:
             robust = tests['monkey_stress']
@@ -1560,19 +1615,23 @@ class StabilityReportGenerator:
             perf_tests = perf.get('tests', {})
 
             cold_start = perf_tests.get('cold_start_time', {})
-            if cold_start.get('pass_rate', 0) < 0.8:
-                avg_time = cold_start.get('average_time', 0)
-                issues.append(f"冷启动时间过长: {avg_time:.2f}秒")
+            if _has_samples(cold_start) and cold_start.get('pass_rate', 1.0) < 0.8:
+                avg_time = _pos_float(cold_start.get('average_time', 0))
+                if avg_time > 0:
+                    issues.append(f"冷启动时间过长: {avg_time:.2f}秒")
             response_delay = perf_tests.get('response_delay', {})
-            if response_delay.get('pass_rate', 0) < 0.8:
-                avg_delay = response_delay.get('average_delay', 0)
-                issues.append(f"响应延迟过长: {avg_delay:.2f}秒")
+            if _has_samples(response_delay) and response_delay.get('pass_rate', 1.0) < 0.8:
+                avg_delay = _pos_float(response_delay.get('average_delay', 0))
+                if avg_delay > 0:
+                    issues.append(f"响应延迟过长: {avg_delay:.2f}秒")
             resource = perf_tests.get('resource_usage') or (tests.get('resource_consumption', {}) or {}).get('resource_usage', {}) or {}
             if resource.get('memory_pss', {}).get('memory_leak_detected', False):
                 issues.append("检测到内存泄漏")
-            if resource.get('cpu_foreground', {}).get('pass_rate', 0) < 0.9:
-                cpu_fg = resource.get('cpu_foreground', {}).get('average', 0)
-                issues.append(f"前台CPU使用率过高: {cpu_fg:.1f}%")
+            cpu_fg_metric = (resource.get('cpu_foreground') or {}) if isinstance(resource, dict) else {}
+            if _has_samples(cpu_fg_metric) and cpu_fg_metric.get('pass_rate', 1.0) < 0.9:
+                cpu_fg = _pos_float(cpu_fg_metric.get('average', 0))
+                if cpu_fg > 0:
+                    issues.append(f"前台CPU使用率过高: {cpu_fg:.1f}%")
         return issues
 
     def _generate_analysis(self, test_results: Dict[str, Any]) -> Dict[str, Any]:
@@ -1597,14 +1656,22 @@ class StabilityReportGenerator:
         perf_tests = test_results.get('tests', {}).get('performance', {}).get('tests', {})
 
         cold_start = perf_tests.get('cold_start_time', {})
-        if cold_start.get('average_time', 0) > 3.0:
+        try:
+            cold_avg = float(cold_start.get('average_time', 0) or 0)
+        except Exception:
+            cold_avg = 0.0
+        if cold_avg > 3.0:
             recommendations.append("优化应用冷启动性能：")
             recommendations.append("• 减少启动时的初始化工作")
             recommendations.append("• 实现懒加载机制")
             recommendations.append("• 优化资源加载顺序")
 
         response_delay = perf_tests.get('response_delay', {})
-        if response_delay.get('average_delay', 0) > 1.5:
+        try:
+            resp_avg = float(response_delay.get('average_delay', 0) or 0)
+        except Exception:
+            resp_avg = 0.0
+        if resp_avg > 1.5:
             recommendations.append("优化网络响应性能：")
             recommendations.append("• 实现数据缓存机制")
             recommendations.append("• 优化API请求")
@@ -1612,7 +1679,11 @@ class StabilityReportGenerator:
 
         resource_usage = perf_tests.get('resource_usage') or (test_results.get('tests', {}).get('resource_consumption', {}) or {}).get('resource_usage', {}) or {}
         cpu_fg = resource_usage.get('cpu_foreground', {})
-        if cpu_fg.get('average', 0) > 30:
+        try:
+            cpu_avg = float((cpu_fg or {}).get('average', 0) or 0)
+        except Exception:
+            cpu_avg = 0.0
+        if cpu_avg > 30:
             recommendations.append("优化CPU使用率：")
             recommendations.append("• 识别并优化耗CPU的操作")
             recommendations.append("• 实现后台任务管理")
@@ -2231,20 +2302,25 @@ class StabilityReportGenerator:
                     events = int(events or 0)
                     c_in_phase = p.get('crashes_in_phase', 0)
                     a_in_phase = p.get('anrs_in_phase', 0)
-                    # 阶段耗时
-                    try:
-                        if isinstance(st, str) and isinstance(et, str):
-                            st_dt = _dt.fromisoformat(st.replace("Z", "+00:00"))
-                            et_dt = _dt.fromisoformat(et.replace("Z", "+00:00"))
-                            if st_dt.tzinfo:
-                                st_dt = st_dt.replace(tzinfo=None)
-                            if et_dt.tzinfo:
-                                et_dt = et_dt.replace(tzinfo=None)
-                            dur_sec = max(0, int((et_dt - st_dt).total_seconds()))
-                        else:
-                            dur_sec = 0
-                    except Exception:
-                        dur_sec = 0
+                    # 阶段耗时：优先使用数据源提供的 actual_duration_seconds，否则由开始/结束时间计算
+                    dur_sec = 0
+                    if p.get('actual_duration_seconds') is not None:
+                        try:
+                            dur_sec = max(0, int(round(float(p.get('actual_duration_seconds')))))
+                        except (TypeError, ValueError):
+                            pass
+                    if dur_sec == 0 and st and et:
+                        try:
+                            if isinstance(st, str) and isinstance(et, str):
+                                st_dt = _dt.fromisoformat(st.replace("Z", "+00:00"))
+                                et_dt = _dt.fromisoformat(et.replace("Z", "+00:00"))
+                                if st_dt.tzinfo:
+                                    st_dt = st_dt.replace(tzinfo=None)
+                                if et_dt.tzinfo:
+                                    et_dt = et_dt.replace(tzinfo=None)
+                                dur_sec = max(0, int((et_dt - st_dt).total_seconds()))
+                        except Exception:
+                            pass
                     # 工具异常 / fallback 标记
                     bug_flag = ""
                     if p.get("monkey_tool_bug"):
@@ -2388,7 +2464,7 @@ class StabilityReportGenerator:
             cpu_fg, cpu_bg = [], []
             mem_fg, mem_bg = [], []
             device_cpu_list, device_mem_list = [], []
-            with open(jsonl_path, 'r', encoding='utf-8') as f:
+            with open(jsonl_path, 'r', encoding='utf-8', errors='replace') as f:
                 for line in f:
                     line = line.strip()
                     if not line:

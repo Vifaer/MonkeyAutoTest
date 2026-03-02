@@ -110,12 +110,19 @@ def load_stability_config(config_path: str | Path | None = None) -> Dict[str, An
         gui_cfg_path = os.path.join("conf", "test_ui_config.json")
         gui_cfg = read_json(gui_cfg_path, default={})
         if isinstance(gui_cfg, dict):
-            # 合并 mock_server
+            # 合并 mock_server，并归一化端口类型（GUI 通常以字符串形式保存）
             ms = gui_cfg.get("mock_server")
             if isinstance(ms, dict):
                 if "mock_server" not in config:
                     config["mock_server"] = {}
                 config["mock_server"].update(ms)
+                try:
+                    port_val = config["mock_server"].get("port", 8080)
+                    if port_val not in (None, ""):
+                        config["mock_server"]["port"] = int(port_val)
+                except Exception as e:
+                    logging.warning("从 test_ui_config.json 解析 mock_server.port 失败（%r），回退 8080: %s", port_val, e)
+                    config["mock_server"]["port"] = 8080
             
             # 合并 monkey_mask 到 long_stress
             mm = gui_cfg.get("monkey_mask")

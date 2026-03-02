@@ -151,11 +151,19 @@ def test_config(pytestconfig):
             except Exception:
                 logging.warning(f"从 GUI 配置解析测试时长失败: duration={raw_duration}, unit={unit_txt}")
 
-    # 3) 合并 GUI 配置中的 mock_server 设置
+    # 3) 合并 GUI 配置中的 mock_server 设置（并归一化端口类型）
     if isinstance(gui_config, dict) and 'mock_server' in gui_config:
         mock_server_cfg = gui_config['mock_server']
         if isinstance(mock_server_cfg, dict):
             default_config['mock_server'].update(mock_server_cfg)
+            # 端口在 GUI 配置中通常以字符串形式保存，这里统一转换为 int，防止 HTTPServer 绑定失败
+            try:
+                port_val = default_config['mock_server'].get('port', 8080)
+                if port_val not in (None, ""):
+                    default_config['mock_server']['port'] = int(port_val)
+            except Exception as e:
+                logging.warning(f"从 GUI 配置解析 mock_server.port 失败（{port_val!r}），回退使用 8080: {e}")
+                default_config['mock_server']['port'] = 8080
 
     # 4) 合并 GUI 配置中的性能监控设置
     if isinstance(gui_config, dict) and 'performance_monitor' in gui_config:
@@ -400,14 +408,20 @@ def mock_server(test_config):
     """Mock Server fixture（会话级别）"""
     if not test_config.get('mock_server', {}).get('enabled', False):
         pytest.skip("Mock Server 未启用")
-    
+
     from utils import mock_server as mock_server_mod
+    host = test_config['mock_server'].get('host', '127.0.0.1')
+    port_cfg = test_config['mock_server'].get('port', 8080)
+    try:
+        port = int(port_cfg)
+    except Exception as e:
+        logging.warning(f"mock_server.port 配置无效（{port_cfg!r}），回退使用 8080: {e}")
+        port = 8080
     server = mock_server_mod.MockServer(
-        host=test_config['mock_server'].get('host', '127.0.0.1'),
-        port=test_config['mock_server'].get('port', 8080),
-        rules_path=test_config['mock_server'].get('rules_path', 'conf/mock_rules.json')
+        host=host,
+        port=port,
     )
-    
+
     # 启动服务器
     server.start()
     yield server

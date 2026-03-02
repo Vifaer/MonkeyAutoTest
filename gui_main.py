@@ -852,6 +852,10 @@ class MonkeyTestGUI:
         self.start_stability_btn = ttk.Button(button_frame, text="开始稳定性测试", command=self.start_stability_test)
         self.start_stability_btn.pack(side=tk.LEFT, padx=5)
 
+        self.pause_stability_btn = ttk.Button(button_frame, text="⏸ 暂停", command=self.pause_test, state=["disabled"])
+        self.pause_stability_btn.pack(side=tk.LEFT, padx=5)
+        self.resume_stability_btn = ttk.Button(button_frame, text="▶ 继续", command=self.resume_test, state=["disabled"])
+        self.resume_stability_btn.pack(side=tk.LEFT, padx=5)
         self.stop_stability_btn = ttk.Button(button_frame, text="⏹️ 停止测试", command=self.stop_test, state=["disabled"])
         self.stop_stability_btn.pack(side=tk.LEFT, padx=5)
 
@@ -1184,6 +1188,22 @@ class MonkeyTestGUI:
             padx=(0, 10)
         )
 
+        self.pause_test_btn = self.create_action_button(
+            btn_row, text="⏸ 暂停",
+            command=self.pause_test,
+            variant="secondary",
+            side=tk.LEFT,
+            padx=(0, 5)
+        )
+        self.pause_test_btn.config(state="disabled")
+        self.resume_test_btn = self.create_action_button(
+            btn_row, text="▶ 继续",
+            command=self.resume_test,
+            variant="secondary",
+            side=tk.LEFT,
+            padx=(0, 10)
+        )
+        self.resume_test_btn.config(state="disabled")
         self.stop_test_btn = self.create_action_button(
             btn_row, text="⏹️ 停止测试",
             command=self.stop_test,
@@ -2975,7 +2995,7 @@ class MonkeyTestGUI:
             if not os.path.exists(json_path):
                 return {}
             try:
-                with open(json_path, "r", encoding="utf-8") as f:
+                with open(json_path, "r", encoding="utf-8", errors="replace") as f:
                     data = json.load(f)
                 meta = {}
                 detailed = data.get("detailed_results") if isinstance(data.get("detailed_results"), dict) else {}
@@ -3589,7 +3609,7 @@ class MonkeyTestGUI:
             config_path = self._get_test_ui_config_path()
             if os.path.exists(config_path):
                 try:
-                    with open(config_path, 'r', encoding='utf-8') as f:
+                    with open(config_path, 'r', encoding='utf-8', errors='replace') as f:
                         config = json.load(f)
                         saved_combos = config.get('saved_module_combos', {})
                         for combo_name, combo_config in saved_combos.items():
@@ -3631,7 +3651,7 @@ class MonkeyTestGUI:
             config = {}
             if os.path.exists(config_path):
                 try:
-                    with open(config_path, 'r', encoding='utf-8') as f:
+                    with open(config_path, 'r', encoding='utf-8', errors='replace') as f:
                         config = json.load(f)
                 except Exception:
                     pass
@@ -3644,7 +3664,7 @@ class MonkeyTestGUI:
                 'created_at': datetime.now().isoformat()
             }
             
-            with open(config_path, 'w', encoding='utf-8') as f:
+            with open(config_path, 'w', encoding='utf-8', errors='replace') as f:
                 json.dump(config, f, indent=2, ensure_ascii=False)
             
             # 更新下拉框选项
@@ -3661,7 +3681,7 @@ class MonkeyTestGUI:
         try:
             config_path = self._get_test_ui_config_path()
             if os.path.exists(config_path):
-                with open(config_path, 'r', encoding='utf-8') as f:
+                with open(config_path, 'r', encoding='utf-8', errors='replace') as f:
                     config = json.load(f)
                     saved_combos = config.get('saved_module_combos', {})
                     return saved_combos.get(combo_name)
@@ -3692,7 +3712,7 @@ class MonkeyTestGUI:
             config_path = self._get_test_ui_config_path()
             if os.path.exists(config_path):
                 try:
-                    with open(config_path, 'r', encoding='utf-8') as f:
+                    with open(config_path, 'r', encoding='utf-8', errors='replace') as f:
                         config = json.load(f)
                         saved_combos = list(config.get('saved_module_combos', {}).keys())
                 except Exception:
@@ -4655,12 +4675,15 @@ class MonkeyTestGUI:
                                                'performance', 'broadcast_stress', 'tts_stress'):
                         info['test_type'] = info['project_key']
             
-            # 尝试从JSON文件中读取更多信息
+            # 尝试从JSON文件中读取更多信息（过大则跳过，避免阻塞）
             json_path = os.path.join("reports", filename.replace('.html', '.json'))
             if os.path.exists(json_path):
                 try:
-                    with open(json_path, 'r', encoding='utf-8', errors='replace') as f:
-                        json_data = json.load(f)
+                    if os.path.getsize(json_path) > 2 * 1024 * 1024:
+                        pass
+                    else:
+                        with open(json_path, 'r', encoding='utf-8', errors='replace') as f:
+                            json_data = json.load(f)
                         metadata = json_data.get('metadata', {})
                         if 'generated_at' in metadata:
                             info['file_time'] = metadata['generated_at']
@@ -4784,7 +4807,7 @@ class MonkeyTestGUI:
 
         def _open_json() -> None:
             try:
-                with open(report_path, "r", encoding="utf-8") as f:
+                with open(report_path, "r", encoding="utf-8", errors="replace") as f:
                     content = json.dumps(json.load(f), indent=2, ensure_ascii=False)
                 self.root.after(0, lambda c=content: self._show_json_report_window(report_file, c))
                 self.root.after(0, lambda: self.update_status("已打开JSON报告: %s" % report_file))
@@ -4963,11 +4986,25 @@ class MonkeyTestGUI:
         if not self.no_mock_server_var.get():
             self.ensure_mock_server_running()
 
+        # 清除暂停状态，确保新测试从运行态开始
+        try:
+            from utils.run_control import set_paused
+            set_paused(False)
+        except Exception:
+            pass
+
         # 更新UI状态
         if self.start_test_btn:
             self.start_test_btn.config(state="disabled", bg=UIColors.TEXT_SECONDARY)
-        if self.stop_test_btn:
-            self.stop_test_btn.config(state="normal")
+        for btn in (getattr(self, "stop_test_btn", None), getattr(self, "stop_stability_btn", None)):
+            if btn:
+                btn.config(state="normal")
+        for btn in (getattr(self, "pause_test_btn", None), getattr(self, "pause_stability_btn", None)):
+            if btn:
+                btn.config(state="normal")
+        for btn in (getattr(self, "resume_test_btn", None), getattr(self, "resume_stability_btn", None)):
+            if btn:
+                btn.config(state="disabled")
         if self.progress_bar:
             self.progress_bar.start()
 
@@ -5046,13 +5083,55 @@ class MonkeyTestGUI:
             # 清理UI状态
             self.root.after(0, self.reset_stability_ui)
 
+    def pause_test(self):
+        """暂停测试（子进程将进入等待，超时 30 分钟自动终止）"""
+        try:
+            from utils.run_control import set_paused
+            set_paused(True)
+            self.update_status("已暂停测试，点击「继续」恢复；暂停超过 30 分钟将自动终止")
+            for btn in (getattr(self, "pause_test_btn", None), getattr(self, "pause_stability_btn", None)):
+                if btn:
+                    btn.config(state="disabled")
+            for btn in (getattr(self, "resume_test_btn", None), getattr(self, "resume_stability_btn", None)):
+                if btn:
+                    btn.config(state="normal")
+        except Exception as e:
+            self.update_status(f"暂停失败: {e}")
+
+    def resume_test(self):
+        """继续测试"""
+        try:
+            from utils.run_control import set_paused
+            set_paused(False)
+            self.update_status("已继续测试")
+            for btn in (getattr(self, "pause_test_btn", None), getattr(self, "pause_stability_btn", None)):
+                if btn:
+                    btn.config(state="normal")
+            for btn in (getattr(self, "resume_test_btn", None), getattr(self, "resume_stability_btn", None)):
+                if btn:
+                    btn.config(state="disabled")
+        except Exception as e:
+            self.update_status(f"继续失败: {e}")
+
     def stop_test(self):
         """停止测试"""
         if self.is_testing:
             self.is_testing = False
             self.update_status("正在停止测试（尝试终止子进程）...")
-            if self.stop_test_btn:
-                self.stop_test_btn.config(state="disabled")
+            for btn in (getattr(self, "stop_test_btn", None), getattr(self, "stop_stability_btn", None)):
+                if btn:
+                    btn.config(state="disabled")
+            for btn in (getattr(self, "pause_test_btn", None), getattr(self, "pause_stability_btn", None)):
+                if btn:
+                    btn.config(state="disabled")
+            for btn in (getattr(self, "resume_test_btn", None), getattr(self, "resume_stability_btn", None)):
+                if btn:
+                    btn.config(state="disabled")
+            try:
+                from utils.run_control import set_paused
+                set_paused(False)
+            except Exception:
+                pass
             self._terminate_running_test_process()
             # 同步更新实时报告状态为“已停止”
             try:
@@ -5187,7 +5266,7 @@ class MonkeyTestGUI:
             if marker in html:
                 html = html.replace(marker, insert_block + marker, 1)
         try:
-            with open(path, "w", encoding="utf-8") as f:
+            with open(path, "w", encoding="utf-8", errors="replace") as f:
                 f.write(html)
         except Exception:
             return
@@ -5195,11 +5274,11 @@ class MonkeyTestGUI:
         json_path = os.path.splitext(path)[0] + ".json"
         if os.path.exists(json_path):
             try:
-                with open(json_path, "r", encoding="utf-8") as f:
+                with open(json_path, "r", encoding="utf-8", errors="replace") as f:
                     data = json.load(f)
                 data.setdefault("metadata", {})["report_status"] = "stopped"
                 data.setdefault("metadata", {})["stopped_at"] = stop_time
-                with open(json_path, "w", encoding="utf-8") as f:
+                with open(json_path, "w", encoding="utf-8", errors="replace") as f:
                     json.dump(data, f, indent=2, ensure_ascii=False)
             except Exception:
                 pass
@@ -5237,6 +5316,7 @@ class MonkeyTestGUI:
         """
         # 确保只存在一个测试进程
         self._terminate_running_test_process()
+        self._last_test_exit_code = None
 
         self.log_queue.put(f"{title}启动: {' '.join([str(x) for x in cmd])}")
         try:
@@ -5311,17 +5391,35 @@ class MonkeyTestGUI:
                     exit_code = p.poll() or -1
                 except Exception:
                     exit_code = -1
-            return int(exit_code if exit_code is not None else -1)
+            self._last_test_exit_code = int(exit_code if exit_code is not None else -1)
+            return self._last_test_exit_code
         finally:
             with self._test_process_lock:
                 self.test_process = None
+            if getattr(self, "_last_test_exit_code", None) is not None:
+                try:
+                    self.log_queue.put("测试进程已退出，退出码: %s" % self._last_test_exit_code)
+                except Exception:
+                    pass
 
     def reset_stability_ui(self):
         """重置稳定性测试UI状态"""
         if self.start_test_btn:
             self.start_test_btn.config(state="normal", bg=UIColors.PRIMARY)
-        if self.stop_test_btn:
-            self.stop_test_btn.config(state="disabled")
+        for btn in (getattr(self, "stop_test_btn", None), getattr(self, "stop_stability_btn", None)):
+            if btn:
+                btn.config(state="disabled")
+        for btn in (getattr(self, "pause_test_btn", None), getattr(self, "pause_stability_btn", None)):
+            if btn:
+                btn.config(state="disabled")
+        for btn in (getattr(self, "resume_test_btn", None), getattr(self, "resume_stability_btn", None)):
+            if btn:
+                btn.config(state="disabled")
+        try:
+            from utils.run_control import set_paused
+            set_paused(False)
+        except Exception:
+            pass
         if self.progress_bar:
             self.progress_bar.stop()
         if self.progress_info_label:
@@ -5346,7 +5444,7 @@ class MonkeyTestGUI:
         )
         if filename:
             try:
-                with open(filename, 'w', encoding='utf-8') as f:
+                with open(filename, 'w', encoding='utf-8', errors='replace') as f:
                     f.write(self.log_text.get(1.0, tk.END))
                 self.update_status(f"日志已保存到: {filename}")
             except Exception as e:

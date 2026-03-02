@@ -57,7 +57,7 @@ def setup_logging(level: int = logging.INFO, log_file: Optional[str] = None, enc
 class ProjectLog:
     def __init__(self):
         self.log_root = LOG_ROOT
-        self.log_path = "{}/{}".format(LOG_ROOT, "log.txt")
+        self.log_path = os.path.join(LOG_ROOT, "log.txt")
         self.history_root = HISTORY_ROOT
 
     def set_up(self):
@@ -72,18 +72,21 @@ class ProjectLog:
             os.makedirs(self.history_root)
         # 将本次结果目录复制到历史结果目录
         now = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-        dest_dir = "{}/{}".format(self.history_root, now)
+        dest_dir = os.path.join(self.history_root, now)
         shutil.copytree(self.log_root, dest_dir)
 
 
 class DeviceLog:
+    # 流式读取时单次处理的最大行数，避免超大 monkey.log 导致 OOM
+    CHECK_MAX_LINES = 2_000_000
+
     def __init__(self, sn):
         self.sn = sn
-        self.device_root = "{}/{}".format(LOG_ROOT, self.sn)
-        self.anr_dir = "{}/{}".format(self.device_root, "anr")
-        self.crash_dir = "{}/{}".format(self.device_root, "crash")
-        self.dump_dir = "{}/{}".format(self.device_root, "dumpsys")
-        self.log_path = "{}/{}".format(self.device_root, "monkey.log")
+        self.device_root = os.path.join(LOG_ROOT, self.sn)
+        self.anr_dir = os.path.join(self.device_root, "anr")
+        self.crash_dir = os.path.join(self.device_root, "crash")
+        self.dump_dir = os.path.join(self.device_root, "dumpsys")
+        self.log_path = os.path.join(self.device_root, "monkey.log")
 
     def init(self):
         # 不再删除整个设备日志目录，仅确保必要子目录存在，避免覆盖历史日志
@@ -128,50 +131,55 @@ class DeviceLog:
         return anr_store
 
     def check(self, package):
-        with open(self.log_path, "r", encoding='utf-8', errors='ignore') as fp:
-            # 判断文件行是否为anr或crash，如果是则做相关处理
-            is_anr = 0
-            is_crash = False
-            # anr和crash计数
-            anr_cnt = 0
-            crash_cnt = 0
-            # anr和crash信息
-            anr_info = []
-            crash_info = []
-            # 逐行读取日志信息
-            for line in fp:
-                # ANR处理
-                if line.startswith("// NOT RESPONDING: {} ".format(package.name)):
-                    if is_anr == 0:
-                        anr_cnt += 1
-                    is_anr += 1
-                if is_anr != 0:
-                    anr_info.append(line)
-                if is_anr != 0 and line.strip() == "// meminfo status was 0":
-                    is_anr -= 1
-                    if is_anr == 0:
-                        # 去掉多余的traces
-                        anr_info = self.__remove_excess_traces(anr_info)
-                        # 存成文件
-                        with open("{}/anr_{}_{}.txt".format(self.anr_dir, self.sn, anr_cnt), "w", encoding='utf-8') as anr_fp:
-                            for anr_line in anr_info:
-                                anr_fp.write(anr_line)
-                        # 清空
-                        anr_info = []
-                # CRASH处理
-                if line.startswith("// CRASH: {} ".format(package.name)) or line.startswith("// CRASH: {}:".format(package.name)):
-                    is_crash = True
-                    crash_cnt += 1
-                if is_crash:
-                    crash_info.append(line)
-                if is_crash and line.strip() == "//":
-                    # 存成文件
-                    with open("{}/crash_{}_{}.txt".format(self.crash_dir, self.sn, crash_cnt), "w", encoding='utf-8') as crash_fp:
-                        for crash_line in crash_info:
-                            crash_fp.write(crash_line)
-                    # 清空
-                    crash_info = []
-                    is_crash = False
+        if not os.path.isfile(self.log_path):
+            return
+        is_anr = 0
+        is_crash = False
+        anr_cnt = 0
+        crash_cnt = 0
+        anr_info = []
+        crash_info = []
+        lines_read = 0
+        max_lines = getattr(self, "CHECK_MAX_LINES", 2_000_000)
+        write_encoding = "utf-8"
+        write_errors = "replace"
+        try:
+            with open(self.log_path, "r", encoding="utf-8", errors="replace") as fp:
+                for line in fp:
+                    lines_read += 1
+                    if lines_read > max_lines:
+                        break
+                    # ANR处理
+                    if line.startswith("// NOT RESPONDING: {} ".format(package.name)):
+                        if is_anr == 0:
+                            anr_cnt += 1
+                        is_anr += 1
+                    if is_anr != 0:
+                        anr_info.append(line)
+                    if is_anr != 0 and line.strip() == "// meminfo status was 0":
+                        is_anr -= 1
+                        if is_anr == 0:
+                            anr_info = self.__remove_excess_traces(anr_info)
+                            anr_path = os.path.join(self.anr_dir, "anr_{}_{}.txt".format(self.sn, anr_cnt))
+                            with open(anr_path, "w", encoding=write_encoding, errors=write_errors) as anr_fp:
+                                for anr_line in anr_info:
+                                    anr_fp.write(anr_line)
+                            anr_info = []
+                    # CRASH处理
+                    if line.startswith("// CRASH: {} ".format(package.name)) or line.startswith("// CRASH: {}:".format(package.name)):
+                        is_crash = True
+                        crash_cnt += 1
+                    if is_crash:
+                        crash_info.append(line)
+                    if is_crash and line.strip() == "//":
+                        crash_path = os.path.join(self.crash_dir, "crash_{}_{}.txt".format(self.sn, crash_cnt))
+                        with open(crash_path, "w", encoding=write_encoding, errors=write_errors) as crash_fp:
+                            for crash_line in crash_info:
+                                crash_fp.write(crash_line)
+                        crash_info = []
+                        is_crash = False
+        except Exception as e:
+            logging.warning("DeviceLog.check 读取或处理日志失败 %s: %s", self.log_path, e)
 
     @staticmethod
     def __numerical_sort(value):
@@ -192,10 +200,10 @@ class DeviceLog:
         # 将anr、crash、dumpsys写入附件list
         att_list = []
         for fn in anr_fn_list:
-            att_list.append("{}/{}".format(self.anr_dir, fn))
+            att_list.append(os.path.join(self.anr_dir, fn))
         for fn in crash_fn_list:
-            att_list.append("{}/{}".format(self.crash_dir, fn))
+            att_list.append(os.path.join(self.crash_dir, fn))
         for fn in dumpsys_fn_list:
-            att_list.append("{}/{}".format(self.dump_dir, fn))
+            att_list.append(os.path.join(self.dump_dir, fn))
         # 返回anr_cnt、crash_cnt和att_list
         return anr_cnt, crash_cnt, att_list

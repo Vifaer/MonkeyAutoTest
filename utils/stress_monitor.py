@@ -25,7 +25,10 @@ TRIM_PERF_SAMPLES_TO = 10000
 
 
 class StressMonitor:
-    """压力测试监控器，提供前台检测、性能采样、logcat 采集与崩溃/ANR 分析"""
+    """
+    压力测试监控器，提供前台检测、性能采样、logcat 采集与崩溃/ANR 分析。
+    职责分组：前台与进程、性能采样、logcat/app.log、设备异常目录与 bugreport、logcat 解析与响应监控。
+    """
 
     def __init__(
         self,
@@ -53,6 +56,7 @@ class StressMonitor:
         # CPU 核数缓存（用于将单进程CPU占比归一化到整机核数）
         self._cpu_core_count = None
 
+    # -------------------- 前台与进程 --------------------
     def _get_package_name(self) -> str:
         return getattr(self.package, "name", None) or getattr(self.package, "package", None) or ""
 
@@ -116,6 +120,7 @@ class StressMonitor:
                 time.sleep(poll_interval)
         logging.info("[stress-monitor] 已尝试所有拉起方式，将继续执行")
 
+    # -------------------- 性能采样（CPU/内存、start_monitoring_thread）--------------------
     def _parse_top_output_for_cpu(
         self, top_output: str, pkg: str
     ) -> tuple[float, float]:
@@ -301,60 +306,80 @@ class StressMonitor:
         return 0.0
 
     def get_memory_usage(self) -> int:
-        """获取内存使用量 PSS（KB）"""
-        pkg = self._get_package_name()
-        if not pkg:
-            return 0
-        cmd = f"adb -s {self.device.sn} shell dumpsys meminfo {pkg}"
-        result = run_cmd(cmd, timeout=5)
-        if result and isinstance(result, str):
-            try:
+        """获取内存使用量 PSS（KB）。失败或超时返回 0，不抛异常。"""
+        try:
+            pkg = self._get_package_name()
+            if not pkg:
+                return 0
+            cmd = f"adb -s {self.device.sn} shell dumpsys meminfo {pkg}"
+            result = run_cmd(cmd, timeout=5)
+            if result and isinstance(result, str):
                 for line in result.splitlines():
                     if "TOTAL PSS:" in line:
                         after = line.split("TOTAL PSS:")[1].strip()
                         num_str = after.split()[0].replace(',', '')
                         return int(num_str)
-            except Exception:
-                pass
+        except Exception as e:
+            logging.debug("get_memory_usage failed: %s", e)
         return 0
 
     def _sample_performance_once(self) -> Dict[str, Any]:
         """
         执行一次性能采样，返回单条性能数据字典。
         单次 top 输出同时解析应用 CPU 与设备总 CPU，减少 adb 调用。
+        任一步骤失败时返回带默认值的字典，不抛异常，避免监控线程阻塞测试。
         """
-        is_fg = self.is_app_in_foreground()
-        mode = "foreground" if is_fg else "background"
-        pkg = self._get_package_name()
-        app_cpu_raw = 0.0
-        device_cpu_pct = 0.0
-        try:
-            cmd = f"adb -s {self.device.sn} shell top -n 1 -d 1"
-            top_out = run_cmd(cmd, timeout=5)
-            if top_out and isinstance(top_out, str):
-                app_cpu_raw, device_cpu_pct = self._parse_top_output_for_cpu(top_out, pkg)
-        except Exception:
-            pass
-        if app_cpu_raw == 0.0 and pkg:
-            app_cpu_raw = self.get_cpu_usage()
-        if device_cpu_pct == 0.0:
-            device_cpu_pct = self.get_device_cpu_total()
-        cores = self.get_cpu_core_count()
-        app_cpu_pct = round(app_cpu_raw / float(cores), 2) if cores > 0 else app_cpu_raw
-        mem_usage = self.get_memory_usage()
-        memory_mb = round(mem_usage / 1024.0, 2) if mem_usage > 0 else 0.0
-        device_memory_used_mb = self.get_device_memory_total_mb()
-        return {
-            "timestamp": datetime.now().isoformat(),
-            "app_cpu_pct": app_cpu_pct,
-            "app_memory_pss_kb": mem_usage,
-            "app_memory_pss_mb": memory_mb,
-            "app_foreground_mode": mode,
-            "device_cpu_pct": device_cpu_pct,
-            "device_memory_used_mb": device_memory_used_mb,
-            "device_sn": self.device.sn,
+        pkg = self._get_package_name() or ""
+        now_ts = datetime.now().isoformat()
+        safe_default = {
+            "timestamp": now_ts,
+            "app_cpu_pct": 0.0,
+            "app_memory_pss_kb": 0,
+            "app_memory_pss_mb": 0.0,
+            "app_foreground_mode": "background",
+            "device_cpu_pct": 0.0,
+            "device_memory_used_mb": 0.0,
+            "device_sn": getattr(self.device, "sn", ""),
             "package": pkg,
         }
+        try:
+            is_fg = self.is_app_in_foreground()
+            mode = "foreground" if is_fg else "background"
+            app_cpu_raw = 0.0
+            device_cpu_pct = 0.0
+            try:
+                cmd = f"adb -s {self.device.sn} shell top -n 1 -d 1"
+                top_out = run_cmd(cmd, timeout=5)
+                if top_out and isinstance(top_out, str):
+                    app_cpu_raw, device_cpu_pct = self._parse_top_output_for_cpu(top_out, pkg)
+            except Exception:
+                pass
+            if app_cpu_raw == 0.0 and pkg:
+                app_cpu_raw = self.get_cpu_usage()
+            if device_cpu_pct == 0.0:
+                device_cpu_pct = self.get_device_cpu_total()
+            cores = self.get_cpu_core_count()
+            app_cpu_pct = round(app_cpu_raw / float(cores), 2) if cores > 0 else app_cpu_raw
+            mem_usage = self.get_memory_usage()
+            memory_mb = round(mem_usage / 1024.0, 2) if mem_usage > 0 else 0.0
+            try:
+                device_memory_used_mb = self.get_device_memory_total_mb()
+            except Exception:
+                device_memory_used_mb = 0.0
+            return {
+                "timestamp": now_ts,
+                "app_cpu_pct": app_cpu_pct,
+                "app_memory_pss_kb": mem_usage,
+                "app_memory_pss_mb": memory_mb,
+                "app_foreground_mode": mode,
+                "device_cpu_pct": device_cpu_pct,
+                "device_memory_used_mb": device_memory_used_mb,
+                "device_sn": self.device.sn,
+                "package": pkg,
+            }
+        except Exception as e:
+            logging.warning("性能采样单次失败，使用默认值: %s", e)
+            return safe_default
 
     def start_monitoring_thread(
         self,
@@ -398,6 +423,7 @@ class StressMonitor:
         t.start()
         return t
 
+    # -------------------- logcat 全量抓取与 app.log（PID 过滤）--------------------
     def start_logcat_capture(self, logcat_log_path):
         """
         启动 logcat 抓取线程（全量）。

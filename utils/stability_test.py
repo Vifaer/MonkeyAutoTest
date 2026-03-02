@@ -10,6 +10,7 @@ import threading
 from datetime import datetime, timedelta
 from utils import Device, Package, DeviceLog
 from utils.timeout_command import run as run_cmd
+from utils.run_control import is_paused, wait_while_paused_or_timeout, set_paused, PAUSE_TIMEOUT_SECONDS
 from enum import Enum
 
 
@@ -167,78 +168,98 @@ class ModularStabilityTest:
         logging.info(f"实时报告已启动，每 {LIVE_REPORT_UPDATE_INTERVAL} 秒更新: {self._live_report_path}")
 
         # 根据启用的模块运行相应测试；单模块失败时记录 error 并继续后续模块
-        if TestModule.MONKEY_STRESS in self.enabled_modules:
-            self._live_state['current_phase'] = 'monkey_stress'
-            try:
-                self._run_monkey_stress_test()
-            except Exception as e:
-                logging.exception("Monkey 模式压力测试模块异常")
-                self.test_results.setdefault('tests', {})['monkey_stress'] = {'error': str(e)}
-            self._live_state['modules_done'].append('monkey_stress')
-            rb = self.test_results.get('tests', {}).get('monkey_stress', {})
-            self._live_state['run_log_dir'] = rb.get('run_log_dir', '') or self._live_state.get('run_log_dir', '')
+        # 使用 try/finally 确保异常或超时退出时仍停止实时报告并写入一次终态（便于报告可读）
+        try:
+            def _check_pause_before_module():
+                """模块开始前检查暂停，若处于暂停则等待（超时 30 分钟则终止）"""
+                if is_paused():
+                    if not wait_while_paused_or_timeout(
+                        on_timeout=lambda: None,
+                        stop_event=None,
+                        timeout_seconds=PAUSE_TIMEOUT_SECONDS,
+                    ):
+                        raise RuntimeError("暂停超过 30 分钟，测试已自动终止")
+            if TestModule.MONKEY_STRESS in self.enabled_modules:
+                _check_pause_before_module()
+                self._live_state['current_phase'] = 'monkey_stress'
+                try:
+                    self._run_monkey_stress_test()
+                except Exception as e:
+                    logging.exception("Monkey 模式压力测试模块异常")
+                    self.test_results.setdefault('tests', {})['monkey_stress'] = {'error': str(e)}
+                self._live_state['modules_done'].append('monkey_stress')
+                rb = self.test_results.get('tests', {}).get('monkey_stress', {})
+                self._live_state['run_log_dir'] = rb.get('run_log_dir', '') or self._live_state.get('run_log_dir', '')
 
-        if TestModule.EXCEPTION_RECOVERY in self.enabled_modules:
-            self._live_state['current_phase'] = 'exception_recovery'
-            try:
-                self._run_exception_recovery_test()
-            except Exception as e:
-                logging.exception("异常恢复测试模块异常")
-                self.test_results.setdefault('tests', {})['exception_recovery'] = {'error': str(e)}
-            self._live_state['modules_done'].append('exception_recovery')
+            if TestModule.EXCEPTION_RECOVERY in self.enabled_modules:
+                _check_pause_before_module()
+                self._live_state['current_phase'] = 'exception_recovery'
+                try:
+                    self._run_exception_recovery_test()
+                except Exception as e:
+                    logging.exception("异常恢复测试模块异常")
+                    self.test_results.setdefault('tests', {})['exception_recovery'] = {'error': str(e)}
+                self._live_state['modules_done'].append('exception_recovery')
 
-        if TestModule.PERFORMANCE_ALL in self.enabled_modules:
-            self._live_state['current_phase'] = 'performance'
-            try:
-                self._run_performance_test()
-            except Exception as e:
-                logging.exception("完整性能测试模块异常")
-                self.test_results.setdefault('tests', {})['performance'] = {'error': str(e)}
-            self._live_state['modules_done'].append('performance')
-        else:
-            if TestModule.PERFORMANCE_RESPONSE in self.enabled_modules:
+            if TestModule.PERFORMANCE_ALL in self.enabled_modules:
+                _check_pause_before_module()
                 self._live_state['current_phase'] = 'performance'
                 try:
-                    self._run_response_performance_test()
+                    self._run_performance_test()
                 except Exception as e:
-                    logging.exception("响应性能测试模块异常")
-                    self.test_results.setdefault('tests', {})['performance_response'] = {'error': str(e)}
-                self._live_state['modules_done'].append('performance_response')
+                    logging.exception("完整性能测试模块异常")
+                    self.test_results.setdefault('tests', {})['performance'] = {'error': str(e)}
+                self._live_state['modules_done'].append('performance')
+            else:
+                if TestModule.PERFORMANCE_RESPONSE in self.enabled_modules:
+                    _check_pause_before_module()
+                    self._live_state['current_phase'] = 'performance'
+                    try:
+                        self._run_response_performance_test()
+                    except Exception as e:
+                        logging.exception("响应性能测试模块异常")
+                        self.test_results.setdefault('tests', {})['performance_response'] = {'error': str(e)}
+                    self._live_state['modules_done'].append('performance_response')
 
-            if TestModule.PERFORMANCE_RESOURCE in self.enabled_modules:
-                self._live_state['current_phase'] = 'performance'
+                if TestModule.PERFORMANCE_RESOURCE in self.enabled_modules:
+                    _check_pause_before_module()
+                    self._live_state['current_phase'] = 'performance'
+                    try:
+                        self._run_resource_consumption_test()
+                    except Exception as e:
+                        logging.exception("资源消耗测试模块异常")
+                        self.test_results.setdefault('tests', {})['performance_resource'] = {'error': str(e)}
+                    self._live_state['modules_done'].append('performance_resource')
+
+            if TestModule.BROADCAST_STRESS in self.enabled_modules:
+                _check_pause_before_module()
+                self._live_state['current_phase'] = 'broadcast_stress'
                 try:
-                    self._run_resource_consumption_test()
+                    self._run_broadcast_stress_test()
                 except Exception as e:
-                    logging.exception("资源消耗测试模块异常")
-                    self.test_results.setdefault('tests', {})['performance_resource'] = {'error': str(e)}
-                self._live_state['modules_done'].append('performance_resource')
+                    logging.exception("广播压力测试模块异常")
+                    self.test_results.setdefault('tests', {})['broadcast_stress'] = {'error': str(e)}
+                self._live_state['modules_done'].append('broadcast_stress')
+                bc = self.test_results.get('tests', {}).get('broadcast_stress', {})
+                self._live_state['run_log_dir'] = bc.get('run_log_dir', '') or self._live_state.get('run_log_dir', '')
 
-        if TestModule.BROADCAST_STRESS in self.enabled_modules:
-            self._live_state['current_phase'] = 'broadcast_stress'
-            try:
-                self._run_broadcast_stress_test()
-            except Exception as e:
-                logging.exception("广播压力测试模块异常")
-                self.test_results.setdefault('tests', {})['broadcast_stress'] = {'error': str(e)}
-            self._live_state['modules_done'].append('broadcast_stress')
-            bc = self.test_results.get('tests', {}).get('broadcast_stress', {})
-            self._live_state['run_log_dir'] = bc.get('run_log_dir', '') or self._live_state.get('run_log_dir', '')
+            if TestModule.TTS_STRESS in self.enabled_modules:
+                _check_pause_before_module()
+                self._live_state['current_phase'] = 'tts_stress'
+                try:
+                    self._run_tts_stress_test()
+                except Exception as e:
+                    logging.exception("TTS 压力测试模块异常")
+                    self.test_results.setdefault('tests', {})['tts_stress'] = {'error': str(e)}
+                self._live_state['modules_done'].append('tts_stress')
+                ts = self.test_results.get('tests', {}).get('tts_stress', {})
+                self._live_state['run_log_dir'] = ts.get('run_log_dir', '') or self._live_state.get('run_log_dir', '')
 
-        if TestModule.TTS_STRESS in self.enabled_modules:
-            self._live_state['current_phase'] = 'tts_stress'
-            try:
-                self._run_tts_stress_test()
-            except Exception as e:
-                logging.exception("TTS 压力测试模块异常")
-                self.test_results.setdefault('tests', {})['tts_stress'] = {'error': str(e)}
-            self._live_state['modules_done'].append('tts_stress')
-            ts = self.test_results.get('tests', {}).get('tts_stress', {})
-            self._live_state['run_log_dir'] = ts.get('run_log_dir', '') or self._live_state.get('run_log_dir', '')
-
-        # 添加结束时间后，停止实时报告更新并最后一次写入同一报告文件（完整结果 + 已停止）
-        self.test_results['end_time'] = datetime.now().isoformat()
-        self._stop_live_report_updates()
+        finally:
+            # 无论正常结束还是异常/超时，都写入结束时间并停止实时报告，保证报告可读
+            self.test_results['end_time'] = self.test_results.get('end_time') or datetime.now().isoformat()
+            self._stop_live_report_updates()
+            set_paused(False)  # 测试结束清除暂停状态，避免下次启动误判
 
         # 基线建立/对比（不再生成新报告文件，报告已由 update_live_report 写入同一文件）
         self._run_baseline_if_needed()
@@ -569,7 +590,8 @@ class ModularStabilityTest:
                         self._live_state['run_log_dir'] = r.get('run_log_dir', '')
                         break
 
-                # 实时刷新 exceptions.log：按当前阶段与 run_log_dir 重算窗口 [模块start_time, now]，
+                # 实时刷新异常提取文件：按当前阶段与 run_log_dir 重算窗口 [模块start_time, now]，
+                # 输出到 exceptions_extracted.log（规则等同 adb logcat -s <pkg>:V AndroidRuntime:E），
                 # 并追加框架侧 ANR 事件（response-monitor 判定的 Hint/TTS 无响应），方便统一排查。
                 run_log_dir = self._live_state.get('run_log_dir') or ''
                 current_phase = self._live_state.get('current_phase')
@@ -599,9 +621,9 @@ class ModularStabilityTest:
                             # 回退：按 12 小时窗口
                             start_dt = now_dt - timedelta(hours=float(mod.get('duration_hours', 12) or 12))
                         logcat_path = os.path.join(run_log_dir, logcat_name)
-                        exc_path = os.path.join(run_log_dir, "app.log")
+                        exc_path = os.path.join(run_log_dir, "exceptions_extracted.log")
                         if os.path.exists(logcat_path):
-                            # 1) 先基于 logcat 重算系统级 Crash/ANR/ERROR，输出到 app.log（应用日志）
+                            # 1) 先基于 logcat 重算系统级 Crash/ANR/ERROR，输出到 exceptions_extracted.log（三模式统一规则）
                             StressMonitor.extract_exceptions_to_file(
                                 logcat_path, exc_path, start_dt, now_dt, self.package.name
                             )
@@ -633,7 +655,7 @@ class ModularStabilityTest:
                                 # 追加失败不影响主流程
                                 pass
                     except Exception as exc:
-                        logging.debug(f"实时刷新 exceptions.log 失败: {exc}")
+                        logging.debug(f"实时刷新 exceptions_extracted.log 失败: {exc}")
 
                 if self.report_generator and self._live_report_path:
                     self.report_generator.update_live_report(self._live_state, self._live_report_path)

@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 
 from utils.timeout_command import run as run_cmd
 from utils.stress_monitor import StressMonitor
+from utils.run_control import is_paused, wait_while_paused_or_timeout, PAUSE_TIMEOUT_SECONDS
 
 
 class BroadcastStressTest:
@@ -277,6 +278,8 @@ class BroadcastStressTest:
         # 启动监控线程（每 2 秒采样 CPU/内存）
         monitor_thread = monitor.start_monitoring_thread(result, 2, perf_log_path)
         logcat_thread = monitor.start_logcat_capture(self.logcat_log_path)
+        # 基于 PID 的实时应用日志（与 Monkey 模式一致，规则等同 adb logcat -s <pkg>:V AndroidRuntime:E 的采集范围）
+        monitor.start_app_log_capture(os.path.join(self._run_log_dir, "app.log"))
         # 监控设备异常目录（/data/anr, /data/tombstones）
         try:
             monitor.start_exception_file_monitor(self._run_log_dir)
@@ -311,6 +314,15 @@ class BroadcastStressTest:
 
         try:
             while datetime.now() < end_time and not self._stop_event.is_set():
+                # 暂停/继续：若处于暂停则等待，超时 30 分钟则终止
+                if is_paused():
+                    if not wait_while_paused_or_timeout(
+                        on_timeout=lambda: self._stop_event.set(),
+                        stop_event=self._stop_event,
+                        timeout_seconds=PAUSE_TIMEOUT_SECONDS,
+                    ):
+                        result["terminated_due_to_pause_timeout"] = True
+                        break
                 hint = hints[hint_index % len(hints)]
                 hint_index += 1
                 hint_send_time = datetime.now()

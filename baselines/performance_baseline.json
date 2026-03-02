@@ -1,17 +1,11 @@
 {
   "metadata": {
     "version": "ver1",
-    "established_at": "2026-02-28T06:52:15.840857",
+    "established_at": "2026-02-28T15:04:33.228083",
     "baseline_manager_version": "1.0.0"
   },
   "performance_metrics": {},
-  "stability_metrics": {
-    "monkey_stress": {
-      "crashes": 0,
-      "anrs": 0,
-      "test_duration_hours": 12.0
-    }
-  },
+  "stability_metrics": {},
   "thresholds": {
     "cold_start_time_max": 3.0,
     "response_delay_max": 1.5,
