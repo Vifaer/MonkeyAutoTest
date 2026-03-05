@@ -525,19 +525,94 @@ class StressMonitor:
 
         注意：部分设备需要 root 才能访问/清理；失败仅记录 warning，不中断测试。
         """
+        sn = getattr(self.device, "sn", "")
+        if not sn:
+            return
+
+        def _has_err(s: str) -> bool:
+            return any(
+                k in s
+                for k in (
+                    "Permission denied",
+                    "Operation not permitted",
+                    "not permitted",
+                    "Read-only file system",
+                    "No such file or directory",
+                )
+            )
+
+        def _run_shell(cmd: str, timeout: int) -> Optional[str]:
+            out = run_cmd(f"adb -s {sn} shell {cmd}", timeout=timeout)
+            return out if isinstance(out, str) else None
+
+        def _run_su(cmd: str, timeout: int) -> Optional[str]:
+            # 先 su -c，再按需外层做 adb root
+            out = run_cmd(f'adb -s {sn} shell su -c "{cmd}"', timeout=timeout)
+            return out if isinstance(out, str) else None
+
+        def _try_adb_root() -> bool:
+            try:
+                out = run_cmd(f"adb -s {sn} root", timeout=15)
+                s = str(out or "").lower()
+                # 常见成功输出: "restarting adbd as root"
+                if "root" in s or "restarting" in s:
+                    time.sleep(2.0)
+                    return True
+            except Exception:
+                pass
+            return False
+
         for d in ("/data/anr", "/data/tombstones"):
             try:
-                cmd = f"adb -s {self.device.sn} shell rm -f {d}/*"
-                out = run_cmd(cmd, timeout=8)
-                # run_cmd 返回 None 表示超时，字符串中包含错误关键字则视为失败，否则视为成功
-                if out is None:
-                    logging.warning("[device-exc] 清理目录失败（命令超时）: %s", d)
-                else:
-                    s = str(out).strip()
-                    if any(err in s for err in ("Permission denied", "Operation not permitted", "No such file or directory")):
-                        logging.warning("[device-exc] 清理目录失败（adb 返回错误）%s: %s", d, s[:200])
-                    else:
+                # 1) 优先普通权限清理（快速失败/成功）
+                out = _run_shell(f"rm -f {d}/*", timeout=8)
+                if out is not None:
+                    s = out.strip()
+                    if not _has_err(s):
                         logging.info("[device-exc] 清理目录成功: %s", d)
+                        continue
+                    # 目录不存在视为已清理（不报错）
+                    if "No such file or directory" in s:
+                        logging.info("[device-exc] 目录不存在（视为已清理）: %s", d)
+                        continue
+                    logging.warning("[device-exc] 清理目录失败（无权限/只读）%s: %s", d, s[:200])
+                else:
+                    logging.warning("[device-exc] 清理目录失败（命令超时）: %s", d)
+
+                # 2) 失败后尝试 su -c（你确认的策略：su 优先）
+                out2 = _run_su(f"rm -f {d}/*", timeout=20)
+                if out2 is not None:
+                    s2 = out2.strip()
+                    if not _has_err(s2):
+                        logging.info("[device-exc] 清理目录成功（su）: %s", d)
+                        continue
+                    if "No such file or directory" in s2:
+                        logging.info("[device-exc] 目录不存在（su，视为已清理）: %s", d)
+                        continue
+                    # su 不存在/不可用/被拒绝
+                    if any(x in s2.lower() for x in ("not found", "su: not found", "permission denied", "not permitted")):
+                        logging.warning("[device-exc] su 清理失败 %s: %s", d, s2[:200])
+                    else:
+                        logging.warning("[device-exc] su 清理失败（返回异常）%s: %s", d, s2[:200])
+                else:
+                    logging.warning("[device-exc] su 清理超时: %s", d)
+
+                # 3) su 仍失败：尝试 adb root 后再清理
+                if _try_adb_root():
+                    out3 = _run_shell(f"rm -f {d}/*", timeout=20)
+                    if out3 is not None:
+                        s3 = out3.strip()
+                        if not _has_err(s3):
+                            logging.info("[device-exc] 清理目录成功（adb root）: %s", d)
+                            continue
+                        if "No such file or directory" in s3:
+                            logging.info("[device-exc] 目录不存在（adb root，视为已清理）: %s", d)
+                            continue
+                        logging.warning("[device-exc] adb root 后清理仍失败 %s: %s", d, s3[:200])
+                    else:
+                        logging.warning("[device-exc] adb root 后清理超时: %s", d)
+                else:
+                    logging.warning("[device-exc] adb root 不可用/失败，无法提升权限清理: %s", d)
             except Exception as e:
                 logging.warning("[device-exc] 清理目录失败（可忽略）%s: %s", d, e)
 

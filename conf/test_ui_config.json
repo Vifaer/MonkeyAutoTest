@@ -6,6 +6,7 @@
   "pinned_packages": [
     "com.svw.avatar",
     "com.svw.modelservice",
+    "com.bytedance.auto.agent",
     "com.cei.llm.data"
   ],
   "prj_ver": "broadcast_stress_test",
@@ -21,8 +22,8 @@
     "broadcast_stress": true,
     "tts_stress": false
   },
-  "duration_preset": "持久稳定性测试（24小时）",
-  "duration": "24",
+  "duration_preset": "长期压力测试（12小时）",
+  "duration": "12",
   "duration_unit": "小时",
   "network_method": "pc_proxy",
   "multi_devices": "7ff80600",

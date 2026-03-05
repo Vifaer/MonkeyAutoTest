@@ -291,6 +291,12 @@ class MonkeyTestGUI:
 
     def __init__(self, root):
         self.root = root
+        # Tk 主线程标识（用于线程安全更新 UI）
+        try:
+            import threading as _threading
+            self._ui_thread_id = _threading.get_ident()
+        except Exception:
+            self._ui_thread_id = None
         self.root.title("Monkey自动化测试工具 v1.0.0")
         self.root.geometry("1200x800")
         # 最小尺寸：避免过度压缩导致不可用；但允许更小以适配低分辨率
@@ -2917,7 +2923,47 @@ class MonkeyTestGUI:
 
         # 列表区（Treeview）
         body = tk.Frame(win, bg=UIColors.WHITE, relief="raised", bd=1)
-        body.pack(fill=tk.BOTH, expand=True, padx=15, pady=(0, 15))
+        body.pack(fill=tk.BOTH, expand=True, padx=15, pady=(0, 8))
+
+        # 底部使用提示（可发现性增强）
+        footer = tk.Frame(win, bg=UIColors.BG_LIGHT)
+        footer.pack(fill=tk.X, padx=15, pady=(0, 12))
+        hint_text = (
+            "提示：支持 Ctrl/Shift 多选；点击「🗑️ 删除」可批量删除；"
+            "在上方筛选区可按 SN/包名/状态/日期/版本过滤；双击行或点「📖 打开」查看报告。"
+        )
+        hint_lbl = tk.Label(
+            footer,
+            text=hint_text,
+            bg=UIColors.BG_LIGHT,
+            fg=UIColors.TEXT_SECONDARY,
+            font=UIFonts.CAPTION,
+            anchor="w",
+            justify=tk.LEFT,
+            wraplength=1200,
+        )
+        hint_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        # 悬浮帮助（内容较多时不占用布局）
+        help_lbl = tk.Label(
+            footer,
+            text="更多帮助",
+            bg=UIColors.BG_LIGHT,
+            fg=UIColors.PRIMARY,
+            font=UIFonts.CAPTION,
+            cursor="hand2",
+        )
+        help_lbl.pack(side=tk.RIGHT, padx=(10, 0))
+        ToolTip(
+            help_lbl,
+            "报告查看器使用说明：\n"
+            "- 多选：按住 Ctrl 逐条选择；按住 Shift 选择连续范围\n"
+            "- 打开：选中一条后点「📖 打开」或在列表中双击\n"
+            "- 删除：支持多选批量删除（谨慎操作，删除不可恢复）\n"
+            "- 重构：对旧报告应用最新模板（会生成 .bak 备份）\n"
+            "- 筛选：可按 测试项目/设备SN/包名/状态/日期范围/设备版本/应用版本 过滤\n"
+            "- 已运行时间：优先从伴生 JSON 的 start/end_time 计算，缺失时会尝试从 HTML 解析",
+            delay=300,
+        )
 
         # 增加“已运行时间”列
         columns = ("project", "sn", "device_ver", "pkg", "app_ver", "status", "runtime", "time", "size", "file")
@@ -4036,37 +4082,120 @@ class MonkeyTestGUI:
                 "系统应用安装将执行：root → remount → 推送至 /vendor/app/<包名>/ → 重启设备。\n设备会重启，请保存工作。是否继续？"
             ):
                 return
-            def status_cb(text):
-                self.update_status(text)
-            success, err_msg = app_installer.system_install(
-                adb_cmd, sn, paths,
-                status_callback=status_cb,
-                reboot_timeout=120,
+
+            # 后台执行，避免主线程冻结
+            try:
+                import threading
+                import tkinter as _tk
+                from tkinter import ttk as _ttk
+            except Exception:
+                threading = None  # type: ignore
+
+            win = tk.Toplevel(self.root)
+            win.title("系统应用安装中…")
+            win.configure(bg=UIColors.BG_LIGHT)
+            win.geometry("520x220")
+            win.resizable(False, False)
+            try:
+                win.transient(self.root)
+                win.grab_set()
+            except Exception:
+                pass
+
+            title = tk.Label(win, text="正在安装系统应用（后台执行）", bg=UIColors.BG_LIGHT, fg=UIColors.TEXT_PRIMARY, font=UIFonts.SUBTITLE)
+            title.pack(anchor="w", padx=16, pady=(16, 6))
+            status_var = tk.StringVar(value="准备开始…")
+            status_lbl = tk.Label(win, textvariable=status_var, bg=UIColors.BG_LIGHT, fg=UIColors.TEXT_SECONDARY, font=UIFonts.BODY, wraplength=480, justify=tk.LEFT)
+            status_lbl.pack(anchor="w", padx=16, pady=(0, 10))
+            bar = _ttk.Progressbar(win, mode="indeterminate")
+            bar.pack(fill="x", padx=16, pady=(0, 10))
+            bar.start(10)
+
+            hint = tk.Label(
+                win,
+                text="提示：该过程包含 root/remount/push/reboot/等待上线，期间设备会重启。",
+                bg=UIColors.BG_LIGHT,
+                fg=UIColors.TEXT_SECONDARY,
+                font=UIFonts.CAPTION,
+                wraplength=480,
+                justify=tk.LEFT,
             )
-            if success:
-                # 解析安装包名并置顶
+            hint.pack(anchor="w", padx=16, pady=(0, 12))
+
+            def _set_status(text: str):
+                # 线程安全更新窗口文案 + 状态栏
                 try:
-                    from utils import Package
-                    installed_pkgs = []
-                    installed_desc = []
-                    for p in paths:
-                        try:
-                            pkg = Package(p)
-                            if pkg.name:
-                                installed_pkgs.append(pkg.name)
-                                label = pkg.app_label or os.path.basename(p)
-                                installed_desc.append(f"{label} ({pkg.name})")
-                        except Exception:
-                            continue
-                    if installed_pkgs:
-                        self._pin_packages(installed_pkgs)
-                        self.log_info_ui("系统应用安装成功（已重启）： " + ", ".join(installed_desc))
+                    self.root.after(0, lambda: status_var.set(str(text)))
                 except Exception:
                     pass
-                messagebox.showinfo("安装完成", "系统应用已推送并已重启设备，请等待设备就绪后使用。")
-                self.refresh_devices()
-            else:
-                messagebox.showerror("❌ 系统应用安装失败", err_msg)
+                self.update_status(text)
+
+            def _finish(success: bool, err_msg: str):
+                def _ui_done():
+                    try:
+                        bar.stop()
+                    except Exception:
+                        pass
+                    try:
+                        win.grab_release()
+                    except Exception:
+                        pass
+                    try:
+                        win.destroy()
+                    except Exception:
+                        pass
+                    if success:
+                        # 解析安装包名并置顶
+                        try:
+                            from utils import Package
+                            installed_pkgs = []
+                            installed_desc = []
+                            for p in paths:
+                                try:
+                                    pkg = Package(p)
+                                    if pkg.name:
+                                        installed_pkgs.append(pkg.name)
+                                        label = pkg.app_label or os.path.basename(p)
+                                        installed_desc.append(f"{label} ({pkg.name})")
+                                except Exception:
+                                    continue
+                            if installed_pkgs:
+                                self._pin_packages(installed_pkgs)
+                                self.log_info_ui("系统应用安装成功（已重启）： " + ", ".join(installed_desc))
+                        except Exception:
+                            pass
+                        messagebox.showinfo("安装完成", "系统应用已推送并已重启设备，请等待设备就绪后使用。")
+                        # 刷新设备列表可能耗时，放到后台
+                        try:
+                            threading.Thread(target=self.refresh_devices, daemon=True).start()
+                        except Exception:
+                            self.refresh_devices()
+                    else:
+                        messagebox.showerror("❌ 系统应用安装失败", err_msg or "未知错误")
+                try:
+                    self.root.after(0, _ui_done)
+                except Exception:
+                    _ui_done()
+
+            def _worker():
+                try:
+                    _set_status("开始系统应用安装…")
+                    success, err_msg = app_installer.system_install(
+                        adb_cmd, sn, paths,
+                        status_callback=lambda t: _set_status(t),
+                        reboot_timeout=120,
+                    )
+                    _finish(bool(success), err_msg or "")
+                except Exception as e:
+                    _finish(False, str(e))
+
+            try:
+                if threading is None:
+                    raise RuntimeError("threading 不可用")
+                threading.Thread(target=_worker, daemon=True).start()
+            except Exception:
+                # 兜底：若线程不可用则同步执行（保持功能可用）
+                _worker()
         else:
             success, err_msg = app_installer.normal_install(adb_cmd, sn, paths)
             if success:
@@ -5507,11 +5636,33 @@ class MonkeyTestGUI:
             self.log_text.delete(1.0, f"{len(lines) - 1000}.0")
 
     def update_status(self, message):
-        """更新状态栏"""
-        # 检查status_bar是否已创建
-        if hasattr(self, 'status_bar') and self.status_bar:
-            self.status_bar.config(text=message)
-        self.log_queue.put(message)
+        """更新状态栏（线程安全）"""
+        msg = str(message)
+        # 日志队列允许跨线程写入
+        try:
+            self.log_queue.put(msg)
+        except Exception:
+            pass
+
+        def _apply():
+            try:
+                if hasattr(self, 'status_bar') and self.status_bar:
+                    self.status_bar.config(text=msg)
+            except Exception:
+                pass
+
+        # Tk UI 只能在主线程更新；后台线程调用时用 after 投递
+        try:
+            import threading as _threading
+            if getattr(self, "_ui_thread_id", None) is not None and _threading.get_ident() != self._ui_thread_id:
+                try:
+                    self.root.after(0, _apply)
+                except Exception:
+                    pass
+            else:
+                _apply()
+        except Exception:
+            _apply()
 
     def on_closing(self):
         """窗口关闭事件处理"""
