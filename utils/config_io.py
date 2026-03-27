@@ -88,6 +88,23 @@ def load_stability_config(config_path: str | Path | None = None) -> Dict[str, An
             'interval_seconds': 30,
             'texts': [],
             'texts_file': ''
+        },
+        'app_log': {
+            'enabled': True,
+            'extra_packages_csv': '',
+            'package_process_map': '',
+            'include_process_names_csv': '',
+            'levels': 'VDIWEF',
+            'tags_include_csv': '',
+            'tags_exclude_csv': '',
+            'keywords_include_csv': '',
+            'keywords_exclude_csv': '',
+            'output_subdir': '',
+            'max_file_mb': 50.0,
+            'backup_count': 3,
+            'flush_interval_ms': 500,
+            'batch_lines': 50,
+            'pid_refresh_seconds': 2.0,
         }
     }
     
@@ -145,6 +162,11 @@ def load_stability_config(config_path: str | Path | None = None) -> Dict[str, An
             rm = gui_cfg.get("response_monitor")
             if isinstance(rm, dict):
                 config["response_monitor"] = rm
+
+            # 合并 app_log
+            app_log = gui_cfg.get("app_log")
+            if isinstance(app_log, dict):
+                config["app_log"] = deep_merge(config.get("app_log", {}), app_log)
     except Exception as e:
         logging.debug("从 test_ui_config.json 加载配置失败: %s", e)
     

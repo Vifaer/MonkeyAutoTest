@@ -29,8 +29,8 @@ if sys.platform == 'win32':
 
 from utils import addition
 from utils import ProjectLog
-from utils.stability_test import StabilityTestRunner
 from utils.config_io import read_json, load_stability_config as load_unified_config
+from core.services.stability_service import StabilityTestService
 
 
 def init_param():
@@ -127,136 +127,15 @@ def main():
     params = init_param()
     if params is None:
         return
-    # 稳定性测试模式
-    run_stability_test(params)
+    # 稳定性测试模式：通过 StabilityTestService 构建计划并执行
+    service = StabilityTestService()
+    plan = service.plan_from_params(params)
+    result = service.run_with_pytest(plan)
+    # CLI 模式下保持原有行为：根据 pytest 退出码退出进程
+    import sys
 
+    sys.exit(result.exit_code)
 
-def build_pytest_args(params):
-    """
-    构建pytest命令行参数
-    使用配置字典优化参数构建逻辑。
-    每次运行生成独立的 HTML 报告文件，避免覆盖历史报告。
-    """
-    import os
-    from datetime import datetime
-
-    # 基础pytest参数
-    # GUI 场景下（smoke_only）优先跑 tests/integration，避免同一用例在 tests/ 与 tests/integration 重复执行
-    test_target = 'tests/'
-    if params.get('smoke_only', False):
-        test_target = 'tests/integration/'
-    # 模块化稳定性（GUI 勾选模块）：使用单一 runner 用例，runner 内部按参数运行模块并生成实时/阶段性/最终报告
-    if params.get('modular_enabled', False):
-        test_target = 'tests/integration/test_modular_runner.py'
-
-    # 模块化测试时由 report_generator 写入单一综合报告（{sn}_{project}_{ts}.html），不在此处添加 pytest-html
-    reports_dir = 'reports'
-    os.makedirs(reports_dir, exist_ok=True)
-    pytest_args = [test_target, '-v', '--tb=short']
-    if not params.get('modular_enabled', False):
-        mode = params.get('mode', 'test')
-        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        html_report_name = f"pytest_{mode}_{ts}.html"
-        html_report_path = os.path.join(reports_dir, html_report_name)
-        pytest_args.extend([f'--html={html_report_path}', '--self-contained-html'])
-
-    # 设备序列号参数
-    if params['sn_list']:
-        pytest_args.extend(['--device-sn', params['sn_list'][0]])
-
-    # 测试应用来源：优先已安装应用包名，其次 APK 路径/URL
-    if params.get('package_name'):
-        pytest_args.extend(['--package-name', params['package_name']])
-    elif params.get('apk_path'):
-        pytest_args.extend(['--apk-path', params['apk_path']])
-    elif params.get('apk_url'):
-        pytest_args.extend(['--apk-url', params['apk_url']])
-
-    # 模块到标记的映射配置
-    MODULE_MARKER_MAP = {
-        'monkey_stress': 'monkey_stress',
-        'exception_recovery': 'exception_recovery',
-        'performance_all': 'performance',
-        'performance_response': 'performance',
-        'performance_resource': 'performance',
-        'broadcast_stress': 'broadcast_stress',
-        'tts_stress': 'tts_stress',
-    }
-
-    MODULE_ARG_MAP = {
-        'monkey_stress': '--module-robustness',
-        'exception_recovery': '--module-recovery',
-        'performance_all': '--module-performance',
-        'performance_response': '--module-response',
-        'performance_resource': '--module-resource',
-        'broadcast_stress': '--module-broadcast',
-        'tts_stress': '--module-tts',
-    }
-
-    # 模块化测试：根据启用的模块添加参数（由 runner 用例内部执行模块，不再依赖 pytest marker 过滤）
-    if params.get('modular_enabled', False):
-        enabled_modules = params.get('enabled_modules', [])
-        
-        # 添加模块参数
-        for module in enabled_modules:
-            if module in MODULE_ARG_MAP:
-                pytest_args.append(MODULE_ARG_MAP[module])
-    else:
-        # 完整测试套件：运行所有稳定性测试
-        # GUI 场景下仅运行标记为 stability_smoke 的轻量用例
-        if params.get('smoke_only', False):
-            pytest_args.extend(['-m', 'stability_smoke'])
-        else:
-            pytest_args.extend(['-m', 'stability'])
-
-    # 基线选项
-    if params.get('establish_baseline', False):
-        pytest_args.append('--establish-baseline')
-    if params.get('compare_baseline', False):
-        pytest_args.append('--compare-baseline')
-
-    # 长时间压力测试时长（小时），通过 pytest 自定义参数传递给测试配置
-    duration = params.get('duration')
-    if duration is not None:
-        try:
-            pytest_args.extend(['--duration-hours', str(float(duration))])
-        except Exception:
-            # 如果转换失败则忽略，由测试侧使用默认值
-            pass
-
-    # 直接使用 Fallback 事件注入（跳过 monkey 命令）
-    if params.get('use_fallback_only', False):
-        pytest_args.append('--use-fallback-only')
-
-    return pytest_args
-
-
-def run_stability_test(params):
-    """运行稳定性测试"""
-    logging.info("开始车载端侧稳定性测试模式")
-    logging.info(f"测试设备: {', '.join(params['sn_list'])}")
-    logging.info(f"测试时长: {params['duration']} 小时")
-
-    # 检查是否启用模块化测试
-    if params.get('modular_enabled', False):
-        logging.info("启用模块化测试模式")
-        logging.info(f"启用的测试模块: {params.get('enabled_modules', [])}")
-
-    # 使用pytest框架执行测试
-    logging.info("使用pytest框架执行测试")
-    try:
-        import pytest  # type: ignore
-        import sys
-
-        # 构建pytest参数
-        pytest_args = build_pytest_args(params)
-
-        logging.info(f"pytest 参数: {' '.join(pytest_args)}")
-        exit_code = pytest.main(pytest_args)
-        sys.exit(exit_code)
-    except ImportError:
-        logging.error("pytest 未安装，请运行 'pip install pytest pytest-html pytest-cov pytest-timeout pytest-xdist' 安装所需依赖")
-        sys.exit(-1)
 
     logging.info("稳定性测试执行完成")
 

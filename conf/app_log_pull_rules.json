@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "local_base_subdir": "aicar_ainavi_logs",
+  "adb_timeout_seconds": 120,
+  "incremental": {
+    "enabled": true,
+    "interval_seconds": 20,
+    "max_files_per_dir": 500
+  },
+  "packages": {
+    "com.exturing.aicarllite": [
+      {
+        "remote_dir": "/storage/emulated/0/Android/data/{package}/files/NaviLogs",
+        "local_subdir": "NaviLogs"
+      }
+    ]
+  }
+}
+

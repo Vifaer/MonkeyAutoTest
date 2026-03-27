@@ -129,8 +129,8 @@ class ModularStabilityTest:
 
         # 测试前清理设备异常目录（/data/anr, /data/tombstones），避免历史干扰
         try:
-            from utils.stress_monitor import StressMonitor
-            StressMonitor(self.device, self.package, self.config.get('performance', {})).clear_device_exception_dirs()
+            from infra.device_cleanup import clear_device_exception_dirs
+            clear_device_exception_dirs(getattr(self.device, "sn", "") or "")
         except Exception as e:
             logging.warning("[device-exc] 清理设备异常目录失败（可忽略继续）: %s", e)
 
@@ -353,7 +353,7 @@ class ModularStabilityTest:
         from utils.stress_monitor import StressMonitor
         monitor = StressMonitor(self.device, self.package, self.config.get('performance', {}))
         monitor._stop_logcat.clear()
-        logcat_thread = monitor.start_logcat_capture(logcat_log_path)
+        logcat_thread = monitor.start_logcat_capture(logcat_log_path, clear_before=True)
         try:
             from utils.performance_monitor import PerformanceMonitor
             perf_monitor = PerformanceMonitor(self.device, self.package, self.config['performance'])
@@ -382,7 +382,7 @@ class ModularStabilityTest:
         from utils.stress_monitor import StressMonitor
         monitor = StressMonitor(self.device, self.package, self.config.get('performance', {}))
         monitor._stop_logcat.clear()
-        logcat_thread = monitor.start_logcat_capture(logcat_log_path)
+        logcat_thread = monitor.start_logcat_capture(logcat_log_path, clear_before=True)
         try:
             from utils.performance_monitor import PerformanceMonitor
             perf_monitor = PerformanceMonitor(self.device, self.package, self.config['performance'])
@@ -437,7 +437,11 @@ class ModularStabilityTest:
         logging.info("开始 Monkey 模式压力测试...")
 
         from utils.extended_monkey import ExtendedMonkeyTest
-        monkey_test = ExtendedMonkeyTest(self.device, self.package, self.config['long_stress'])
+        monkey_cfg = dict(self.config.get('long_stress', {}) or {})
+        global_app_log = self.config.get('app_log')
+        if isinstance(global_app_log, dict) and 'app_log' not in monkey_cfg:
+            monkey_cfg['app_log'] = global_app_log
+        monkey_test = ExtendedMonkeyTest(self.device, self.package, monkey_cfg)
 
         result = monkey_test.run_long_stress_test()
         self.test_results['tests']['monkey_stress'] = result
@@ -456,6 +460,9 @@ class ModularStabilityTest:
         global_rm = self.config.get('response_monitor')
         if isinstance(global_rm, dict) and 'response_monitor' not in cfg:
             cfg['response_monitor'] = global_rm
+        global_app_log = self.config.get('app_log')
+        if isinstance(global_app_log, dict) and 'app_log' not in cfg:
+            cfg['app_log'] = global_app_log
 
         broadcast_test = BroadcastStressTest(self.device, self.package, cfg)
 
@@ -485,6 +492,9 @@ class ModularStabilityTest:
         global_rm = self.config.get('response_monitor')
         if isinstance(global_rm, dict) and 'response_monitor' not in cfg:
             cfg['response_monitor'] = global_rm
+        global_app_log = self.config.get('app_log')
+        if isinstance(global_app_log, dict) and 'app_log' not in cfg:
+            cfg['app_log'] = global_app_log
 
         tts_test = TTSStressTest(self.device, self.package, cfg)
 
@@ -831,8 +841,8 @@ class StabilityTestFramework:
 
         # 测试前清理设备异常目录（/data/anr, /data/tombstones），避免历史干扰
         try:
-            from utils.stress_monitor import StressMonitor
-            StressMonitor(self.device, self.package, self.config.get('performance', {})).clear_device_exception_dirs()
+            from infra.device_cleanup import clear_device_exception_dirs
+            clear_device_exception_dirs(getattr(self.device, "sn", "") or "")
         except Exception as e:
             logging.warning("清理设备异常目录失败（可忽略继续）: %s", e)
 
@@ -911,7 +921,11 @@ class StabilityTestFramework:
         logging.info("开始 Monkey 模式压力测试...")
 
         from utils.extended_monkey import ExtendedMonkeyTest
-        monkey_test = ExtendedMonkeyTest(self.device, self.package, self.config['long_stress'])
+        monkey_cfg = dict(self.config.get('long_stress', {}) or {})
+        global_app_log = self.config.get('app_log')
+        if isinstance(global_app_log, dict) and 'app_log' not in monkey_cfg:
+            monkey_cfg['app_log'] = global_app_log
+        monkey_test = ExtendedMonkeyTest(self.device, self.package, monkey_cfg)
 
         result = monkey_test.run_long_stress_test()
         self.test_results['tests']['monkey_stress'] = result

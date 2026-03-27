@@ -33,7 +33,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["ruff>=0.1.0"]
+dev = [
+  "ruff>=0.1.0",
+  "mypy>=1.7.0",
+  "pre-commit>=3.0.0",
+]
 
 [project.urls]
 Homepage = "https://example.com/monkey-auto-test"
@@ -61,3 +65,15 @@ ignore = ["E501"]  # line too long handled by formatter
 
 [tool.ruff.lint.isort]
 known-first-party = ["utils", "libs"]
+
+[tool.mypy]
+python_version = "3.9"
+warn_unused_configs = true
+ignore_missing_imports = true
+disallow_untyped_defs = false
+show_error_codes = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+addopts = "-v --cov=utils --cov=core --cov=infra --cov-report=term-missing"

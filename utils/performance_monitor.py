@@ -58,7 +58,7 @@ class PerformanceMonitor:
         from utils.stress_monitor import StressMonitor
         monitor = StressMonitor(self.device, self.package, self.config)
         monitor._stop_logcat.clear()
-        logcat_thread = monitor.start_logcat_capture(logcat_log_path)
+        logcat_thread = monitor.start_logcat_capture(logcat_log_path, clear_before=True)
         
         try:
             test_start_time = time.time()

@@ -658,6 +658,39 @@ class StabilityReportGenerator:
         except Exception:
             pass
 
+        # 动态追加：应用私有日志（如 NaviLogs），链接到一个示例文件
+        try:
+            local_base_subdir = "app_private_logs"
+            try:
+                import json as _json
+                rules_path = os.path.join("conf", "app_log_pull_rules.json")
+                if os.path.isfile(rules_path):
+                    rules_data = _json.loads(open(rules_path, "r", encoding="utf-8", errors="replace").read())
+                    if isinstance(rules_data, dict) and isinstance(rules_data.get("local_base_subdir"), str):
+                        local_base_subdir = rules_data["local_base_subdir"]
+            except Exception:
+                pass
+
+            apd = os.path.join(run_log_dir, local_base_subdir)
+            if os.path.isdir(apd):
+                found_href = None
+                for root, _dirs, files in os.walk(apd):
+                    for fn in sorted(files):
+                        full = os.path.join(root, fn)
+                        if not os.path.isfile(full):
+                            continue
+                        rel_from_run = os.path.relpath(full, run_log_dir).replace("\\", "/")
+                        found_href = f"{rel_base}/{rel_from_run}"
+                        break
+                    if found_href:
+                        break
+                if found_href:
+                    links.append(
+                        f'<a href="{self._escape_html(found_href)}" target="_blank" rel="noopener noreferrer">应用私有日志（app_private_logs）</a>'
+                    )
+        except Exception:
+            pass
+
         # 动态追加：bugreport（如有则链接到一个示例 zip）
         try:
             bd = os.path.join(run_log_dir, "bugreport")

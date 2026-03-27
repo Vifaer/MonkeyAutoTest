@@ -14,6 +14,7 @@ import logging
 import subprocess
 import threading
 import collections
+import queue
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
@@ -45,6 +46,8 @@ class StressMonitor:
         # 应用 PID 过滤日志（app.log）相关
         self._stop_app_log = threading.Event()
         self._app_log_process = None
+        self._app_log_processes: dict[int, subprocess.Popen] = {}
+        self._app_log_reader_threads: list[threading.Thread] = []
         # 设备异常目录监控结果（用于测试结束时触发 bugreport）
         self._device_exception_found = threading.Event()
         self._bugreport_lock = threading.Lock()
@@ -55,6 +58,10 @@ class StressMonitor:
         self._error_monitor_stop = threading.Event()
         # CPU 核数缓存（用于将单进程CPU占比归一化到整机核数）
         self._cpu_core_count = None
+
+        # 应用私有目录增量日志拉取（准实时）
+        self._stop_app_private_logs_incremental = threading.Event()
+        self._app_private_logs_incremental_thread: Optional[threading.Thread] = None
 
     # -------------------- 前台与进程 --------------------
     def _get_package_name(self) -> str:
@@ -424,11 +431,10 @@ class StressMonitor:
         return t
 
     # -------------------- logcat 全量抓取与 app.log（PID 过滤）--------------------
-    def start_logcat_capture(self, logcat_log_path):
+    def start_logcat_capture(self, logcat_log_path, *, clear_before: bool = False):
         """
         启动 logcat 抓取线程（全量）。
-        注意：旧实现使用 tag 过滤（如 f"{pkg}:*" + "*:S"），在多数应用下会导致日志为空。
-        这里改为抓取全量 logcat，作为每次测试的完整记录。
+        默认与 `adb logcat` 默认输出保持一致（不清空缓冲区、不过滤 tag）。
         """
         self.logcat_log_path = logcat_log_path
 
@@ -436,13 +442,15 @@ class StressMonitor:
             log_dir = os.path.dirname(logcat_log_path)
             if log_dir and not os.path.exists(log_dir):
                 os.makedirs(log_dir, exist_ok=True)
-            run_cmd(f"adb -s {self.device.sn} logcat -c", timeout=5)
+            if clear_before:
+                # 可选：清空 logcat 缓冲区（用于减少噪音），但会改变输出内容与 `adb logcat` 的一致性
+                run_cmd(f"adb -s {self.device.sn} logcat -c", timeout=5)
             try:
                 from utils.timeout_command import _resolve_adb_path
                 adb_path = _resolve_adb_path()
                 adb_bin = adb_path or "adb"
-                # 用 threadtime 带 pid/tid，便于后续排查；不加 selectors => 全量
-                logcat_cmd = [adb_bin, "-s", self.device.sn, "logcat", "-v", "threadtime"]
+                # 不指定 -v：尽量与用户手动运行 `adb logcat` 默认输出一致
+                logcat_cmd = [adb_bin, "-s", self.device.sn, "logcat"]
                 process = subprocess.Popen(
                     logcat_cmd,
                     stdout=subprocess.PIPE,
@@ -463,7 +471,7 @@ class StressMonitor:
                                 f.flush()
                         except Exception:
                             break
-                        time.sleep(0.1)
+                        # readline 阻塞等待下一行；这里不额外 sleep，避免积压导致丢行
                 if process.poll() is None:
                     process.terminate()
                     try:
@@ -500,6 +508,7 @@ class StressMonitor:
         self._stop_logcat.set()
         self._stop_app_log.set()
         self._error_monitor_stop.set()
+        self._stop_app_private_logs_incremental.set()
         if self._logcat_process and self._logcat_process.poll() is None:
             try:
                 self._logcat_process.terminate()
@@ -514,6 +523,27 @@ class StressMonitor:
             except Exception:
                 pass
         self._app_log_process = None
+        # 多进程 app.log 子进程回收
+        try:
+            for proc in list(self._app_log_processes.values()):
+                try:
+                    if proc and proc.poll() is None:
+                        proc.terminate()
+                        proc.wait(timeout=2)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self._app_log_processes = {}
+        self._app_log_reader_threads = []
+
+        # 停止增量拉取线程
+        try:
+            if self._app_private_logs_incremental_thread and self._app_private_logs_incremental_thread.is_alive():
+                self._app_private_logs_incremental_thread.join(timeout=5)
+        except Exception:
+            pass
+        self._app_private_logs_incremental_thread = None
 
     # -------------------- 设备异常目录（/data/anr, /data/tombstones）监控 --------------------
 
@@ -523,98 +553,13 @@ class StressMonitor:
         - /data/anr
         - /data/tombstones
 
+        委托给 infra.device_cleanup 统一实现。
         注意：部分设备需要 root 才能访问/清理；失败仅记录 warning，不中断测试。
         """
-        sn = getattr(self.device, "sn", "")
-        if not sn:
-            return
+        from infra.device_cleanup import clear_device_exception_dirs
 
-        def _has_err(s: str) -> bool:
-            return any(
-                k in s
-                for k in (
-                    "Permission denied",
-                    "Operation not permitted",
-                    "not permitted",
-                    "Read-only file system",
-                    "No such file or directory",
-                )
-            )
-
-        def _run_shell(cmd: str, timeout: int) -> Optional[str]:
-            out = run_cmd(f"adb -s {sn} shell {cmd}", timeout=timeout)
-            return out if isinstance(out, str) else None
-
-        def _run_su(cmd: str, timeout: int) -> Optional[str]:
-            # 先 su -c，再按需外层做 adb root
-            out = run_cmd(f'adb -s {sn} shell su -c "{cmd}"', timeout=timeout)
-            return out if isinstance(out, str) else None
-
-        def _try_adb_root() -> bool:
-            try:
-                out = run_cmd(f"adb -s {sn} root", timeout=15)
-                s = str(out or "").lower()
-                # 常见成功输出: "restarting adbd as root"
-                if "root" in s or "restarting" in s:
-                    time.sleep(2.0)
-                    return True
-            except Exception:
-                pass
-            return False
-
-        for d in ("/data/anr", "/data/tombstones"):
-            try:
-                # 1) 优先普通权限清理（快速失败/成功）
-                out = _run_shell(f"rm -f {d}/*", timeout=8)
-                if out is not None:
-                    s = out.strip()
-                    if not _has_err(s):
-                        logging.info("[device-exc] 清理目录成功: %s", d)
-                        continue
-                    # 目录不存在视为已清理（不报错）
-                    if "No such file or directory" in s:
-                        logging.info("[device-exc] 目录不存在（视为已清理）: %s", d)
-                        continue
-                    logging.warning("[device-exc] 清理目录失败（无权限/只读）%s: %s", d, s[:200])
-                else:
-                    logging.warning("[device-exc] 清理目录失败（命令超时）: %s", d)
-
-                # 2) 失败后尝试 su -c（你确认的策略：su 优先）
-                out2 = _run_su(f"rm -f {d}/*", timeout=20)
-                if out2 is not None:
-                    s2 = out2.strip()
-                    if not _has_err(s2):
-                        logging.info("[device-exc] 清理目录成功（su）: %s", d)
-                        continue
-                    if "No such file or directory" in s2:
-                        logging.info("[device-exc] 目录不存在（su，视为已清理）: %s", d)
-                        continue
-                    # su 不存在/不可用/被拒绝
-                    if any(x in s2.lower() for x in ("not found", "su: not found", "permission denied", "not permitted")):
-                        logging.warning("[device-exc] su 清理失败 %s: %s", d, s2[:200])
-                    else:
-                        logging.warning("[device-exc] su 清理失败（返回异常）%s: %s", d, s2[:200])
-                else:
-                    logging.warning("[device-exc] su 清理超时: %s", d)
-
-                # 3) su 仍失败：尝试 adb root 后再清理
-                if _try_adb_root():
-                    out3 = _run_shell(f"rm -f {d}/*", timeout=20)
-                    if out3 is not None:
-                        s3 = out3.strip()
-                        if not _has_err(s3):
-                            logging.info("[device-exc] 清理目录成功（adb root）: %s", d)
-                            continue
-                        if "No such file or directory" in s3:
-                            logging.info("[device-exc] 目录不存在（adb root，视为已清理）: %s", d)
-                            continue
-                        logging.warning("[device-exc] adb root 后清理仍失败 %s: %s", d, s3[:200])
-                    else:
-                        logging.warning("[device-exc] adb root 后清理超时: %s", d)
-                else:
-                    logging.warning("[device-exc] adb root 不可用/失败，无法提升权限清理: %s", d)
-            except Exception as e:
-                logging.warning("[device-exc] 清理目录失败（可忽略）%s: %s", d, e)
+        sn = getattr(self.device, "sn", "") or ""
+        clear_device_exception_dirs(sn)
 
     def start_exception_file_monitor(self, run_log_dir: str, interval_seconds: float = 10.0) -> threading.Thread:
         """
@@ -980,7 +925,273 @@ class StressMonitor:
             logging.warning("[bugreport] 导出过程发生异常: %s", e)
             return None
 
+    def maybe_collect_app_private_logs(self, run_log_dir: str, reason: str = "") -> None:
+        """
+        测试结束后拉取应用私有目录日志（例如 NaviLogs）。
+
+        - 规则来源：`conf/app_log_pull_rules.json`
+        - 依据 package_name 选择远端目录
+        - 失败仅记录 warning，不影响主流程
+        """
+        try:
+            pkg = self._get_package_name().strip()
+            sn = getattr(getattr(self, "device", None), "sn", "") or ""
+            if not pkg or not sn or not run_log_dir:
+                return
+
+            enabled = True
+            try:
+                enabled = bool(self.config.get("app_log_pull_enabled", True))
+            except Exception:
+                enabled = True
+            if not enabled:
+                return
+
+            from infra.app_log_pull import pull_app_private_logs
+
+            pull_app_private_logs(
+                device_sn=sn,
+                package_name=pkg,
+                run_log_dir=run_log_dir,
+                config=self.config,
+                reason=reason or "test_end",
+            )
+        except Exception as e:
+            logging.warning("[app-log-pull] 收集应用私有日志失败: %s", e)
+
+    def start_app_private_logs_incremental_monitor(self, run_log_dir: str, reason: str = "") -> None:
+        """
+        启动应用私有目录增量日志拉取（准实时）。
+
+        读取 `conf/app_log_pull_rules.json` 的 `incremental` 配置与 package 对应规则。
+        拉取失败不影响主流程；退出由 StressMonitor.stop() 控制。
+        """
+        try:
+            pkg = self._get_package_name().strip()
+            sn = getattr(getattr(self, "device", None), "sn", "") or ""
+            if not pkg or not sn or not run_log_dir:
+                return
+
+            # 用户/GUI 侧可用开关（没有则默认开启：由规则文件决定）
+            try:
+                if "app_log_pull_enabled" in self.config:
+                    if not bool(self.config.get("app_log_pull_enabled", True)):
+                        return
+            except Exception:
+                pass
+
+            # 清理旧线程
+            self._stop_app_private_logs_incremental.clear()
+
+            from infra.app_log_pull import run_app_private_logs_incremental_pulling
+
+            def _runner() -> None:
+                run_app_private_logs_incremental_pulling(
+                    stop_event=self._stop_app_private_logs_incremental,
+                    device_sn=sn,
+                    package_name=pkg,
+                    run_log_dir=run_log_dir,
+                    config=self.config,
+                    reason=reason or "test_running",
+                )
+
+            self._app_private_logs_incremental_thread = threading.Thread(target=_runner, daemon=True)
+            self._app_private_logs_incremental_thread.start()
+        except Exception as e:
+            logging.warning("[app-log-pull] 启动增量拉取失败: %s", e)
+
     # -------------------- 应用 PID 基础工具 --------------------
+
+    @staticmethod
+    def _split_csv(raw: Any) -> list[str]:
+        if raw is None:
+            return []
+        txt = str(raw).replace("\n", ",").replace(";", ",")
+        out = []
+        seen = set()
+        for it in txt.split(","):
+            s = it.strip()
+            if not s or s in seen:
+                continue
+            seen.add(s)
+            out.append(s)
+        return out
+
+    @staticmethod
+    def _parse_package_process_map(raw: Any) -> dict[str, list[str]]:
+        """
+        支持格式：
+        - com.demo.app:main,remote;com.demo.other:worker
+        - 每行一条：pkg:proc1,proc2
+        """
+        result: dict[str, list[str]] = {}
+        if raw is None:
+            return result
+        text = str(raw).strip()
+        if not text:
+            return result
+        for chunk in text.replace("\r", "").replace("\n", ";").split(";"):
+            item = chunk.strip()
+            if not item or ":" not in item:
+                continue
+            pkg, procs = item.split(":", 1)
+            pkg = pkg.strip()
+            if not pkg:
+                continue
+            plist = StressMonitor._split_csv(procs)
+            if plist:
+                result[pkg] = plist
+        return result
+
+    def _build_app_log_cfg(self) -> dict:
+        cfg_raw = self.config.get("app_log")
+        cfg = cfg_raw if isinstance(cfg_raw, dict) else {}
+        norm = {
+            "enabled": bool(cfg.get("enabled", True)),
+            "extra_packages_csv": cfg.get("extra_packages_csv", ""),
+            "package_process_map": cfg.get("package_process_map", ""),
+            "include_process_names_csv": cfg.get("include_process_names_csv", ""),
+            "levels": str(cfg.get("levels", "VDIWEF") or "VDIWEF").upper(),
+            "tags_include_csv": cfg.get("tags_include_csv", ""),
+            "tags_exclude_csv": cfg.get("tags_exclude_csv", ""),
+            "keywords_include_csv": cfg.get("keywords_include_csv", ""),
+            "keywords_exclude_csv": cfg.get("keywords_exclude_csv", ""),
+            "output_subdir": str(cfg.get("output_subdir", "") or "").strip(),
+        }
+        try:
+            norm["max_file_mb"] = max(1.0, float(cfg.get("max_file_mb", 50.0)))
+        except Exception:
+            norm["max_file_mb"] = 50.0
+        try:
+            norm["backup_count"] = max(1, int(float(cfg.get("backup_count", 3))))
+        except Exception:
+            norm["backup_count"] = 3
+        try:
+            norm["flush_interval_ms"] = max(50, int(float(cfg.get("flush_interval_ms", 500))))
+        except Exception:
+            norm["flush_interval_ms"] = 500
+        try:
+            norm["batch_lines"] = max(1, int(float(cfg.get("batch_lines", 50))))
+        except Exception:
+            norm["batch_lines"] = 50
+        try:
+            norm["pid_refresh_seconds"] = max(0.5, float(cfg.get("pid_refresh_seconds", 2.0)))
+        except Exception:
+            norm["pid_refresh_seconds"] = 2.0
+        return norm
+
+    def _list_device_processes(self) -> list[tuple[int, str]]:
+        """
+        返回设备进程列表：[(pid, process_name), ...]
+        """
+        rows: list[tuple[int, str]] = []
+        try:
+            out = run_cmd(f"adb -s {self.device.sn} shell ps -A", timeout=6)
+            if not isinstance(out, str):
+                return rows
+            for line in out.splitlines():
+                line = line.strip()
+                if not line or " PID " in f" {line} ":
+                    continue
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                name = parts[-1].strip()
+                if not name:
+                    continue
+                pid = None
+                for p in parts:
+                    if p.isdigit():
+                        pid = int(p)
+                        break
+                if pid is None or pid <= 0:
+                    continue
+                rows.append((pid, name))
+        except Exception:
+            return rows
+        return rows
+
+    def _resolve_target_processes_for_app_log(self, cfg: dict) -> dict[int, str]:
+        pkg = self._get_package_name().strip()
+        packages = set([pkg] if pkg else [])
+        packages.update(self._split_csv(cfg.get("extra_packages_csv")))
+        process_map = self._parse_package_process_map(cfg.get("package_process_map"))
+        include_names = set(self._split_csv(cfg.get("include_process_names_csv")))
+        # 追加映射中针对已选择包名的进程名
+        for p in list(packages):
+            for proc in process_map.get(p, []):
+                include_names.add(proc)
+                if ":" not in proc:
+                    include_names.add(f"{p}:{proc}")
+
+        result: dict[int, str] = {}
+        for pid, name in self._list_device_processes():
+            matched = False
+            for p in packages:
+                if name == p or name.startswith(f"{p}:"):
+                    matched = True
+                    break
+            if not matched and name in include_names:
+                matched = True
+            if matched:
+                result[pid] = name
+        return result
+
+    @staticmethod
+    def _parse_threadtime_line(line: str) -> tuple[Optional[int], str, str, str]:
+        """
+        解析 threadtime 行，返回 (pid, level, tag, content_lower)
+        """
+        # MM-DD HH:MM:SS.mmm  PID  TID L TAG: msg
+        m = re.match(
+            r"^\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d+\s+(\d+)\s+\d+\s+([VDIWEF])\s+([^:]+):\s?(.*)$",
+            line,
+        )
+        if not m:
+            return None, "", "", line.lower()
+        try:
+            pid = int(m.group(1))
+        except Exception:
+            pid = None
+        level = (m.group(2) or "").upper()
+        tag = (m.group(3) or "").strip()
+        content = f"{tag}: {m.group(4) or ''}".lower()
+        return pid, level, tag, content
+
+    def _match_app_log_filters(self, line: str, cfg: dict) -> bool:
+        _, level, tag, content_lower = self._parse_threadtime_line(line)
+        levels = set(ch for ch in str(cfg.get("levels", "VDIWEF")).upper() if ch.isalpha())
+        if level and levels and level not in levels:
+            return False
+        tag_l = tag.lower()
+        tags_include = [x.lower() for x in self._split_csv(cfg.get("tags_include_csv"))]
+        tags_exclude = [x.lower() for x in self._split_csv(cfg.get("tags_exclude_csv"))]
+        if tags_include and (not tag_l or tag_l not in tags_include):
+            return False
+        if tag_l and tags_exclude and tag_l in tags_exclude:
+            return False
+        kw_inc = [x.lower() for x in self._split_csv(cfg.get("keywords_include_csv"))]
+        kw_exc = [x.lower() for x in self._split_csv(cfg.get("keywords_exclude_csv"))]
+        if kw_inc and not any(k in content_lower for k in kw_inc):
+            return False
+        if kw_exc and any(k in content_lower for k in kw_exc):
+            return False
+        return True
+
+    @staticmethod
+    def _rotate_app_log_file(log_path: str, backup_count: int) -> None:
+        if backup_count < 1:
+            return
+        try:
+            for i in range(backup_count, 1, -1):
+                src = f"{log_path}.{i - 1}"
+                dst = f"{log_path}.{i}"
+                if os.path.exists(src):
+                    os.replace(src, dst)
+            if os.path.exists(log_path):
+                os.replace(log_path, f"{log_path}.1")
+        except Exception:
+            pass
 
     def _get_app_pid(self) -> Optional[int]:
         """
@@ -1032,100 +1243,180 @@ class StressMonitor:
         - 每 2 秒检查一次 PID，应用重启时自动切换到新 PID。
         - 日志以 UTF-8 写入，确保中文显示正常。
         """
+        cfg = self._build_app_log_cfg()
         pkg = self._get_package_name().strip()
-        if not pkg:
-            logging.warning("[app-log] 未指定包名，跳过应用日志采集")
-            # 返回一个空线程占位，避免调用方出错
+        if not pkg and not self._split_csv(cfg.get("extra_packages_csv")):
+            logging.warning("[app-log] 未指定包名且未配置额外包名，跳过应用日志采集")
             t = threading.Thread(target=lambda: None, daemon=True)
             t.start()
             return t
 
+        if not cfg.get("enabled", True):
+            logging.info("[app-log] 已禁用精准采集，跳过 app.log")
+            t = threading.Thread(target=lambda: None, daemon=True)
+            t.start()
+            return t
+
+        # 输出路径支持子目录覆盖
+        out_path = app_log_path
+        subdir = (cfg.get("output_subdir") or "").strip()
+        if subdir:
+            base_dir = os.path.dirname(app_log_path)
+            out_path = os.path.join(base_dir, subdir, os.path.basename(app_log_path))
+
         self._stop_app_log.clear()
 
         def _worker() -> None:
-            last_pid = None
-            while not (self._stop_monitor.is_set() or self._stop_app_log.is_set()):
+            line_q: queue.Queue = queue.Queue(maxsize=5000)
+            self._app_log_processes = {}
+            self._app_log_reader_threads = []
+
+            def _spawn_pid_reader(pid: int, proc_name: str) -> None:
                 try:
-                    pid = self._get_app_pid()
-                    if not pid:
-                        time.sleep(2.0)
-                        continue
-                    last_pid = pid
-                    try:
-                        from utils.timeout_command import _resolve_adb_path
-                        adb_path = _resolve_adb_path() or "adb"
-                    except Exception:
-                        adb_path = "adb"
-                    cmd = [
-                        adb_path,
-                        "-s",
-                        self.device.sn,
-                        "logcat",
-                        "--pid",
-                        str(pid),
-                        "-v",
-                        "threadtime",
-                    ]
-                    logging.info("[app-log] 启动应用日志采集: pid=%s", pid)
-                    proc = subprocess.Popen(
-                        cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.DEVNULL,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                    )
+                    from utils.timeout_command import _resolve_adb_path
+                    adb_path = _resolve_adb_path() or "adb"
+                except Exception:
+                    adb_path = "adb"
+                cmd = [adb_path, "-s", self.device.sn, "logcat", "--pid", str(pid), "-v", "threadtime"]
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                self._app_log_processes[pid] = proc
+                if self._app_log_process is None:
                     self._app_log_process = proc
-                    # 确保目录存在
-                    log_dir = os.path.dirname(app_log_path)
-                    if log_dir and not os.path.exists(log_dir):
-                        try:
-                            os.makedirs(log_dir, exist_ok=True)
-                        except Exception:
-                            pass
-                    with open(app_log_path, "a", encoding="utf-8", errors="replace") as f:
-                        last_check = time.time()
+                logging.info("[app-log] 启动应用日志采集: pid=%s process=%s", pid, proc_name)
+
+                def _reader():
+                    try:
+                        if not proc.stdout:
+                            return
                         while not (self._stop_monitor.is_set() or self._stop_app_log.is_set()):
                             if proc.poll() is not None:
                                 break
+                            line = proc.stdout.readline()
+                            if not line:
+                                time.sleep(0.02)
+                                continue
                             try:
-                                line = proc.stdout.readline()
-                                if line:
-                                    f.write(line)
-                                    f.flush()
-                            except Exception:
-                                break
-                            # 定期检查 PID 是否变化
-                            now = time.time()
-                            if now - last_check >= 2.0:
-                                last_check = now
-                                new_pid = self._get_app_pid()
-                                if new_pid and new_pid != pid:
-                                    msg = (
-                                        f"# [app-log] PID changed from {pid} to {new_pid} "
-                                        f"at {datetime.now().isoformat()}\n"
-                                    )
-                                    f.write(msg)
-                                    f.flush()
-                                    logging.info("[app-log] 检测到 PID 变化: %s -> %s，重启 logcat", pid, new_pid)
-                                    break
-                            time.sleep(0.05)
-                    # 结束当前 logcat 进程
-                    if proc.poll() is None:
+                                line_q.put_nowait((pid, line))
+                            except queue.Full:
+                                # 满队列时丢弃最旧数据，优先保证实时性
+                                try:
+                                    _ = line_q.get_nowait()
+                                except Exception:
+                                    pass
+                                try:
+                                    line_q.put_nowait((pid, line))
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+
+                rt = threading.Thread(target=_reader, daemon=True)
+                rt.start()
+                self._app_log_reader_threads.append(rt)
+
+            # 确保目录存在
+            log_dir = os.path.dirname(out_path)
+            if log_dir and not os.path.exists(log_dir):
+                try:
+                    os.makedirs(log_dir, exist_ok=True)
+                except Exception:
+                    pass
+
+            max_bytes = int(float(cfg.get("max_file_mb", 50.0)) * 1024 * 1024)
+            backup_count = int(cfg.get("backup_count", 3))
+            flush_interval_s = max(0.05, float(cfg.get("flush_interval_ms", 500)) / 1000.0)
+            batch_lines = int(cfg.get("batch_lines", 50))
+            pid_refresh_s = float(cfg.get("pid_refresh_seconds", 2.0))
+            last_flush = time.time()
+            last_refresh = 0.0
+            pending = 0
+
+            f = open(out_path, "a", encoding="utf-8", errors="replace")
+            try:
+                f.write(f"# [app-log] start at {datetime.now().isoformat()}\n")
+                f.flush()
+                while not (self._stop_monitor.is_set() or self._stop_app_log.is_set()):
+                    now = time.time()
+                    # 动态刷新目标进程集合
+                    if now - last_refresh >= pid_refresh_s:
+                        last_refresh = now
+                        targets = self._resolve_target_processes_for_app_log(cfg)
+                        target_pids = set(targets.keys())
+                        active_pids = set(self._app_log_processes.keys())
+                        # 停掉不再需要的 pid
+                        for pid in list(active_pids - target_pids):
+                            proc = self._app_log_processes.pop(pid, None)
+                            if proc and proc.poll() is None:
+                                try:
+                                    proc.terminate()
+                                    proc.wait(timeout=1)
+                                except Exception:
+                                    pass
+                        # 拉起新增 pid
+                        for pid in list(target_pids - active_pids):
+                            _spawn_pid_reader(pid, targets.get(pid, ""))
+
+                    # 消费队列
+                    consumed = 0
+                    while consumed < batch_lines:
                         try:
-                            proc.terminate()
-                            proc.wait(timeout=2)
-                        except subprocess.TimeoutExpired:
-                            try:
-                                proc.kill()
-                                proc.wait(timeout=1)
-                            except Exception:
-                                pass
-                    self._app_log_process = None
-                    # 若是 PID 变化导致的中断，则继续外层 while 重新获取 PID
-                except Exception as e:
-                    logging.debug(f"[app-log] 日志采集异常: {e}")
-                    time.sleep(2.0)
+                            _, line = line_q.get_nowait()
+                        except queue.Empty:
+                            break
+                        consumed += 1
+                        if not self._match_app_log_filters(line, cfg):
+                            continue
+                        # 轮转
+                        try:
+                            if os.path.exists(out_path) and os.path.getsize(out_path) >= max_bytes:
+                                f.flush()
+                                self._rotate_app_log_file(out_path, backup_count)
+                                f.close()
+                                f = open(out_path, "a", encoding="utf-8", errors="replace")
+                                f.write(f"# [app-log] rotate at {datetime.now().isoformat()}\n")
+                        except Exception:
+                            pass
+                        f.write(line)
+                        pending += 1
+
+                    if pending > 0 and (time.time() - last_flush >= flush_interval_s or pending >= batch_lines):
+                        try:
+                            f.flush()
+                        except Exception:
+                            pass
+                        last_flush = time.time()
+                        pending = 0
+
+                    if consumed == 0:
+                        time.sleep(0.05)
+
+                # 优雅收尾
+                try:
+                    f.flush()
+                except Exception:
+                    pass
+            finally:
+                try:
+                    f.close()
+                except Exception:
+                    pass
+
+            for proc in list(self._app_log_processes.values()):
+                try:
+                    if proc.poll() is None:
+                        proc.terminate()
+                        proc.wait(timeout=1)
+                except Exception:
+                    pass
+            self._app_log_processes = {}
+            self._app_log_process = None
 
         t = threading.Thread(target=_worker, daemon=True)
         t.start()
@@ -1224,26 +1515,52 @@ class StressMonitor:
         pkg = self._get_package_name()
         crashes = 0
         anrs = 0
+
+        def _dt_to_logcat_time_key(dt: datetime) -> str:
+            # 目标格式：MM-DD HH:MM:SS.mmm（字符串可直接字典序比较）
+            ms = int(getattr(dt, "microsecond", 0) / 1000)
+            return dt.strftime("%m-%d %H:%M:%S") + f".{ms:03d}"
+
+        def _line_to_logcat_time_key(line: str) -> Optional[str]:
+            """
+            从 logcat 行提取时间戳（MM-DD HH:MM:SS.mmm）。
+            兼容 brief/threadtime 常见的前两段 token：
+              1) MM-DD
+              2) HH:MM:SS(.mmm)?
+            """
+            if not line:
+                return None
+            parts = line.strip().split()
+            if len(parts) < 2:
+                return None
+            mmdd = parts[0]
+            t2 = parts[1]
+            import re as _re
+            m = _re.match(r"^(\\d{2}:\\d{2}:\\d{2})(?:\\.(\\d{1,3}))?$", t2)
+            if not m:
+                return None
+            hms = m.group(1)
+            ms = m.group(2) or "0"
+            ms = (ms + "000")[:3]  # 保底补齐到 3 位
+            return f"{mmdd} {hms}.{ms}"
+
+        start_key = _dt_to_logcat_time_key(start_time)
+        end_key = _dt_to_logcat_time_key(end_time)
         try:
-            start_str = start_time.strftime("%m-%d %H:%M:%S")
-            end_str = end_time.strftime("%m-%d %H:%M:%S")
             with open(logcat_path, 'r', encoding='utf-8', errors='ignore') as f:
-                in_phase = False
                 for line in f:
                     line = line.strip()
                     if not line:
                         continue
-                    try:
-                        if len(line) >= 19:
-                            time_str = line[:19]
-                            if start_str <= time_str <= end_str:
-                                in_phase = True
-                            elif time_str > end_str:
-                                break
-                    except Exception:
-                        pass
-                    if not in_phase:
+
+                    time_key = _line_to_logcat_time_key(line)
+                    if not time_key:
                         continue
+                    if time_key < start_key:
+                        continue
+                    if time_key > end_key:
+                        break
+
                     if "FATAL EXCEPTION" in line and pkg in line:
                         crashes += 1
                     elif "AndroidRuntime" in line and "FATAL" in line:
@@ -1284,8 +1601,32 @@ class StressMonitor:
             return 0
         pkg = package_name
         try:
-            start_str = start_time.strftime("%m-%d %H:%M:%S")
-            end_str = end_time.strftime("%m-%d %H:%M:%S")
+            # logcat 时间戳通常包含毫秒：MM-DD HH:MM:SS.mmm
+            # 为保证区间判断正确，使用同一格式的“时间键”做比较（字符串字典序即可）
+            start_str_display = start_time.strftime("%m-%d %H:%M:%S")
+            end_str_display = end_time.strftime("%m-%d %H:%M:%S")
+
+            def _dt_to_logcat_time_key(dt: datetime) -> str:
+                ms = int(getattr(dt, "microsecond", 0) / 1000)
+                return dt.strftime("%m-%d %H:%M:%S") + f".{ms:03d}"
+
+            def _line_to_logcat_time_key(line: str) -> Optional[str]:
+                parts = line.strip().split()
+                if len(parts) < 2:
+                    return None
+                mmdd = parts[0]
+                t2 = parts[1]
+                import re as _re
+                m = _re.match(r"^(\\d{2}:\\d{2}:\\d{2})(?:\\.(\\d{1,3}))?$", t2)
+                if not m:
+                    return None
+                hms = m.group(1)
+                ms = m.group(2) or "0"
+                ms = (ms + "000")[:3]
+                return f"{mmdd} {hms}.{ms}"
+
+            start_key = _dt_to_logcat_time_key(start_time)
+            end_key = _dt_to_logcat_time_key(end_time)
             out_dir = os.path.dirname(output_path)
             if out_dir and not os.path.exists(out_dir):
                 os.makedirs(out_dir, exist_ok=True)
@@ -1295,7 +1636,7 @@ class StressMonitor:
                 lines = list(fin)
 
             with open(output_path, 'w', encoding='utf-8', errors='replace') as fout:
-                fout.write(f"# 异常日志提取: {start_str} ~ {end_str}, 包名: {pkg}\n")
+                fout.write(f"# 异常日志提取: {start_str_display} ~ {end_str_display}, 包名: {pkg}\n")
                 fout.write("# 包含: 崩溃(Crash)、ANR、以及 E 级别仅限 AndroidRuntime 或本应用 TAG 的日志（规则等同 adb logcat -s <pkg>:V AndroidRuntime:E）\n")
                 fout.write("-" * 60 + "\n")
 
@@ -1307,9 +1648,9 @@ class StressMonitor:
                     if not stripped:
                         i += 1
                         continue
-                    time_str = stripped[:19] if len(stripped) >= 19 else ""
-                    in_range = start_str <= time_str <= end_str if time_str else False
-                    if time_str and time_str > end_str:
+                    time_key = _line_to_logcat_time_key(stripped)
+                    in_range = start_key <= time_key <= end_key if time_key else False
+                    if time_key and time_key > end_key:
                         break
 
                     is_crash = in_range and (
@@ -1326,12 +1667,21 @@ class StressMonitor:
                     if include_error_level and in_range:
                         # 按原始规则 adb logcat -s com.svw.avatar:V AndroidRuntime:E 筛选：
                         # 仅将 AndroidRuntime:E 或应用 TAG(包名):E 视为异常，不因其它 TAG 的 E 且含包名就写入
-                        # threadtime 格式：MM-DD HH:MM:SS.mmm PID TID priority TAG: msg
+                        # 不强绑定 -v 格式（brief/threadtime 等均可能）
+                        # priority 为单字符 V/D/I/W/E/F/S，tag 紧跟 priority 后且以 ':' 结尾
                         parts = stripped.split()
-                        level = parts[4] if len(parts) > 4 else ""
-                        tag = parts[5].rstrip(":") if len(parts) > 5 else ""
-                        if level == "E" and pkg in stripped:
-                            # 只保留 AndroidRuntime 或应用自身 TAG 的 E 级别，排除如 DisplaySceneMonitorService 等
+                        priority_set = {"V", "D", "I", "W", "E", "F", "S"}
+                        prio = ""
+                        tag = ""
+                        for i_tok in range(len(parts) - 1):
+                            tok = parts[i_tok].rstrip()
+                            if tok in priority_set:
+                                prio = tok
+                                nxt = parts[i_tok + 1]
+                                tag = nxt.rstrip(":")
+                                break
+                        if prio == "E" and pkg in stripped:
+                            # 只保留 AndroidRuntime 或应用自身 TAG 的 E 级别，排除如其它组件的 E
                             if tag == "AndroidRuntime" or tag == pkg:
                                 is_error = True
 
@@ -1344,8 +1694,8 @@ class StressMonitor:
                             if not next_stripped:
                                 fout.write(next_line)
                                 continue
-                            next_ts = next_stripped[:19] if len(next_stripped) >= 19 else ""
-                            if next_ts and next_ts > end_str:
+                            next_key = _line_to_logcat_time_key(next_stripped)
+                            if next_key and next_key > end_key:
                                 break
                             if next_stripped.startswith("at ") or next_stripped[0:1].isspace() or \
                                "Caused by:" in next_stripped or "at " in next_stripped:

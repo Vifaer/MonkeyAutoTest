@@ -134,6 +134,12 @@ class ExtendedMonkeyTest:
         except Exception as e:
             logging.warning(f"启动应用日志采集失败（app.log）: {e}")
 
+        # 应用私有目录日志（如 NaviLogs）增量拉取（准实时）
+        try:
+            self._stress_monitor.start_app_private_logs_incremental_monitor(run_log_dir, reason="test_running")
+        except Exception:
+            pass
+
         # 启动设备异常目录监控（/data/anr, /data/tombstones）
         try:
             self._stress_monitor.start_exception_file_monitor(run_log_dir)
@@ -155,6 +161,11 @@ class ExtendedMonkeyTest:
             # 停止监控和logcat
             self._stop_logcat.set()
             self._stop_monitor.set()
+            # 统一回收 StressMonitor 内部资源（app.log 多进程采集、增量拉取线程等）
+            try:
+                self._stress_monitor.stop()
+            except Exception:
+                pass
             if logcat_thread:
                 logcat_thread.join(timeout=5)
             monitor_thread.join(timeout=10)
@@ -164,6 +175,12 @@ class ExtendedMonkeyTest:
                 self._stress_monitor.maybe_collect_bugreport(run_log_dir, reason="test_end")
             except Exception as e:
                 logging.warning("导出 bugreport 失败（可忽略）: %s", e)
+
+            # 拉取应用私有目录日志（例如 NaviLogs），用于补充排查
+            try:
+                self._stress_monitor.maybe_collect_app_private_logs(run_log_dir, reason="test_end")
+            except Exception as e:
+                logging.warning("拉取应用私有日志失败（可忽略）: %s", e)
 
             # 记录实际结束时间并生成异常摘要与性能汇总
             result['actual_end_time'] = datetime.now().isoformat()
@@ -1207,16 +1224,13 @@ class ExtendedMonkeyTest:
             log_dir = os.path.dirname(self.logcat_log_path)
             if log_dir and not os.path.exists(log_dir):
                 os.makedirs(log_dir, exist_ok=True)
-            
-            # 清空之前的logcat日志
+
+            # 每次测试开始前清空 logcat 缓冲区：保证文件只包含当次测试范围
             cmd = f"adb -s {self.device.sn} logcat -c"
             run_cmd(cmd, timeout=5)
-            
-            # 启动 logcat 抓取（全量）：作为每次测试运行的完整记录
-            logcat_cmd = [
-                "adb", "-s", self.device.sn, "logcat",
-                "-v", "threadtime",
-            ]
+
+            # 启动 logcat 抓取（全量）：尽量与用户手动运行 `adb logcat` 默认输出一致
+            logcat_cmd = ["adb", "-s", self.device.sn, "logcat"]
             
             try:
                 from utils.timeout_command import _resolve_adb_path
@@ -1245,7 +1259,7 @@ class ExtendedMonkeyTest:
                                 f.flush()
                         except Exception:
                             break
-                        time.sleep(0.1)
+                        # readline 阻塞等待下一行，不额外 sleep，避免积压丢行
                 
                 # 停止logcat
                 if process.poll() is None:
@@ -1280,8 +1294,27 @@ class ExtendedMonkeyTest:
                 return {'crashes': 0, 'anrs': 0}
             
             # 将datetime转换为logcat时间格式（MM-DD HH:MM:SS.mmm）
-            start_str = start_time.strftime("%m-%d %H:%M:%S")
-            end_str = end_time.strftime("%m-%d %H:%M:%S")
+            def _dt_to_logcat_time_key(dt):
+                ms = int(getattr(dt, "microsecond", 0) / 1000)
+                return dt.strftime("%m-%d %H:%M:%S") + f".{ms:03d}"
+
+            def _line_to_logcat_time_key(line: str):
+                parts = line.strip().split()
+                if len(parts) < 2:
+                    return None
+                mmdd = parts[0]
+                t2 = parts[1]
+                import re as _re
+                m = _re.match(r"^(\\d{2}:\\d{2}:\\d{2})(?:\\.(\\d{1,3}))?$", t2)
+                if not m:
+                    return None
+                hms = m.group(1)
+                ms = m.group(2) or "0"
+                ms = (ms + "000")[:3]
+                return f"{mmdd} {hms}.{ms}"
+
+            start_key = _dt_to_logcat_time_key(start_time)
+            end_key = _dt_to_logcat_time_key(end_time)
             
             with open(self.logcat_log_path, 'r', encoding='utf-8', errors='ignore') as f:
                 in_phase = False
@@ -1293,13 +1326,12 @@ class ExtendedMonkeyTest:
                     # 检查时间戳是否在阶段范围内
                     # logcat格式: MM-DD HH:MM:SS.mmm level/tag: message
                     try:
-                        # 提取时间戳（前19个字符：MM-DD HH:MM:SS.mmm）
-                        if len(line) >= 19:
-                            time_str = line[:19]
-                            # 简单比较（不考虑年份，因为测试通常在同一天）
-                            if start_str <= time_str <= end_str:
-                                in_phase = True
-                            elif time_str > end_str:
+                        time_key = _line_to_logcat_time_key(line)
+                        if not time_key:
+                            continue
+                        if start_key <= time_key <= end_key:
+                            in_phase = True
+                        elif time_key > end_key:
                                 break
                     except Exception:
                         pass

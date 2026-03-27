@@ -277,9 +277,14 @@ class BroadcastStressTest:
 
         # 启动监控线程（每 2 秒采样 CPU/内存）
         monitor_thread = monitor.start_monitoring_thread(result, 2, perf_log_path)
-        logcat_thread = monitor.start_logcat_capture(self.logcat_log_path)
+        logcat_thread = monitor.start_logcat_capture(self.logcat_log_path, clear_before=True)
         # 基于 PID 的实时应用日志（与 Monkey 模式一致，规则等同 adb logcat -s <pkg>:V AndroidRuntime:E 的采集范围）
         monitor.start_app_log_capture(os.path.join(self._run_log_dir, "app.log"))
+        # 应用私有目录日志（如 NaviLogs）增量拉取（准实时）
+        try:
+            monitor.start_app_private_logs_incremental_monitor(self._run_log_dir, reason="test_running")
+        except Exception:
+            pass
         # 监控设备异常目录（/data/anr, /data/tombstones）
         try:
             monitor.start_exception_file_monitor(self._run_log_dir)
@@ -463,6 +468,12 @@ class BroadcastStressTest:
             monitor.maybe_collect_bugreport(self._run_log_dir, reason="test_end")
         except Exception as e:
             logging.warning("导出 bugreport 失败（可忽略）: %s", e)
+
+        # 拉取应用私有目录日志（例如 NaviLogs），用于补充排查
+        try:
+            monitor.maybe_collect_app_private_logs(self._run_log_dir, reason="test_end")
+        except Exception as e:
+            logging.warning("拉取应用私有日志失败（可忽略）: %s", e)
 
         result["actual_end_time"] = datetime.now().isoformat()
         end_time = datetime.now()

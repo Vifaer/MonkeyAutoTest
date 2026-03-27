@@ -1,0 +1,81 @@
+{
+  "theme": "cosmo",
+  "adb_path": "",
+  "app_type": "system",
+  "package_name": "com.example.app",
+  "pinned_packages": ["com.example.app"],
+  "prj_ver": "stability_test",
+  "device_sn": "emulator-5554",
+  "apk_path": "",
+  "email": "",
+  "test_mode": "full",
+  "modules": {
+    "monkey_stress": true,
+    "exception_recovery": true,
+    "performance_response": false,
+    "performance_all": true,
+    "broadcast_stress": false,
+    "tts_stress": false
+  },
+  "duration_preset": "长期压力测试（12小时）",
+  "duration": "12",
+  "duration_unit": "小时",
+  "network_method": "pc_proxy",
+  "multi_devices": "",
+  "baseline_establish": false,
+  "baseline_compare": false,
+  "no_mock_server": false,
+  "no_network_proxy": false,
+  "use_fallback_only": true,
+  "mock_server": {
+    "mode": "mitmproxy",
+    "host": "127.0.0.1",
+    "port": "8080",
+    "rules_path": "conf/mock_rules.json"
+  },
+  "performance_monitor": {
+    "clickable_elements": "按钮1,按钮2"
+  },
+  "monkey_mask": {
+    "top": "0.0",
+    "bottom": "0.0",
+    "left": "0.0",
+    "right": "0.0"
+  },
+  "broadcast_stress": {
+    "hints": ["示例指令1", "示例指令2"],
+    "hints_file": ""
+  },
+  "tts_stress": {
+    "texts": ["示例语音1", "示例语音2"],
+    "texts_file": "",
+    "end_phrase": "",
+    "wake_phrase": "",
+    "wake_delay_seconds": "2",
+    "interval_seconds": "30",
+    "volume_percent": "100"
+  },
+  "app_log": {
+    "enabled": true,
+    "extra_packages_csv": "",
+    "package_process_map": "com.example.app:main,remote",
+    "include_process_names_csv": "",
+    "levels": "VDIWEF",
+    "tags_include_csv": "",
+    "tags_exclude_csv": "",
+    "keywords_include_csv": "",
+    "keywords_exclude_csv": "",
+    "output_subdir": "",
+    "max_file_mb": 50,
+    "backup_count": 3,
+    "flush_interval_ms": 500,
+    "batch_lines": 50,
+    "pid_refresh_seconds": 2
+  },
+  "response_monitor": {
+    "max_wait_for_appear": 15.0,
+    "check_interval": 0.1,
+    "max_wait_for_disappear": 120.0,
+    "anr_recover_threshold": 0
+  }
+}

@@ -18,13 +18,31 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from utils import Device, Package, DeviceLog
-from utils.config_io import read_json
+from infra.config import load_test_ui_config, load_project_config
 
 # 响应监控默认配置（广播/TTS 压力测试共用，发送后立即开始监控）
 DEFAULT_RESPONSE_MONITOR = {
     'max_wait_for_appear': 6,
     'check_interval': 0.1,
     'max_wait_for_disappear': 300,
+}
+
+DEFAULT_APP_LOG = {
+    'enabled': True,
+    'extra_packages_csv': '',
+    'package_process_map': '',
+    'include_process_names_csv': '',
+    'levels': 'VDIWEF',
+    'tags_include_csv': '',
+    'tags_exclude_csv': '',
+    'keywords_include_csv': '',
+    'keywords_exclude_csv': '',
+    'output_subdir': '',
+    'max_file_mb': 50.0,
+    'backup_count': 3,
+    'flush_interval_ms': 500,
+    'batch_lines': 50,
+    'pid_refresh_seconds': 2.0,
 }
 
 
@@ -80,8 +98,9 @@ def test_config(pytestconfig):
     2. GUI 持久化配置 conf/test_ui_config.json 中的 duration + duration_unit
     3. 本地默认值（12 小时）
     """
-    config_path = os.path.join("conf", "test_ui_config.json")
-    gui_config = read_json(config_path, default={})
+    gui_config = load_test_ui_config()
+    if not isinstance(gui_config, dict):
+        gui_config = {}
 
     # 默认配置
     default_config = {
@@ -117,7 +136,8 @@ def test_config(pytestconfig):
             'enabled': True,
             'type': 'mitmproxy',
             'method': 'root'
-        }
+        },
+        'app_log': dict(DEFAULT_APP_LOG),
     }
 
     # 1) pytest 参数 --duration-hours（统一使用“小时”）
@@ -225,6 +245,34 @@ def test_config(pytestconfig):
                 rm_merged[k] = v
     # 顶层 response_monitor，供 stability_test 注入到 broadcast_stress/tts_stress 的 cfg（含 anr_recover_threshold=0 时禁用自动恢复）
     default_config['response_monitor'] = rm_merged
+    app_log_merged = dict(DEFAULT_APP_LOG)
+    if isinstance(gui_config, dict) and isinstance(gui_config.get('app_log'), dict):
+        for k, v in gui_config['app_log'].items():
+            if v is not None:
+                app_log_merged[k] = v
+    # 归一化 app_log 数值字段，避免字符串导致运行时异常
+    try:
+        app_log_merged['max_file_mb'] = max(1.0, float(app_log_merged.get('max_file_mb', 50.0)))
+    except Exception:
+        app_log_merged['max_file_mb'] = 50.0
+    try:
+        app_log_merged['backup_count'] = max(1, int(float(app_log_merged.get('backup_count', 3))))
+    except Exception:
+        app_log_merged['backup_count'] = 3
+    try:
+        app_log_merged['flush_interval_ms'] = max(50, int(float(app_log_merged.get('flush_interval_ms', 500))))
+    except Exception:
+        app_log_merged['flush_interval_ms'] = 500
+    try:
+        app_log_merged['batch_lines'] = max(1, int(float(app_log_merged.get('batch_lines', 50))))
+    except Exception:
+        app_log_merged['batch_lines'] = 50
+    try:
+        app_log_merged['pid_refresh_seconds'] = max(0.5, float(app_log_merged.get('pid_refresh_seconds', 2.0)))
+    except Exception:
+        app_log_merged['pid_refresh_seconds'] = 2.0
+    default_config['app_log'] = app_log_merged
+
     if isinstance(gui_config, dict) and 'broadcast_stress' in gui_config:
         bc = gui_config['broadcast_stress']
         if isinstance(bc, dict):
@@ -235,17 +283,38 @@ def test_config(pytestconfig):
                 'hints': bc.get('hints', ['介绍一下白居易', '讲个笑话']),
                 'hints_file': (bc.get('hints_file') or '').strip(),
                 'response_monitor': rm_merged,
+                'app_log': dict(app_log_merged),
             }
     if isinstance(gui_config, dict) and 'tts_stress' in gui_config:
         tts = gui_config['tts_stress']
         if isinstance(tts, dict):
+            # 从 GUI 配置读取 TTS 间隔（非法值回退 30）
+            interval_seconds = 30
+            try:
+                raw_interval = tts.get('interval_seconds', 30)
+                if raw_interval not in (None, ''):
+                    interval_seconds = int(float(raw_interval))
+            except Exception:
+                interval_seconds = 30
+            if interval_seconds < 0:
+                interval_seconds = 0
             default_config['tts_stress'] = {
                 'duration_hours': dur_hours,
-                'interval_seconds': 30,
+                'interval_seconds': interval_seconds,
                 'texts': tts.get('texts', ['打开设置', '介绍一下北京']),
                 'texts_file': (tts.get('texts_file') or '').strip(),
+                # 唤醒词/结束词配置透传到运行时（此前遗漏导致唤醒词不生效）
+                'end_phrase': (tts.get('end_phrase') or '').strip(),
+                'wake_phrase': (tts.get('wake_phrase') or '').strip(),
+                'wake_delay_seconds': tts.get('wake_delay_seconds', 2),
+                # TTS 引擎音量（0-100 百分比，运行时再归一化）
+                'volume_percent': tts.get('volume_percent', 100),
                 'response_monitor': rm_merged,
+                'app_log': dict(app_log_merged),
             }
+    # monkey 长压也注入统一 app_log 配置
+    if isinstance(default_config.get('long_stress'), dict):
+        default_config['long_stress']['app_log'] = dict(app_log_merged)
 
     return default_config
 
@@ -253,8 +322,8 @@ def test_config(pytestconfig):
 @pytest.fixture(scope="session")
 def project_config():
     """加载项目配置"""
-    config_path = os.path.join("conf", "project.json")
-    return read_json(config_path, default={})
+    cfg = load_project_config()
+    return cfg if isinstance(cfg, dict) else {}
 
 
 # ==================== 设备 Fixtures ====================

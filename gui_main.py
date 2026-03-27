@@ -81,209 +81,17 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
-# UI设计常量
-class UIColors:
-    """UI色彩体系"""
-    PRIMARY = "#1677FF"        # 主色：亮蓝色
-    SUCCESS = "#52C41A"        # 成功：绿色
-    ERROR = "#FF4D4F"          # 错误：红色
-    WARNING = "#FAAD14"        # 警告：橙色
-    INFO = "#13C2C2"           # 信息：青色
-
-    # 中性色
-    WHITE = "#FFFFFF"          # 白色背景
-    BG_LIGHT = "#F0F2F5"       # 浅灰背景
-    BG_DARK = "#E6F7FF"        # 浅蓝背景
-    TEXT_PRIMARY = "#333333"   # 主文字
-    TEXT_SECONDARY = "#666666" # 次要文字
-    BORDER = "#D9D9D9"         # 边框色
-
-class UIFonts:
-    """UI字体设置"""
-    # 注意：实际运行时会在 MonkeyTestGUI.__init__ 里用 tk.font.Font 重新初始化并挂载到同名属性，
-    # 方便后续动态缩放
-    TITLE = ("Microsoft YaHei", 14, "bold")      # 标题
-    SUBTITLE = ("Microsoft YaHei", 12, "bold")   # 副标题
-    BODY = ("Microsoft YaHei", 11)               # 正文
-    CAPTION = ("Microsoft YaHei", 9)             # 说明文字
-    BUTTON = ("Microsoft YaHei", 10, "bold")     # 按钮文字
-    MONO = ("Consolas", 9)                       # 等宽字体（日志/设备列表）
-
-class UIMetrics:
-    """UI尺寸常量"""
-    CARD_PADDING = 20         # 卡片内边距
-    ELEMENT_SPACING = 10      # 元素间距
-    BORDER_RADIUS = 8         # 圆角半径
-    SHADOW_DEPTH = 2          # 阴影深度
-
-# 向后兼容：大量代码使用全大写 UIFONTS 访问字体，保持别名
-UIFONTS = UIFonts
+# UI 设计常量与通用控件从 gui.toolkit 统一引入
+from gui.toolkit import UIColors, UIFonts, UIMetrics, UIFONTS, ToolTip
+from gui.state import GuiContext
 
 # 导入项目模块
 from utils import addition, ProjectLog
 from utils.stability_test import StabilityTestFramework, StabilityTestRunner
 from utils import Package
-from utils import mock_server as mock_server_mod
+from infra.mock_server import create_mock_server, apply_rules
 from utils.config_io import read_json, write_json
-from utils.report_regenerator import regenerate_report
-
-
-class ToolTip:
-    """悬浮提示工具类，与现有UI风格保持一致"""
-    
-    def __init__(self, widget, text, delay=500):
-        """
-        Args:
-            widget: 要添加提示的控件
-            text: 提示文本（支持多行，使用\n分隔）
-            delay: 显示延迟（毫秒）
-        """
-        self.widget = widget
-        self.text = text
-        self.delay = delay
-        self.tip_window = None
-        self.id = None
-        self.x = self.y = 0
-        # 防止被垃圾回收：将自身挂到控件上
-        try:
-            setattr(self.widget, "_tooltip", self)
-        except Exception:
-            pass
-        # 为有提示的控件增加统一的视觉标识（如下划线或“ⓘ”）
-        self._mark_widget_with_hint()
-        
-        # 绑定事件
-        self.widget.bind('<Enter>', self.on_enter)
-        self.widget.bind('<Leave>', self.on_leave)
-        self.widget.bind('<Motion>', self.on_motion)
-    
-    def _mark_widget_with_hint(self):
-        """为绑定了 Tooltip 的控件增加统一的视觉标识（幂等）"""
-        w = self.widget
-        try:
-            # 已经标记过则不重复处理
-            if getattr(w, "_has_tooltip_marker", False):
-                return
-            # 仅对常见文本控件添加标记，避免影响 Entry/Text 等输入内容
-            text_widgets = (tk.Label, tk.Checkbutton, tk.Radiobutton, ttk.Label, ttk.Checkbutton, ttk.Radiobutton)
-            if isinstance(w, text_widgets):
-                # 优先尝试使用带下划线的字体
-                try:
-                    font_name = w.cget("font")
-                except Exception:
-                    font_name = ""
-                if font_name:
-                    try:
-                        base_font = tkfont.nametofont(font_name)
-                        marker_font = base_font.copy()
-                        marker_font.configure(underline=1)
-                        w.configure(font=marker_font)
-                        setattr(w, "_tooltip_font", marker_font)
-                    except Exception:
-                        # 退化为在文本末尾追加“ⓘ”
-                        try:
-                            text = w.cget("text")
-                            if text and "ⓘ" not in text:
-                                w.configure(text=f"{text} ⓘ")
-                        except Exception:
-                            pass
-                else:
-                    # 没有字体配置时，仅追加“ⓘ”标记
-                    try:
-                        text = w.cget("text")
-                        if text and "ⓘ" not in text:
-                            w.configure(text=f"{text} ⓘ")
-                    except Exception:
-                        pass
-                setattr(w, "_has_tooltip_marker", True)
-        except Exception:
-            # 任何异常都静默忽略，不影响主界面
-            pass
-    
-    def on_enter(self, event=None):
-        """鼠标进入时，延迟显示提示"""
-        self.schedule()
-    
-    def on_leave(self, event=None):
-        """鼠标离开时，隐藏提示"""
-        self.unschedule()
-        self.hide_tip()
-    
-    def on_motion(self, event=None):
-        """鼠标移动时，更新提示位置"""
-        self.x = event.x_root + 10
-        self.y = event.y_root + 10
-    
-    def schedule(self):
-        """安排显示提示"""
-        self.unschedule()
-        self.id = self.widget.after(self.delay, self.show_tip)
-    
-    def unschedule(self):
-        """取消显示提示"""
-        if self.id:
-            self.widget.after_cancel(self.id)
-            self.id = None
-    
-    def show_tip(self):
-        """显示提示窗口"""
-        if self.tip_window:
-            return
-        
-        # 创建提示窗口
-        self.tip_window = tk.Toplevel(self.widget)
-        self.tip_window.wm_overrideredirect(True)  # 无边框
-        self.tip_window.wm_geometry(f"+{self.x}+{self.y}")
-        
-        # 设置样式
-        frame = tk.Frame(
-            self.tip_window,
-            bg=UIColors.WHITE,
-            relief='solid',
-            borderwidth=1,
-            highlightbackground=UIColors.BORDER,
-            highlightthickness=1
-        )
-        frame.pack(fill=tk.BOTH, expand=True)
-        
-        # 创建文本标签
-        label = tk.Label(
-            frame,
-            text=self.text,
-            bg=UIColors.WHITE,
-            fg=UIColors.TEXT_PRIMARY,
-            font=UIFonts.CAPTION,
-            justify=tk.LEFT,
-            wraplength=300,  # 自动换行宽度
-            padx=10,
-            pady=8
-        )
-        label.pack()
-        
-        # 更新位置（确保不超出屏幕）
-        self.tip_window.update_idletasks()
-        width = self.tip_window.winfo_width()
-        height = self.tip_window.winfo_height()
-        
-        # 获取屏幕尺寸
-        screen_width = self.widget.winfo_screenwidth()
-        screen_height = self.widget.winfo_screenheight()
-        
-        # 调整位置，避免超出屏幕
-        x = self.x
-        y = self.y
-        if x + width > screen_width:
-            x = screen_width - width - 10
-        if y + height > screen_height:
-            y = screen_height - height - 10
-        
-        self.tip_window.wm_geometry(f"+{x}+{y}")
-    
-    def hide_tip(self):
-        """隐藏提示窗口"""
-        if self.tip_window:
-            self.tip_window.destroy()
-            self.tip_window = None
+from core.services.report_service import regenerate_report
 
 
 class MonkeyTestGUI:
@@ -291,6 +99,8 @@ class MonkeyTestGUI:
 
     def __init__(self, root):
         self.root = root
+        # GUI 顶层上下文：后续子组件可复用
+        self.context = GuiContext(root=self.root, log_queue=queue.Queue())
         # Tk 主线程标识（用于线程安全更新 UI）
         try:
             import threading as _threading
@@ -359,6 +169,25 @@ class MonkeyTestGUI:
         self.tts_end_phrase_var = tk.StringVar(value="")
         self.tts_wake_phrase_var = tk.StringVar(value="")
         self.tts_wake_delay_var = tk.StringVar(value="2")
+        # TTS 播报间隔/音量（音量为百分比 0-100）
+        self.tts_interval_seconds_var = tk.StringVar(value="30")
+        self.tts_volume_percent_var = tk.StringVar(value="100")
+        # app.log 差异化采集配置
+        self.app_log_enabled_var = tk.BooleanVar(value=True)
+        self.app_log_extra_packages_var = tk.StringVar(value="")
+        self.app_log_package_process_map_var = tk.StringVar(value="")
+        self.app_log_include_process_names_var = tk.StringVar(value="")
+        self.app_log_levels_var = tk.StringVar(value="VDIWEF")
+        self.app_log_tags_include_var = tk.StringVar(value="")
+        self.app_log_tags_exclude_var = tk.StringVar(value="")
+        self.app_log_keywords_include_var = tk.StringVar(value="")
+        self.app_log_keywords_exclude_var = tk.StringVar(value="")
+        self.app_log_output_subdir_var = tk.StringVar(value="")
+        self.app_log_max_file_mb_var = tk.StringVar(value="50")
+        self.app_log_backup_count_var = tk.StringVar(value="3")
+        self.app_log_flush_interval_ms_var = tk.StringVar(value="500")
+        self.app_log_batch_lines_var = tk.StringVar(value="50")
+        self.app_log_pid_refresh_seconds_var = tk.StringVar(value="2")
         # 响应监控参数（广播/TTS 共用，当前仅 logcat 模式，不再支持 UI 正则；发送后立即开始监控）
         self.response_monitor_max_wait_appear_var = tk.StringVar(value="6")
         self.response_monitor_check_interval_var = tk.StringVar(value="0.1")
@@ -1686,6 +1515,42 @@ class MonkeyTestGUI:
         cfg["anr_recover_threshold"] = threshold
         return cfg
 
+    def _get_app_log_for_config(self):
+        """获取 app.log 采集配置（差异化采集策略）"""
+        def _num(var_attr, default, cast=float, min_v=None):
+            v = getattr(self, var_attr, None)
+            if v is None:
+                return default
+            try:
+                x = cast(v.get())
+            except Exception:
+                return default
+            if min_v is not None:
+                try:
+                    if x < min_v:
+                        return min_v
+                except Exception:
+                    return default
+            return x
+
+        return {
+            "enabled": bool(getattr(self, "app_log_enabled_var", tk.BooleanVar(value=True)).get()),
+            "extra_packages_csv": (getattr(self, "app_log_extra_packages_var", tk.StringVar(value="")).get() or "").strip(),
+            "package_process_map": (getattr(self, "app_log_package_process_map_var", tk.StringVar(value="")).get() or "").strip(),
+            "include_process_names_csv": (getattr(self, "app_log_include_process_names_var", tk.StringVar(value="")).get() or "").strip(),
+            "levels": (getattr(self, "app_log_levels_var", tk.StringVar(value="VDIWEF")).get() or "VDIWEF").strip(),
+            "tags_include_csv": (getattr(self, "app_log_tags_include_var", tk.StringVar(value="")).get() or "").strip(),
+            "tags_exclude_csv": (getattr(self, "app_log_tags_exclude_var", tk.StringVar(value="")).get() or "").strip(),
+            "keywords_include_csv": (getattr(self, "app_log_keywords_include_var", tk.StringVar(value="")).get() or "").strip(),
+            "keywords_exclude_csv": (getattr(self, "app_log_keywords_exclude_var", tk.StringVar(value="")).get() or "").strip(),
+            "output_subdir": (getattr(self, "app_log_output_subdir_var", tk.StringVar(value="")).get() or "").strip(),
+            "max_file_mb": _num("app_log_max_file_mb_var", 50.0, float, 1.0),
+            "backup_count": int(_num("app_log_backup_count_var", 3, int, 1)),
+            "flush_interval_ms": int(_num("app_log_flush_interval_ms_var", 500, int, 50)),
+            "batch_lines": int(_num("app_log_batch_lines_var", 50, int, 1)),
+            "pid_refresh_seconds": float(_num("app_log_pid_refresh_seconds_var", 2.0, float, 0.5)),
+        }
+
     def _collect_test_ui_config(self):
         """从各 tk 变量采集当前测试配置（用于保存）"""
         def _get_var(attr: str, default=""):
@@ -1767,7 +1632,10 @@ class MonkeyTestGUI:
                 "end_phrase": getattr(self, "tts_end_phrase_var", tk.StringVar(value="")).get().strip(),
                 "wake_phrase": getattr(self, "tts_wake_phrase_var", tk.StringVar(value="")).get().strip(),
                 "wake_delay_seconds": getattr(self, "tts_wake_delay_var", tk.StringVar(value="2")).get().strip(),
+                "interval_seconds": getattr(self, "tts_interval_seconds_var", tk.StringVar(value="30")).get().strip(),
+                "volume_percent": getattr(self, "tts_volume_percent_var", tk.StringVar(value="100")).get().strip(),
             },
+            "app_log": self._get_app_log_for_config(),
             "response_monitor": self._get_response_monitor_for_config(),
         }
 
@@ -1933,6 +1801,42 @@ class MonkeyTestGUI:
                 self.tts_wake_phrase_var.set(str(tts["wake_phrase"] or ""))
             if "wake_delay_seconds" in tts and tts["wake_delay_seconds"] is not None:
                 self.tts_wake_delay_var.set(str(tts["wake_delay_seconds"]))
+            if "interval_seconds" in tts and tts["interval_seconds"] is not None:
+                self.tts_interval_seconds_var.set(str(tts["interval_seconds"]))
+            if "volume_percent" in tts and tts["volume_percent"] is not None:
+                self.tts_volume_percent_var.set(str(tts["volume_percent"]))
+        app_log = cfg.get("app_log")
+        if isinstance(app_log, dict):
+            if "enabled" in app_log:
+                self.app_log_enabled_var.set(bool(app_log["enabled"]))
+            if "extra_packages_csv" in app_log:
+                self.app_log_extra_packages_var.set(str(app_log["extra_packages_csv"] or ""))
+            if "package_process_map" in app_log:
+                self.app_log_package_process_map_var.set(str(app_log["package_process_map"] or ""))
+            if "include_process_names_csv" in app_log:
+                self.app_log_include_process_names_var.set(str(app_log["include_process_names_csv"] or ""))
+            if "levels" in app_log:
+                self.app_log_levels_var.set(str(app_log["levels"] or "VDIWEF"))
+            if "tags_include_csv" in app_log:
+                self.app_log_tags_include_var.set(str(app_log["tags_include_csv"] or ""))
+            if "tags_exclude_csv" in app_log:
+                self.app_log_tags_exclude_var.set(str(app_log["tags_exclude_csv"] or ""))
+            if "keywords_include_csv" in app_log:
+                self.app_log_keywords_include_var.set(str(app_log["keywords_include_csv"] or ""))
+            if "keywords_exclude_csv" in app_log:
+                self.app_log_keywords_exclude_var.set(str(app_log["keywords_exclude_csv"] or ""))
+            if "output_subdir" in app_log:
+                self.app_log_output_subdir_var.set(str(app_log["output_subdir"] or ""))
+            if "max_file_mb" in app_log and app_log["max_file_mb"] is not None:
+                self.app_log_max_file_mb_var.set(str(app_log["max_file_mb"]))
+            if "backup_count" in app_log and app_log["backup_count"] is not None:
+                self.app_log_backup_count_var.set(str(app_log["backup_count"]))
+            if "flush_interval_ms" in app_log and app_log["flush_interval_ms"] is not None:
+                self.app_log_flush_interval_ms_var.set(str(app_log["flush_interval_ms"]))
+            if "batch_lines" in app_log and app_log["batch_lines"] is not None:
+                self.app_log_batch_lines_var.set(str(app_log["batch_lines"]))
+            if "pid_refresh_seconds" in app_log and app_log["pid_refresh_seconds"] is not None:
+                self.app_log_pid_refresh_seconds_var.set(str(app_log["pid_refresh_seconds"]))
 
         rm = cfg.get("response_monitor")
         if isinstance(rm, dict):
@@ -2183,6 +2087,22 @@ class MonkeyTestGUI:
             getattr(self, "response_monitor_max_wait_appear_var", None),
             getattr(self, "response_monitor_check_interval_var", None),
             getattr(self, "response_monitor_max_wait_disappear_var", None),
+            # app.log 精准采集配置
+            getattr(self, "app_log_enabled_var", None),
+            getattr(self, "app_log_extra_packages_var", None),
+            getattr(self, "app_log_package_process_map_var", None),
+            getattr(self, "app_log_include_process_names_var", None),
+            getattr(self, "app_log_levels_var", None),
+            getattr(self, "app_log_tags_include_var", None),
+            getattr(self, "app_log_tags_exclude_var", None),
+            getattr(self, "app_log_keywords_include_var", None),
+            getattr(self, "app_log_keywords_exclude_var", None),
+            getattr(self, "app_log_output_subdir_var", None),
+            getattr(self, "app_log_max_file_mb_var", None),
+            getattr(self, "app_log_backup_count_var", None),
+            getattr(self, "app_log_flush_interval_ms_var", None),
+            getattr(self, "app_log_batch_lines_var", None),
+            getattr(self, "app_log_pid_refresh_seconds_var", None),
         ]
         try:
             vars_to_trace.extend(list(self.module_vars.values()))
@@ -2311,8 +2231,8 @@ class MonkeyTestGUI:
             if self._mock_server and self._mock_server.is_running():
                 self.stop_mock_server_from_gui()
 
-            self._mock_server = mock_server_mod.MockServer(host=host, port=port)
-            self._mock_server.mock_responses = self.load_mock_rules()
+            self._mock_server = create_mock_server(host=host, port=port)
+            apply_rules(self._mock_server, self.load_mock_rules())
             self._mock_server.start()
             self._mock_server_started_by_gui = True
             self._update_mock_status_ui()
@@ -2929,8 +2849,8 @@ class MonkeyTestGUI:
         footer = tk.Frame(win, bg=UIColors.BG_LIGHT)
         footer.pack(fill=tk.X, padx=15, pady=(0, 12))
         hint_text = (
-            "提示：支持 Ctrl/Shift 多选；点击「🗑️ 删除」可批量删除；"
-            "在上方筛选区可按 SN/包名/状态/日期/版本过滤；双击行或点「📖 打开」查看报告。"
+            "支持 Ctrl/Shift 多选；点击「删除」可批量删除；"
+            "在上方筛选区可按 SN/包名/状态/日期/版本过滤；双击行或点「打开」查看报告。"
         )
         hint_lbl = tk.Label(
             footer,
@@ -4273,10 +4193,20 @@ class MonkeyTestGUI:
         if not pkg:
             return {}
         try:
-            r = subprocess.run([*adb_cmd, "-s", sn, "shell", "pm", "path", pkg], capture_output=True, text=True, timeout=10)
+            r = subprocess.run(
+                [*adb_cmd, "-s", sn, "shell", "pm", "path", pkg],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
             if "package:" not in (r.stdout or ""):
                 return {"missing": True}
-            r2 = subprocess.run([*adb_cmd, "-s", sn, "shell", "dumpsys", "package", pkg], capture_output=True, text=True, timeout=10)
+            r2 = subprocess.run(
+                [*adb_cmd, "-s", sn, "shell", "dumpsys", "package", pkg],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
             info = {"missing": False}
             if r2.stdout:
                 import re as _re
@@ -4324,7 +4254,12 @@ class MonkeyTestGUI:
             adb_cmd = self._get_adb_cmd()
             if not adb_cmd:
                 raise FileNotFoundError("未找到 adb（请在“ADB路径”选择 adb.exe，或将 adb 加入 PATH）")
-            result = subprocess.run([*adb_cmd, 'devices', '-l'], capture_output=True, text=True, timeout=10)
+            result = subprocess.run(
+                [*adb_cmd, "devices", "-l"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
             devices, pretty_lines = self._parse_adb_devices_output(result.stdout)
             self._adb_devices = devices
 
@@ -4512,7 +4447,12 @@ class MonkeyTestGUI:
                 adb_cmd = self._get_adb_cmd()
                 if not adb_cmd:
                     return
-                result = subprocess.run([*adb_cmd, 'devices', '-l'], capture_output=True, text=True, timeout=10)
+                result = subprocess.run(
+                    [*adb_cmd, "devices", "-l"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
                 devices, _pretty = self._parse_adb_devices_output(result.stdout)
                 # 用一个稳定key判断是否变化（避免每次都重刷UI导致闪烁）
                 key = "|".join([f"{sn}:{devices[sn].get('state')}" for sn in sorted(devices.keys())])
@@ -4578,6 +4518,30 @@ class MonkeyTestGUI:
                 return False, f"设备 {sn} 离线（请重新插拔/重连）"
             return False, f"设备 {sn} 不可用（状态：{state}）"
         return True, ""
+
+    def _get_stability_target_sn_list(self) -> list[str]:
+        """
+        稳定性测试的目标设备列表来源统一：
+        - 优先 multi_devices_var（多设备输入）
+        - 否则回退 device_sn_var（单设备选择）
+        """
+        sn_list: list[str] = []
+        try:
+            if getattr(self, "multi_devices_var", None) is not None:
+                raw = (self.multi_devices_var.get() or "").strip()
+                if raw:
+                    sn_list = raw.split()
+        except Exception:
+            sn_list = []
+        if not sn_list:
+            try:
+                raw = (self.device_sn_var.get() or "").strip()
+                if raw:
+                    sn_list = [raw]
+            except Exception:
+                sn_list = []
+        # 去掉空串，保证至少一次调用后可控
+        return [s for s in sn_list if (s or "").strip()]
 
     def _install_and_verify_apk(self, device_sn: str, apk_path: str) -> tuple:
         """
@@ -4648,7 +4612,7 @@ class MonkeyTestGUI:
                 base_cmd + ["shell", "pm", "path", package.name],
                 capture_output=True,
                 text=True,
-                timeout=10,
+                timeout=5,
             )
             if "package:" not in (v.stdout or ""):
                 return False, f"安装验证失败：设备上未找到应用 {package.name}"
@@ -5085,8 +5049,27 @@ class MonkeyTestGUI:
         if not self.device_sn_var.get():
             messagebox.showerror("❌ 错误", "请输入设备序列号")
             return
-        # 设备选择验证：至少确保当前设备可连接（对多设备场景也给出提示）
-        ok, msg = self.validate_selected_device(self.device_sn_var.get())
+        # 设备选择验证：确保稳定性测试实际目标设备可连接
+        sn_list = self._get_stability_target_sn_list()
+        if not sn_list:
+            messagebox.showerror("❌ 错误", "未找到稳定性测试目标设备序列号")
+            return
+
+        ok, msg = self.validate_selected_device(sn_list[0])
+        if not ok:
+            # 如果 multi_devices_var 残留了旧设备，且当前 device_sn_var 是可用设备，则自动切换到它
+            current_single = (self.device_sn_var.get() or "").strip()
+            if current_single and current_single != sn_list[0]:
+                ok2, _ = self.validate_selected_device(current_single)
+                if ok2:
+                    sn_list = [current_single]
+                    try:
+                        # 同步到多设备输入框，避免后续 run_stability_test 仍用旧值
+                        self.multi_devices_var.set(current_single)
+                    except Exception:
+                        pass
+                    ok, msg = True, ""
+
         if not ok:
             messagebox.showerror("❌ 设备不可用", msg)
             return
@@ -5097,7 +5080,7 @@ class MonkeyTestGUI:
         if not pkg:
             messagebox.showerror("❌ 错误", "请选择设备上已安装的应用包名（点击“扫描”）")
             return
-        info = self._get_installed_app_basic_info((self.device_sn_var.get() or "").strip(), pkg)
+        info = self._get_installed_app_basic_info((sn_list[0] or "").strip(), pkg)
         if info.get("missing"):
             messagebox.showerror("❌ 包不存在", f"设备上未安装包名：{pkg}")
             return
@@ -5161,10 +5144,15 @@ class MonkeyTestGUI:
             else:
                 duration_hours = max(dur_value, 0.0)
 
+            # 统一目标设备列表与 start_stability_test 校验逻辑一致
+            sn_list = self._get_stability_target_sn_list()
+            if not sn_list:
+                sn_list = [(self.device_sn_var.get() or "").strip()]
+
             # 构建基础参数
             params = {
                 'mode': 'stability',
-                'sn_list': self.multi_devices_var.get().split(),
+                'sn_list': sn_list,
                 'config_path': None,
                 'duration': duration_hours,
                 'use_mock_server': not self.no_mock_server_var.get(),
@@ -5190,8 +5178,9 @@ class MonkeyTestGUI:
             project_log.set_up()
 
             # 用子进程执行 pytest（可通过 stop_test 强制终止）
-            from main import build_pytest_args
-            pytest_args = build_pytest_args(params)
+            from core.services.stability_service import StabilityTestService
+            plan = StabilityTestService.plan_from_params(params)
+            pytest_args = StabilityTestService.build_pytest_args(plan)
             cmd = [sys.executable, "-m", "pytest", *pytest_args]
             exit_code = self._run_test_subprocess(cmd, title="稳定性测试")
             if exit_code != 0 and self.is_testing:
@@ -5954,48 +5943,134 @@ class MonkeyTestGUI:
             "唤醒后等待时间：\n-单位：秒，默认 2 秒。\n-播放完唤醒词后，等待多少秒再播放实际测试语料。"
         )
 
+        tts_interval_label = tk.Label(bc_frame, text="TTS 间隔(秒):", font=UIFonts.BODY, bg=UIColors.WHITE)
+        tts_interval_label.grid(row=7, column=0, sticky=tk.W, pady=4)
+        tts_interval_entry = tk.Entry(
+            bc_frame,
+            textvariable=getattr(self, "tts_interval_seconds_var", tk.StringVar(value="30")),
+            font=UIFonts.BODY,
+            width=10,
+        )
+        tts_interval_entry.grid(row=7, column=1, sticky=tk.W, padx=(10, 0), pady=4)
+        ToolTip(
+            tts_interval_label,
+            "TTS 播报间隔：\n-单位：秒，默认 30 秒。\n-每条正文播报（含唤醒词/等待）完成后，会按该间隔进入下一条。\n-启用响应监控时，会根据实际耗时补齐剩余间隔。"
+        )
+
+        tts_volume_label = tk.Label(bc_frame, text="TTS 音量(%):", font=UIFonts.BODY, bg=UIColors.WHITE)
+        tts_volume_label.grid(row=8, column=0, sticky=tk.W, pady=4)
+        tts_volume_entry = tk.Entry(
+            bc_frame,
+            textvariable=getattr(self, "tts_volume_percent_var", tk.StringVar(value="100")),
+            font=UIFonts.BODY,
+            width=10,
+        )
+        tts_volume_entry.grid(row=8, column=1, sticky=tk.W, padx=(10, 0), pady=4)
+        ToolTip(
+            tts_volume_label,
+            "TTS 播报音量：\n-范围 0–100，默认 100。\n-该音量用于 TTS 引擎输出音量（pyttsx3 volume），并不会改变系统主音量。\n-若耳机仍偏小，请同时提高系统音量或耳机自身音量。"
+        )
+
         # 响应监控参数（广播/TTS 共用，仅 logcat 模式，发送后立即开始监控）
         max_appear_label = tk.Label(bc_frame, text="最大等待出现(秒):", font=UIFonts.BODY, bg=UIColors.WHITE)
-        max_appear_label.grid(row=7, column=0, sticky=tk.W, pady=4)
+        max_appear_label.grid(row=9, column=0, sticky=tk.W, pady=4)
         max_appear_entry = tk.Entry(bc_frame, textvariable=getattr(self, "response_monitor_max_wait_appear_var", tk.StringVar(value="6")), font=UIFonts.BODY, width=10)
-        max_appear_entry.grid(row=7, column=1, sticky=tk.W, padx=(10, 0), pady=4)
+        max_appear_entry.grid(row=9, column=1, sticky=tk.W, padx=(10, 0), pady=4)
         ToolTip(
             max_appear_label,
             "最大等待出现时间：\n-单位：秒。\n-在发送Hint/TTS 后，最多等待多少秒内出现“响应已显示”的标志。\n-典型取值 3–10 秒，过小可能误判 ANR。"
         )
         check_interval_label = tk.Label(bc_frame, text="检测间隔(秒):", font=UIFonts.BODY, bg=UIColors.WHITE)
-        check_interval_label.grid(row=8, column=0, sticky=tk.W, pady=4)
+        check_interval_label.grid(row=10, column=0, sticky=tk.W, pady=4)
         check_interval_entry = tk.Entry(bc_frame, textvariable=getattr(self, "response_monitor_check_interval_var", tk.StringVar(value="0.1")), font=UIFonts.BODY, width=10)
-        check_interval_entry.grid(row=8, column=1, sticky=tk.W, padx=(10, 0), pady=4)
+        check_interval_entry.grid(row=10, column=1, sticky=tk.W, padx=(10, 0), pady=4)
         ToolTip(
             check_interval_label,
             "检测间隔：\n-单位：秒。\n-控制轮询 logcat 的频率，间隔越小监控越精细，但 logcat 开销越大。\n-建议范围 0.05–1.0。"
         )
         max_disappear_label = tk.Label(bc_frame, text="最大等待消失(秒):", font=UIFonts.BODY, bg=UIColors.WHITE)
-        max_disappear_label.grid(row=9, column=0, sticky=tk.W, pady=4)
+        max_disappear_label.grid(row=11, column=0, sticky=tk.W, pady=4)
         max_disappear_entry = tk.Entry(bc_frame, textvariable=getattr(self, "response_monitor_max_wait_disappear_var", tk.StringVar(value="300")), font=UIFonts.BODY, width=10)
-        max_disappear_entry.grid(row=9, column=1, sticky=tk.W, padx=(10, 0), pady=4)
+        max_disappear_entry.grid(row=11, column=1, sticky=tk.W, padx=(10, 0), pady=4)
         ToolTip(
             max_disappear_label,
             "最大等待消失时间：\n-单位：秒。\n-控制“响应卡片/界面”在出现后，最多允许停留多久仍未消失。\n-超过该时间将视为超时（timeout_disappear）。"
         )
         anr_threshold_label = tk.Label(bc_frame, text="连续 ANR/无响应次数阈值:", font=UIFonts.BODY, bg=UIColors.WHITE)
-        anr_threshold_label.grid(row=10, column=0, sticky=tk.W, pady=4)
+        anr_threshold_label.grid(row=12, column=0, sticky=tk.W, pady=4)
         anr_threshold_entry = tk.Entry(
             bc_frame,
             textvariable=getattr(self, "response_monitor_anr_recover_threshold_var", tk.StringVar(value="1")),
             font=UIFonts.BODY,
             width=10,
         )
-        anr_threshold_entry.grid(row=10, column=1, sticky=tk.W, padx=(10, 0), pady=4)
+        anr_threshold_entry.grid(row=12, column=1, sticky=tk.W, padx=(10, 0), pady=4)
         ToolTip(
             anr_threshold_label,
             "连续 ANR/无响应次数阈值：\n-0：禁用自动杀进程并重拉应用，仅记录 ANR。\n-正整数 N：连续 N 次 timeout_appear/timeout_disappear/error 后才触发自动重拉。\n示例：1=首次无响应即重拉；3=连续 3 次无响应才重拉。"
         )
         ToolTip(broadcast_tts_card, "广播模式：adb broadcast 发送Hint；TTS 模式：PC 端播放语音，设备麦克风接收。响应监控：仅基于 logcat 关键字与时间参数统计响应与展示时长。")
 
+        # app.log 差异化采集配置
+        app_log_card = self.create_card_grid(content, "🧾 App Log 精准采集", row=3, column=0, columnspan=2, sticky="ew", padx=0, pady=(0, 10))
+        app_log_frame = tk.Frame(app_log_card, bg=UIColors.WHITE)
+        app_log_frame.pack(fill=tk.X, padx=5, pady=5)
+        app_log_frame.grid_columnconfigure(1, weight=1)
+        app_log_frame.grid_columnconfigure(3, weight=1)
+
+        app_log_enabled_cb = tk.Checkbutton(
+            app_log_frame,
+            text="启用 App Log 精准采集（推荐）",
+            variable=getattr(self, "app_log_enabled_var", tk.BooleanVar(value=True)),
+            bg=UIColors.WHITE,
+            font=UIFonts.BODY,
+            cursor="hand2",
+        )
+        app_log_enabled_cb.grid(row=0, column=0, columnspan=4, sticky=tk.W, pady=(2, 6))
+
+        tk.Label(app_log_frame, text="额外包名(逗号分隔):", font=UIFonts.BODY, bg=UIColors.WHITE).grid(row=1, column=0, sticky=tk.W, pady=4)
+        tk.Entry(app_log_frame, textvariable=getattr(self, "app_log_extra_packages_var", tk.StringVar(value="")), font=UIFonts.BODY).grid(row=1, column=1, sticky=tk.EW, padx=(8, 14), pady=4)
+        tk.Label(app_log_frame, text="进程名(逗号分隔):", font=UIFonts.BODY, bg=UIColors.WHITE).grid(row=1, column=2, sticky=tk.W, pady=4)
+        tk.Entry(app_log_frame, textvariable=getattr(self, "app_log_include_process_names_var", tk.StringVar(value="")), font=UIFonts.BODY).grid(row=1, column=3, sticky=tk.EW, padx=(8, 0), pady=4)
+
+        tk.Label(app_log_frame, text="包名-进程映射:", font=UIFonts.BODY, bg=UIColors.WHITE).grid(row=2, column=0, sticky=tk.W, pady=4)
+        tk.Entry(app_log_frame, textvariable=getattr(self, "app_log_package_process_map_var", tk.StringVar(value="")), font=UIFonts.BODY).grid(row=2, column=1, columnspan=3, sticky=tk.EW, padx=(8, 0), pady=4)
+
+        tk.Label(app_log_frame, text="级别过滤:", font=UIFonts.BODY, bg=UIColors.WHITE).grid(row=3, column=0, sticky=tk.W, pady=4)
+        tk.Entry(app_log_frame, textvariable=getattr(self, "app_log_levels_var", tk.StringVar(value="VDIWEF")), font=UIFonts.BODY, width=14).grid(row=3, column=1, sticky=tk.W, padx=(8, 14), pady=4)
+        tk.Label(app_log_frame, text="包含TAG(逗号):", font=UIFonts.BODY, bg=UIColors.WHITE).grid(row=3, column=2, sticky=tk.W, pady=4)
+        tk.Entry(app_log_frame, textvariable=getattr(self, "app_log_tags_include_var", tk.StringVar(value="")), font=UIFonts.BODY).grid(row=3, column=3, sticky=tk.EW, padx=(8, 0), pady=4)
+
+        tk.Label(app_log_frame, text="排除TAG(逗号):", font=UIFonts.BODY, bg=UIColors.WHITE).grid(row=4, column=0, sticky=tk.W, pady=4)
+        tk.Entry(app_log_frame, textvariable=getattr(self, "app_log_tags_exclude_var", tk.StringVar(value="")), font=UIFonts.BODY).grid(row=4, column=1, sticky=tk.EW, padx=(8, 14), pady=4)
+        tk.Label(app_log_frame, text="包含关键词(逗号):", font=UIFonts.BODY, bg=UIColors.WHITE).grid(row=4, column=2, sticky=tk.W, pady=4)
+        tk.Entry(app_log_frame, textvariable=getattr(self, "app_log_keywords_include_var", tk.StringVar(value="")), font=UIFonts.BODY).grid(row=4, column=3, sticky=tk.EW, padx=(8, 0), pady=4)
+
+        tk.Label(app_log_frame, text="排除关键词(逗号):", font=UIFonts.BODY, bg=UIColors.WHITE).grid(row=5, column=0, sticky=tk.W, pady=4)
+        tk.Entry(app_log_frame, textvariable=getattr(self, "app_log_keywords_exclude_var", tk.StringVar(value="")), font=UIFonts.BODY).grid(row=5, column=1, sticky=tk.EW, padx=(8, 14), pady=4)
+        tk.Label(app_log_frame, text="输出子目录:", font=UIFonts.BODY, bg=UIColors.WHITE).grid(row=5, column=2, sticky=tk.W, pady=4)
+        tk.Entry(app_log_frame, textvariable=getattr(self, "app_log_output_subdir_var", tk.StringVar(value="")), font=UIFonts.BODY).grid(row=5, column=3, sticky=tk.EW, padx=(8, 0), pady=4)
+
+        tk.Label(app_log_frame, text="单文件上限(MB):", font=UIFonts.BODY, bg=UIColors.WHITE).grid(row=6, column=0, sticky=tk.W, pady=4)
+        tk.Entry(app_log_frame, textvariable=getattr(self, "app_log_max_file_mb_var", tk.StringVar(value="50")), font=UIFonts.BODY, width=10).grid(row=6, column=1, sticky=tk.W, padx=(8, 14), pady=4)
+        tk.Label(app_log_frame, text="备份份数:", font=UIFonts.BODY, bg=UIColors.WHITE).grid(row=6, column=2, sticky=tk.W, pady=4)
+        tk.Entry(app_log_frame, textvariable=getattr(self, "app_log_backup_count_var", tk.StringVar(value="3")), font=UIFonts.BODY, width=10).grid(row=6, column=3, sticky=tk.W, padx=(8, 0), pady=4)
+
+        tk.Label(app_log_frame, text="刷新PID秒:", font=UIFonts.BODY, bg=UIColors.WHITE).grid(row=7, column=0, sticky=tk.W, pady=4)
+        tk.Entry(app_log_frame, textvariable=getattr(self, "app_log_pid_refresh_seconds_var", tk.StringVar(value="2")), font=UIFonts.BODY, width=10).grid(row=7, column=1, sticky=tk.W, padx=(8, 14), pady=4)
+        tk.Label(app_log_frame, text="批量行数:", font=UIFonts.BODY, bg=UIColors.WHITE).grid(row=7, column=2, sticky=tk.W, pady=4)
+        tk.Entry(app_log_frame, textvariable=getattr(self, "app_log_batch_lines_var", tk.StringVar(value="50")), font=UIFonts.BODY, width=10).grid(row=7, column=3, sticky=tk.W, padx=(8, 0), pady=4)
+
+        tk.Label(app_log_frame, text="落盘周期(ms):", font=UIFonts.BODY, bg=UIColors.WHITE).grid(row=8, column=0, sticky=tk.W, pady=4)
+        tk.Entry(app_log_frame, textvariable=getattr(self, "app_log_flush_interval_ms_var", tk.StringVar(value="500")), font=UIFonts.BODY, width=10).grid(row=8, column=1, sticky=tk.W, padx=(8, 14), pady=4)
+
+        ToolTip(
+            app_log_card,
+            "App Log 精准采集：\n-默认监控当前 APK 进程，可附加多个包名与进程名。\n-支持级别/TAG/关键词过滤、文件轮转和实时落盘策略。\n-包名-进程映射格式示例：com.demo.app:main,remote;com.demo.other:worker。"
+        )
+
         # 4) 测试选项
-        opts_card = self.create_card_grid(content, "⚙️ 测试选项", row=1, column=1, sticky="nsew", padx=(10, 0), pady=(0, 10))
+        opts_card = self.create_card_grid(content, "⚙️ 测试选项", row=4, column=1, sticky="nsew", padx=(10, 0), pady=(0, 10))
         opts = [
             ("建立性能基线", self.baseline_establish_var,
              "建立性能基线：\n-在本次测试结束后，将当前性能结果保存为基线。\n-适合在版本较稳定时执行，用于后续版本对比。"),
@@ -6023,7 +6098,7 @@ class MonkeyTestGUI:
         opts_card.grid_columnconfigure(1, weight=1)
 
         # 5) Monkey 遮罩区域（与稳定性强相关，也放在此子窗口中）
-        mask_card = self.create_card_grid(content, "🔲 Monkey 遮罩区域（百分比 0.0 - 100.0）", row=1, column=0, sticky="nsew", padx=(0, 10), pady=(0, 10))
+        mask_card = self.create_card_grid(content, "🔲 Monkey 遮罩区域（百分比 0.0 - 100.0）", row=4, column=0, sticky="nsew", padx=(0, 10), pady=(0, 10))
         mask_form = tk.Frame(mask_card, bg=UIColors.WHITE)
         mask_form.pack(fill=tk.X, pady=5)
         mask_form.grid_columnconfigure(1, weight=1)

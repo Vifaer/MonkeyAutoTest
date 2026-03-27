@@ -170,8 +170,8 @@ dist/MonkeyTestGUI.exe
 # 安装uv（如果尚未安装）
 pip install uv
 
-# 在项目根目录下同步依赖
-cd d:\codes\MonkeyAutoTest
+# 进入项目根目录后执行
+cd MonkeyAutoTest  # 或使用您的项目实际路径
 uv sync
 
 # 或者只安装运行时依赖
@@ -199,6 +199,7 @@ pip install mitmproxy pytest pytest-html pytest-cov pytest-timeout pytest-xdist 
 - **ADB配置**：在项目根目录下的 `tools/adb/` 中放置 `adb.exe`，程序会自动优先使用内置adb
 - **aapt配置**：在 `tools/aapt/` 中放置 `aapt.exe`，用于APK包名和启动Activity解析
 - **配置文件**：确保 `conf/project.json` 和 `conf/mail.ini` 存在并正确配置
+- **GUI 配置**：`conf/test_ui_config.json` 与 `baselines/performance_baseline.json` 已被 .gitignore 排除，首次使用可复制对应 `.example` 文件并重命名
 
 ## 配置说明
 
@@ -679,3 +680,16 @@ A: 检查设备是否发热严重，可能导致降频影响性能数据
 - `crash_anr.log` 记录所有崩溃和ANR事件
 - `performance.log` 包含性能监控数据
 - 使用 `--html-report` 参数生成可视化报告
+
+## 工程化与代码质量
+
+- **静态检查与格式化**
+  - **ruff 检查**：`ruff check .`
+  - **ruff 格式化**：`ruff format .`
+- **类型检查**
+  - 对核心目录做类型检查：`mypy core infra gui`
+- **测试与覆盖率**
+  - 运行全部测试：`pytest`
+  - 查看覆盖率（已在 `pyproject.toml` 中设置默认参数）：`pytest -q`
+
+如需查看更详细的代码规范与贡献指南，可参考根目录下的 `CODING_STYLE.md` 与 `CONTRIBUTING.md`。

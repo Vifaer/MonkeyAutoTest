@@ -21,7 +21,29 @@ from utils.stress_monitor import StressMonitor
 from utils.run_control import is_paused, wait_while_paused_or_timeout, PAUSE_TIMEOUT_SECONDS
 
 
-def _play_tts_via_subprocess(text: str, timeout: int = 60) -> bool:
+def _coerce_volume_to_0_1(volume_percent) -> float:
+    """
+    将音量配置归一化到 [0.0, 1.0]。
+    - 支持 0-100（GUI 保存的百分比）
+    - 支持 0.0-1.0（直接配置浮点）
+    - 非法值回退 1.0
+    """
+    if volume_percent is None or volume_percent == "":
+        return 1.0
+    try:
+        v = float(volume_percent)
+    except Exception:
+        return 1.0
+    # 兼容用户直接填 0-1
+    if 0.0 <= v <= 1.0:
+        return max(0.0, min(1.0, v))
+    # 兼容百分比
+    if v > 1.0:
+        v = v / 100.0
+    return max(0.0, min(1.0, v))
+
+
+def _play_tts_via_subprocess(text: str, *, volume: float = 1.0, timeout: int = 60) -> bool:
     """
     在独立子进程中执行 TTS 播放，每次调用使用全新引擎，避免 pyttsx3 在 Windows 上
     复用引擎导致后续播放无声音的问题。
@@ -29,11 +51,16 @@ def _play_tts_via_subprocess(text: str, timeout: int = 60) -> bool:
     try:
         # 使用 base64 避免引号/换行等特殊字符导致命令行解析错误
         text_b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
+        vol = max(0.0, min(1.0, float(volume)))
         code = f"""
 import base64
 import pyttsx3
 text = base64.b64decode({repr(text_b64)}).decode('utf-8')
 engine = pyttsx3.init()
+try:
+    engine.setProperty('volume', {vol!r})
+except Exception:
+    pass
 engine.say(text)
 engine.runAndWait()
 """
@@ -123,7 +150,14 @@ class TTSStressTest:
         使用 pyttsx3 播放文本语音。
         默认通过独立子进程执行，每次调用使用全新引擎，确保 Windows 下持续、稳定播放。
         """
-        return _play_tts_via_subprocess(text)
+        return _play_tts_via_subprocess(text, volume=self.tts_volume)
+
+    def _append_tts_log(self, line: str) -> None:
+        try:
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
 
     def _restart_service_and_wait(self):
         """终止当前应用进程并重新拉起到前台，等待 10 秒让应用完全启动和稳定后继续。"""
@@ -150,8 +184,14 @@ class TTSStressTest:
     def run_tts_stress_test(self, progress_cb: Optional[Callable[[dict], None]] = None):
         """执行 TTS 模式压力测试（可选 progress_cb 用于实时上报进度）"""
         texts = self._load_texts()
-        interval_seconds = int(self.config.get("interval_seconds", 30))
+        try:
+            interval_seconds = int(float(self.config.get("interval_seconds", 30)))
+        except Exception:
+            interval_seconds = 30
+        if interval_seconds < 0:
+            interval_seconds = 0
         duration_hours = float(self.config.get("duration_hours", 12))
+        self.tts_volume = _coerce_volume_to_0_1((self.config or {}).get("volume_percent", 100))
 
         run_ts = datetime.now().strftime("%Y%m%d%H%M%S")
         self._run_log_dir = os.path.join("logs", str(self.device.sn), run_ts)
@@ -180,6 +220,8 @@ class TTSStressTest:
             f.write(f"Duration: {duration_hours} hours\n")
             f.write(f"Package: {self.package.name}\n")
             f.write(f"Texts: {len(texts)} items\n")
+            f.write(f"TTS interval_seconds: {interval_seconds}\n")
+            f.write(f"TTS volume: {self.tts_volume:.2f}\n")
             f.write("-" * 50 + "\n")
 
         monitor = StressMonitor(self.device, self.package, self.config)
@@ -187,9 +229,14 @@ class TTSStressTest:
         monitor._stop_logcat.clear()
 
         monitor_thread = monitor.start_monitoring_thread(result, 2, perf_log_path)
-        logcat_thread = monitor.start_logcat_capture(self.logcat_log_path)
+        logcat_thread = monitor.start_logcat_capture(self.logcat_log_path, clear_before=True)
         # 基于 PID 的实时应用日志（与 Monkey 模式一致，规则等同 adb logcat -s <pkg>:V AndroidRuntime:E 的采集范围）
         monitor.start_app_log_capture(os.path.join(self._run_log_dir, "app.log"))
+        # 应用私有目录日志（如 NaviLogs）增量拉取（准实时）
+        try:
+            monitor.start_app_private_logs_incremental_monitor(self._run_log_dir, reason="test_running")
+        except Exception:
+            pass
         # 监控设备异常目录（/data/anr, /data/tombstones）
         try:
             monitor.start_exception_file_monitor(self._run_log_dir)
@@ -242,40 +289,49 @@ class TTSStressTest:
                         break
                 text = texts[text_index % len(texts)]
                 text_index += 1
-                text_send_time = datetime.now()
                 try:
                     # 每条主测试文本前按需插入结束词和唤醒词
                     if tts_available:
                         try:
                             if getattr(self, "end_phrase", ""):
-                                if self._play_tts(self.end_phrase):
+                                ok = self._play_tts(self.end_phrase)
+                                if ok:
                                     msg = f"[TTS] 播放结束词: {self.end_phrase[:50]}"
                                     logging.info(msg)
-                                    with open(self.log_path, "a", encoding="utf-8") as f:
-                                        f.write(msg + "\n")
+                                    self._append_tts_log(msg)
+                                else:
+                                    msg = "[TTS] 结束词播放失败（可能是系统音频设备/驱动或 TTS 引擎异常）"
+                                    logging.warning(msg)
+                                    self._append_tts_log(msg)
                                 time.sleep(0.3)
                         except Exception as _e:
                             logging.debug(f"TTS 结束词播放异常: {_e}")
                         try:
                             if getattr(self, "wake_phrase", ""):
-                                if self._play_tts(self.wake_phrase):
+                                ok = self._play_tts(self.wake_phrase)
+                                if ok:
                                     msg = f"[TTS] 播放唤醒词: {self.wake_phrase[:50]}"
                                     logging.info(msg)
-                                    with open(self.log_path, "a", encoding="utf-8") as f:
-                                        f.write(msg + "\n")
+                                    self._append_tts_log(msg)
+                                else:
+                                    msg = "[TTS] 唤醒词播放失败（可能是系统音频设备/驱动或 TTS 引擎异常）"
+                                    logging.warning(msg)
+                                    self._append_tts_log(msg)
                                 delay = float(getattr(self, "wake_delay", 2.0) or 0.0)
                                 if delay > 0:
                                     time.sleep(delay)
                         except Exception as _e:
                             logging.debug(f"TTS 唤醒词播放异常: {_e}")
 
+                    # 将“发送时间/计时点”定义在正文播放之前（避免唤醒词/等待影响响应监控与间隔补齐）
+                    text_send_time = datetime.now()
+
                     if tts_available and self._play_tts(text):
                         result["tts_played"] += 1
                         # logging 已带 [时间] 前缀，这里只保留业务信息
                         log_msg = f"TTS #{result['tts_played']}: {text[:50]}..."
                         logging.info(log_msg)
-                        with open(self.log_path, "a", encoding="utf-8") as f:
-                            f.write(log_msg + "\n")
+                        self._append_tts_log(log_msg)
                         
                         if response_monitor_enabled:
                             # 响应监控：检测"由XXX模型生成"等 UI 文本（仅当 config.response_monitor.enabled=True 时启用）
@@ -412,6 +468,12 @@ class TTSStressTest:
             monitor.maybe_collect_bugreport(self._run_log_dir, reason="test_end")
         except Exception as e:
             logging.warning("导出 bugreport 失败（可忽略）: %s", e)
+
+        # 拉取应用私有目录日志（例如 NaviLogs），用于补充排查
+        try:
+            monitor.maybe_collect_app_private_logs(self._run_log_dir, reason="test_end")
+        except Exception as e:
+            logging.warning("拉取应用私有日志失败（可忽略）: %s", e)
 
         result["actual_end_time"] = datetime.now().isoformat()
         end_time = datetime.now()
