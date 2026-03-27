@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Monkey自动化测试工具 - GUI版本
+端侧自动化测试工具 - GUI版本
 车载端侧应用自动化测试工具的图形界面
 
 作者: MonkeyAutoTest Team
@@ -95,7 +95,7 @@ from core.services.report_service import regenerate_report
 
 
 class MonkeyTestGUI:
-    """Monkey自动化测试工具GUI主类"""
+    """端侧自动化测试工具GUI主类"""
 
     def __init__(self, root):
         self.root = root
@@ -107,7 +107,7 @@ class MonkeyTestGUI:
             self._ui_thread_id = _threading.get_ident()
         except Exception:
             self._ui_thread_id = None
-        self.root.title("Monkey自动化测试工具 v1.0.0")
+        self.root.title("端侧自动化测试工具 v1.0.0")
         self.root.geometry("1200x800")
         # 最小尺寸：避免过度压缩导致不可用；但允许更小以适配低分辨率
         self.root.minsize(980, 680)
@@ -797,7 +797,7 @@ class MonkeyTestGUI:
         # 主标题（在标题容器中居中）
         title_label = tk.Label(
             title_container,
-            text="🚀 Monkey自动化测试工具",
+            text="🚀 端侧自动化测试工具",
             font=UIFonts.TITLE,
             fg=UIColors.TEXT_PRIMARY,
             bg=UIColors.WHITE
