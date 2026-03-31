@@ -19,3 +19,4 @@ logs/
 conf/test_ui_config.json
 baselines/performance_baseline.json
 .coverage
+records/

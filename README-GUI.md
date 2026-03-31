@@ -149,7 +149,47 @@ python gui_main.py
 - `响应监控参数`：影响超时判定与 ANR 统计敏感度
 - `App Log 参数`：影响采集范围、过滤精度与磁盘占用
 
-## 7. 截图说明（占位）
+## 7. 设备控制（投屏/录屏）
+
+设备控制页签支持两类独立会话：
+
+- 投屏（Mirror）：用于实时展示设备画面，并可进行触控交互
+- 录屏（Record）：用于生成文件（视频 + 系统音 + 环境/麦克风声音 + app.log），且与投屏开始/停止时间解耦
+
+### 7.1 投屏（Mirror）
+
+- 点击 `开始投屏`：启动一个独立的 `scrcpy` 投屏窗口
+- 点击 `停止投屏`：仅停止本会话启动的 `scrcpy` 进程树（不会影响稳定性测试等其它 `adb` 使用）
+
+### 7.2 录屏（Record）
+
+- 点击 `开始录制`：启动双路 `scrcpy`（画面+系统音 + 麦克风/环境音），麦克风来源可在录屏卡片中切换（设备麦克风 / 电脑麦克风(dshow)），同时启动精准 `app.log` 采集（基于 PID/级别/TAG/关键词过滤）
+- 点击 `停止录制并合成`：先结束两个 `scrcpy`，等待一段时间确保日志落盘；然后从本次 session 的 `app.log` 中按“开始/结束时间窗”高效截取日志，生成最终日志，再调用 `ffmpeg` 混音并封装生成最终 MP4
+- 输出目录与精准 `app.log` 同目录：`<records_dir>/<device_sn>/<YYYYMMDD_HHMMSS>/`（其中 `YYYYMMDD_HHMMSS` 为本次录制开始时间）
+- 录屏卡片里的“录音麦克风”用于选择音频来源：
+  - 勾选：使用设备端麦克风（scrcpy）
+  - 不勾选：使用电脑端 dshow（PC端环境声），并跳过设备端 mic；此时才需要在下方选择 dshow 音频源设备
+
+命名规则（以 `record_basename` 为前缀）：
+
+- 临时前缀：`<record_basename>_<start_YYYYMMDD_HHMMSS>`
+- 临时视频：`<temp_prefix>_video_tmp.mkv`
+- 临时麦克风音频：`<temp_prefix>_mic_tmp.*`（会扫描最新且非空的临时音频参与混音）
+- 临时 logcat 捕获：`logcat.log`（录制结束后按同一时间窗切片输出最终文件）
+- 最终合成 MP4：`<record_basename>_<start_HHMMSS>-<end_HHMMSS>_final.mp4`
+- 最终日志：`<record_basename>_<start_HHMMSS>-<end_HHMMSS>_final_app.log`
+- 最终 logcat 切片：`<record_basename>_<start_HHMMSS>-<end_HHMMSS>_final_logcat.log`
+- 精准采集文件：`app.log`（仅用于切片；若勾选 `停止录制后删除临时文件`，会在合成后删除）
+
+### 7.3 日志抓取与注意事项
+
+- 录屏日志来自两步：
+- 先用精准 `app.log` 采集写入本次 session 的 `app.log`（不再使用全量 `adb logcat` 抓取）
+- 停止录制后，从本次 `app.log` 按“开始/结束时间戳”截取对应时间窗，写出最终 `<record_basename>_<start_HHMMSS>-<end_HHMMSS>_final_app.log`
+- 同步写入全量 `logcat.log`，停止录制后按同一时间窗切片，写出最终 `<record_basename>_<start_HHMMSS>-<end_HHMMSS>_final_logcat.log`
+- 可选项：`开始录制前清空 logcat`（默认关闭）。该操作会清空设备 logcat 缓冲区，可能影响并行稳定性采集，建议仅在需要“从零开始对齐时间戳”时开启
+
+## 8. 截图说明（占位）
 
 当前仓库未内置 GUI 截图资源。若需要可补充以下截图并在本文档插入：
 
@@ -161,7 +201,7 @@ python gui_main.py
 
 建议截图存放目录：`docs/images/gui/`。
 
-## 8. 常见问题
+## 9. 常见问题
 
 - 设备显示离线：先执行 `adb kill-server`、`adb start-server` 再刷新
 - 点击开始后无执行：检查模块勾选、APK 路径与设备 SN

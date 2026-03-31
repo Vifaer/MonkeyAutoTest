@@ -77,5 +77,19 @@
     "check_interval": 0.1,
     "max_wait_for_disappear": 120.0,
     "anr_recover_threshold": 0
+  },
+  "device_control": {
+    "scrcpy_path": "tools/scrcpy/scrcpy.exe",
+    "record_basename_default": "record",
+    "records_dir": "records",
+    "logcat_clear_on_record_start": false,
+    "delete_tmp_after_record": true,
+    "mic_use_pc": false,
+    "pc_dshow_audio_device": "自动(按识别候选)",
+    "record_params": {
+      "max_fps": "30",
+      "video_bit_rate": "8M",
+      "max_size": ""
+    }
   }
 }

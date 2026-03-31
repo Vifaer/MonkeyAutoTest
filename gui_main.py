@@ -5,7 +5,7 @@
 车载端侧应用自动化测试工具的图形界面
 
 作者: MonkeyAutoTest Team
-版本: 1.0.0
+版本: 1.5.0
 
 UI设计风格：参考Cursor续杯工具设计体系
 - 主色：亮蓝色 (#1677FF)
@@ -107,7 +107,7 @@ class MonkeyTestGUI:
             self._ui_thread_id = _threading.get_ident()
         except Exception:
             self._ui_thread_id = None
-        self.root.title("端侧自动化测试工具 v1.0.0")
+        self.root.title("端侧自动化测试工具 v1.5.0")
         self.root.geometry("1200x800")
         # 最小尺寸：避免过度压缩导致不可用；但允许更小以适配低分辨率
         self.root.minsize(980, 680)
@@ -194,6 +194,30 @@ class MonkeyTestGUI:
         self.response_monitor_max_wait_disappear_var = tk.StringVar(value="300")
         # 连续 ANR/无响应后自动恢复的触发阈值（次数），默认 1 次即触发
         self.response_monitor_anr_recover_threshold_var = tk.StringVar(value="1")
+
+        # ==========================
+        # 设备控制（投屏/录屏）
+        # ==========================
+        # 设备控制：scrcpy/ffmpeg 默认使用项目 tools 目录
+        self.scrcpy_path_var = tk.StringVar(value=str(Path("tools") / "scrcpy" / "scrcpy.exe"))  # 可空走 PATH
+        self.ffmpeg_path_var = tk.StringVar(value=str(Path("tools") / "ffmpeg.exe"))  # 可空走 PATH
+        self.record_basename_var = tk.StringVar(value="record")
+        # 兼容字段：旧配置里可能有 records_dir，但录屏输出已强制对齐 logs/<sn>/<ts>
+        self.records_dir_var = tk.StringVar(value="logs")  # 仅作为 UI 展示/兼容保留
+        self.logcat_clear_on_record_start_var = tk.BooleanVar(value=False)
+        self.logcat_filter_template_var = tk.StringVar(value="*:E *:W")
+        self.delete_tmp_after_record_var = tk.BooleanVar(value=True)
+        # 默认使用电脑端 dshow（避免设备端 mic 可能导致音频路由/外放干扰）
+        self.mic_use_pc_var = tk.BooleanVar(value=False)
+        self.pc_dshow_audio_device_var = tk.StringVar(value="自动(按识别候选)")
+        # 录屏参数（最小集合：max_fps/video_bit_rate/max_size）
+        self.record_max_fps_var = tk.StringVar(value="30")
+        self.record_video_bit_rate_var = tk.StringVar(value="8M")
+        self.record_max_size_var = tk.StringVar(value="")
+        # 运行时对象（投屏/录屏会话）
+        self._mirror_runner = None
+        self._record_session = None
+
         self._mock_server = None
         self._mock_server_started_by_gui = False
         self._mock_status_label = None
@@ -440,7 +464,33 @@ class MonkeyTestGUI:
             pass
 
         # 直接在wrap里放内容（无子滚动条）
-        self.create_operation_panel(left_wrap)
+        # 左侧改为：测试工作台 / 设备控制（预留独立页签，避免侵入稳定性测试逻辑）
+        left_notebook = ttk.Notebook(left_wrap)
+        left_notebook.pack(fill=tk.BOTH, expand=True)
+
+        stable_tab = tk.Frame(left_notebook, bg=UIColors.BG_LIGHT)
+        device_tab = tk.Frame(left_notebook, bg=UIColors.BG_LIGHT)
+
+        left_notebook.add(stable_tab, text="测试工作台")
+        left_notebook.add(device_tab, text="设备控制")
+
+        self.create_operation_panel(stable_tab)
+
+        # 设备控制页（投屏/录屏/ADB按键）
+        try:
+            from gui.device_control_tab import create_device_control_tab_ui
+
+            create_device_control_tab_ui(self, device_tab)
+        except Exception as e:
+            tk.Label(
+                device_tab,
+                text=f"设备控制页初始化失败: {e}",
+                fg=UIColors.ERROR,
+                bg=UIColors.BG_LIGHT,
+                font=UIFonts.BODY,
+                wraplength=520,
+                justify=tk.LEFT,
+            ).pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
         self.create_status_panel(right_wrap)
 
         # 底部状态栏
@@ -807,7 +857,7 @@ class MonkeyTestGUI:
         # 副标题（在标题容器中居中）
         subtitle_label = tk.Label(
             title_container,
-            text="车载端侧应用稳定性测试平台 | v1.0.0",
+            text="车载端侧应用稳定性测试平台 | v1.5.0",
             font=UIFonts.CAPTION,
             fg=UIColors.TEXT_SECONDARY,
             bg=UIColors.WHITE
@@ -1637,6 +1687,20 @@ class MonkeyTestGUI:
             },
             "app_log": self._get_app_log_for_config(),
             "response_monitor": self._get_response_monitor_for_config(),
+            "device_control": {
+                "scrcpy_path": self.scrcpy_path_var.get(),
+                "record_basename_default": self.record_basename_var.get(),
+                "records_dir": self.records_dir_var.get(),
+                "logcat_clear_on_record_start": bool(self.logcat_clear_on_record_start_var.get()),
+                "delete_tmp_after_record": bool(self.delete_tmp_after_record_var.get()),
+                "mic_use_pc": bool(self.mic_use_pc_var.get()),
+                "pc_dshow_audio_device": self.pc_dshow_audio_device_var.get(),
+                "record_params": {
+                    "max_fps": self.record_max_fps_var.get(),
+                    "video_bit_rate": self.record_video_bit_rate_var.get(),
+                    "max_size": self.record_max_size_var.get(),
+                },
+            },
         }
 
     def _apply_test_ui_config(self, cfg):
@@ -1848,6 +1912,60 @@ class MonkeyTestGUI:
                 self.response_monitor_max_wait_disappear_var.set(str(rm["max_wait_for_disappear"]))
             if "anr_recover_threshold" in rm and rm["anr_recover_threshold"] is not None:
                 self.response_monitor_anr_recover_threshold_var.set(str(rm["anr_recover_threshold"]))
+
+        dc = cfg.get("device_control")
+        if isinstance(dc, dict):
+            scrcpy_path = dc.get("scrcpy_path")
+            if isinstance(scrcpy_path, str):
+                v = scrcpy_path.strip()
+                if v:
+                    self.scrcpy_path_var.set(v)
+
+            rb = dc.get("record_basename_default")
+            if isinstance(rb, str):
+                self.record_basename_var.set(rb.strip())
+
+            # records_dir 已弃用：不再影响录屏落盘逻辑（统一落到 logs/<sn>/<ts>）
+            # 仍保留变量用于 UI 展示与兼容旧配置文件读取。
+            try:
+                self.records_dir_var.set("logs")
+            except Exception:
+                pass
+
+            if "logcat_clear_on_record_start" in dc:
+                try:
+                    self.logcat_clear_on_record_start_var.set(bool(dc["logcat_clear_on_record_start"]))
+                except Exception:
+                    pass
+
+            if "delete_tmp_after_record" in dc:
+                try:
+                    self.delete_tmp_after_record_var.set(bool(dc["delete_tmp_after_record"]))
+                except Exception:
+                    pass
+
+            if "mic_use_pc" in dc:
+                try:
+                    self.mic_use_pc_var.set(bool(dc["mic_use_pc"]))
+                except Exception:
+                    pass
+
+            if "pc_dshow_audio_device" in dc:
+                try:
+                    v = dc.get("pc_dshow_audio_device")
+                    if isinstance(v, str):
+                        self.pc_dshow_audio_device_var.set(v)
+                except Exception:
+                    pass
+
+            rp = dc.get("record_params")
+            if isinstance(rp, dict):
+                if "max_fps" in rp and rp["max_fps"] is not None:
+                    self.record_max_fps_var.set(str(rp["max_fps"]))
+                if "video_bit_rate" in rp and rp["video_bit_rate"] is not None:
+                    self.record_video_bit_rate_var.set(str(rp["video_bit_rate"]))
+                if "max_size" in rp and rp["max_size"] is not None:
+                    self.record_max_size_var.set(str(rp["max_size"]))
 
         # 确保模块区启用/禁用状态正确
         self.on_test_mode_changed()
@@ -2103,6 +2221,18 @@ class MonkeyTestGUI:
             getattr(self, "app_log_flush_interval_ms_var", None),
             getattr(self, "app_log_batch_lines_var", None),
             getattr(self, "app_log_pid_refresh_seconds_var", None),
+
+            # 设备控制（投屏/录屏）配置
+            getattr(self, "scrcpy_path_var", None),
+            getattr(self, "record_basename_var", None),
+            getattr(self, "records_dir_var", None),
+            getattr(self, "logcat_clear_on_record_start_var", None),
+            getattr(self, "delete_tmp_after_record_var", None),
+            getattr(self, "mic_use_pc_var", None),
+            getattr(self, "pc_dshow_audio_device_var", None),
+            getattr(self, "record_max_fps_var", None),
+            getattr(self, "record_video_bit_rate_var", None),
+            getattr(self, "record_max_size_var", None),
         ]
         try:
             vars_to_trace.extend(list(self.module_vars.values()))
@@ -3180,12 +3310,57 @@ class MonkeyTestGUI:
             if not paths:
                 messagebox.showwarning("提示", "请先选择至少一条报告", parent=win)
                 return
-            try:
+
+            def _worker():
+                import json as _json
                 import webbrowser
+
+                opened_ok = 0
+                failed = []
+
                 for path in paths:
-                    webbrowser.open(os.path.abspath(path))
-            except Exception as e:
-                messagebox.showerror("错误", str(e), parent=win)
+                    try:
+                        if not path or not os.path.exists(path):
+                            failed.append(f"不存在: {path}")
+                            continue
+
+                        lower = path.lower()
+                        if lower.endswith(".json"):
+                            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                                data = _json.load(f)
+                            content = _json.dumps(data, indent=2, ensure_ascii=False)
+                            report_file = os.path.basename(path)
+                            self.root.after(0, lambda rf=report_file, c=content: self._show_json_report_window(rf, c))
+                        elif lower.endswith(".html"):
+                            abs_path = os.path.abspath(path)
+                            # 统一使用 file:/// scheme，避免 Windows 路径反斜杠导致打开异常
+                            if os.name == "nt":
+                                abs_path = abs_path.replace("\\", "/")
+                            webbrowser.open(f"file:///{abs_path}")
+                        else:
+                            failed.append(f"不支持后缀: {os.path.basename(path)}")
+                            continue
+
+                        opened_ok += 1
+                    except Exception as e:
+                        failed.append(f"{os.path.basename(path)}: {e}")
+
+                def _final_notify():
+                    try:
+                        if opened_ok:
+                            self.update_status(f"已打开报告（共 {opened_ok} 个）")
+                        if failed:
+                            messagebox.showwarning(
+                                "部分打开失败",
+                                "以下报告无法打开：\n" + "\n".join(failed[:10]) + (f"\n... 以及 {len(failed) - 10} 个" if len(failed) > 10 else ""),
+                                parent=win,
+                            )
+                    except Exception:
+                        pass
+
+                self.root.after(0, _final_notify)
+
+            threading.Thread(target=_worker, daemon=True).start()
 
         def _delete_selected():
             paths = _selected_paths()
@@ -5040,6 +5215,69 @@ class MonkeyTestGUI:
             except Exception as e:
                 messagebox.showerror("错误", f"删除报告失败: {str(e)}")
 
+    def _apply_stability_controls(self, *, phase: str) -> None:
+        """
+        统一稳定性测试的按钮状态，降低重复逻辑与竞态风险。
+
+        phase:
+        - running: 测试运行中（允许暂停/停止，不允许开始）
+        - paused: 暂停中（允许继续/停止，不允许暂停）
+        - stopping: 正在停止（仅禁用按钮，避免重复启动/重复暂停）
+        - idle: 空闲态（允许开始，禁用暂停/停止/继续）
+        """
+        phase = (phase or "").strip().lower()
+        if phase == "running":
+            start_state, start_bg = ("disabled", UIColors.TEXT_SECONDARY)
+            stop_state = "normal"
+            pause_state = "normal"
+            resume_state = "disabled"
+        elif phase == "paused":
+            start_state, start_bg = ("disabled", UIColors.TEXT_SECONDARY)
+            stop_state = "normal"
+            pause_state = "disabled"
+            resume_state = "normal"
+        elif phase == "stopping":
+            start_state, start_bg = ("disabled", UIColors.TEXT_SECONDARY)
+            stop_state = "disabled"
+            pause_state = "disabled"
+            resume_state = "disabled"
+        else:
+            start_state, start_bg = ("normal", UIColors.PRIMARY)
+            stop_state = "disabled"
+            pause_state = "disabled"
+            resume_state = "disabled"
+
+        # start
+        try:
+            if getattr(self, "start_test_btn", None):
+                self.start_test_btn.config(state=start_state, bg=start_bg)
+        except Exception:
+            pass
+
+        # stop
+        for btn in (getattr(self, "stop_test_btn", None), getattr(self, "stop_stability_btn", None)):
+            try:
+                if btn:
+                    btn.config(state=stop_state)
+            except Exception:
+                pass
+
+        # pause
+        for btn in (getattr(self, "pause_test_btn", None), getattr(self, "pause_stability_btn", None)):
+            try:
+                if btn:
+                    btn.config(state=pause_state)
+            except Exception:
+                pass
+
+        # resume
+        for btn in (getattr(self, "resume_test_btn", None), getattr(self, "resume_stability_btn", None)):
+            try:
+                if btn:
+                    btn.config(state=resume_state)
+            except Exception:
+                pass
+
     def start_stability_test(self):
         """开始稳定性测试"""
         if self.is_testing:
@@ -5105,18 +5343,7 @@ class MonkeyTestGUI:
         except Exception:
             pass
 
-        # 更新UI状态
-        if self.start_test_btn:
-            self.start_test_btn.config(state="disabled", bg=UIColors.TEXT_SECONDARY)
-        for btn in (getattr(self, "stop_test_btn", None), getattr(self, "stop_stability_btn", None)):
-            if btn:
-                btn.config(state="normal")
-        for btn in (getattr(self, "pause_test_btn", None), getattr(self, "pause_stability_btn", None)):
-            if btn:
-                btn.config(state="normal")
-        for btn in (getattr(self, "resume_test_btn", None), getattr(self, "resume_stability_btn", None)):
-            if btn:
-                btn.config(state="disabled")
+        self._apply_stability_controls(phase="running")
         if self.progress_bar:
             self.progress_bar.start()
 
@@ -5207,12 +5434,9 @@ class MonkeyTestGUI:
             from utils.run_control import set_paused
             set_paused(True)
             self.update_status("已暂停测试，点击「继续」恢复；暂停超过 30 分钟将自动终止")
-            for btn in (getattr(self, "pause_test_btn", None), getattr(self, "pause_stability_btn", None)):
-                if btn:
-                    btn.config(state="disabled")
-            for btn in (getattr(self, "resume_test_btn", None), getattr(self, "resume_stability_btn", None)):
-                if btn:
-                    btn.config(state="normal")
+            self._apply_stability_controls(phase="paused")
+            if self.progress_info_label:
+                self.progress_info_label.config(text="当前状态：已暂停稳定性测试", fg=UIColors.WARNING)
         except Exception as e:
             self.update_status(f"暂停失败: {e}")
 
@@ -5222,12 +5446,9 @@ class MonkeyTestGUI:
             from utils.run_control import set_paused
             set_paused(False)
             self.update_status("已继续测试")
-            for btn in (getattr(self, "pause_test_btn", None), getattr(self, "pause_stability_btn", None)):
-                if btn:
-                    btn.config(state="normal")
-            for btn in (getattr(self, "resume_test_btn", None), getattr(self, "resume_stability_btn", None)):
-                if btn:
-                    btn.config(state="disabled")
+            self._apply_stability_controls(phase="running")
+            if self.progress_info_label:
+                self.progress_info_label.config(text="当前状态：正在运行稳定性测试", fg=UIColors.PRIMARY)
         except Exception as e:
             self.update_status(f"继续失败: {e}")
 
@@ -5236,15 +5457,9 @@ class MonkeyTestGUI:
         if self.is_testing:
             self.is_testing = False
             self.update_status("正在停止测试（尝试终止子进程）...")
-            for btn in (getattr(self, "stop_test_btn", None), getattr(self, "stop_stability_btn", None)):
-                if btn:
-                    btn.config(state="disabled")
-            for btn in (getattr(self, "pause_test_btn", None), getattr(self, "pause_stability_btn", None)):
-                if btn:
-                    btn.config(state="disabled")
-            for btn in (getattr(self, "resume_test_btn", None), getattr(self, "resume_stability_btn", None)):
-                if btn:
-                    btn.config(state="disabled")
+            self._apply_stability_controls(phase="stopping")
+            if self.progress_info_label:
+                self.progress_info_label.config(text="当前状态：正在停止稳定性测试", fg=UIColors.ERROR)
             try:
                 from utils.run_control import set_paused
                 set_paused(False)
@@ -5522,17 +5737,7 @@ class MonkeyTestGUI:
 
     def reset_stability_ui(self):
         """重置稳定性测试UI状态"""
-        if self.start_test_btn:
-            self.start_test_btn.config(state="normal", bg=UIColors.PRIMARY)
-        for btn in (getattr(self, "stop_test_btn", None), getattr(self, "stop_stability_btn", None)):
-            if btn:
-                btn.config(state="disabled")
-        for btn in (getattr(self, "pause_test_btn", None), getattr(self, "pause_stability_btn", None)):
-            if btn:
-                btn.config(state="disabled")
-        for btn in (getattr(self, "resume_test_btn", None), getattr(self, "resume_stability_btn", None)):
-            if btn:
-                btn.config(state="disabled")
+        self._apply_stability_controls(phase="idle")
         try:
             from utils.run_control import set_paused
             set_paused(False)
@@ -5655,6 +5860,26 @@ class MonkeyTestGUI:
 
     def on_closing(self):
         """窗口关闭事件处理"""
+        # 退出前尽最大可能结束投屏/录屏会话（避免后台进程残留）
+        try:
+            runner = getattr(self, "_mirror_runner", None)
+            if runner:
+                try:
+                    runner.stop()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            session = getattr(self, "_record_session", None)
+            if session:
+                try:
+                    session.stop()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         if self.is_testing:
             if messagebox.askyesno("确认退出", "测试正在进行中，确定要退出吗？"):
                 self.stop_test()
