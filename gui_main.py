@@ -207,13 +207,16 @@ class MonkeyTestGUI:
         self.logcat_clear_on_record_start_var = tk.BooleanVar(value=False)
         self.logcat_filter_template_var = tk.StringVar(value="*:E *:W")
         self.delete_tmp_after_record_var = tk.BooleanVar(value=True)
+        self.mirror_forward_audio_var = tk.BooleanVar(value=True)
         # 默认使用电脑端 dshow（避免设备端 mic 可能导致音频路由/外放干扰）
         self.mic_use_pc_var = tk.BooleanVar(value=False)
         self.pc_dshow_audio_device_var = tk.StringVar(value="自动(按识别候选)")
-        # 录屏参数（最小集合：max_fps/video_bit_rate/max_size）
+        # 录屏参数
         self.record_max_fps_var = tk.StringVar(value="30")
         self.record_video_bit_rate_var = tk.StringVar(value="8M")
         self.record_max_size_var = tk.StringVar(value="")
+        self.record_audio_sample_rate_var = tk.StringVar(value="44100")
+        self.record_audio_bitrate_var = tk.StringVar(value="192k")
         # 运行时对象（投屏/录屏会话）
         self._mirror_runner = None
         self._record_session = None
@@ -1693,12 +1696,15 @@ class MonkeyTestGUI:
                 "records_dir": self.records_dir_var.get(),
                 "logcat_clear_on_record_start": bool(self.logcat_clear_on_record_start_var.get()),
                 "delete_tmp_after_record": bool(self.delete_tmp_after_record_var.get()),
+                "mirror_forward_audio": bool(self.mirror_forward_audio_var.get()),
                 "mic_use_pc": bool(self.mic_use_pc_var.get()),
                 "pc_dshow_audio_device": self.pc_dshow_audio_device_var.get(),
                 "record_params": {
                     "max_fps": self.record_max_fps_var.get(),
                     "video_bit_rate": self.record_video_bit_rate_var.get(),
                     "max_size": self.record_max_size_var.get(),
+                    "audio_sample_rate": self.record_audio_sample_rate_var.get(),
+                    "audio_bit_rate": self.record_audio_bitrate_var.get(),
                 },
             },
         }
@@ -1944,6 +1950,12 @@ class MonkeyTestGUI:
                 except Exception:
                     pass
 
+            if "mirror_forward_audio" in dc:
+                try:
+                    self.mirror_forward_audio_var.set(bool(dc["mirror_forward_audio"]))
+                except Exception:
+                    pass
+
             if "mic_use_pc" in dc:
                 try:
                     self.mic_use_pc_var.set(bool(dc["mic_use_pc"]))
@@ -1966,6 +1978,10 @@ class MonkeyTestGUI:
                     self.record_video_bit_rate_var.set(str(rp["video_bit_rate"]))
                 if "max_size" in rp and rp["max_size"] is not None:
                     self.record_max_size_var.set(str(rp["max_size"]))
+                if "audio_sample_rate" in rp and rp["audio_sample_rate"] is not None:
+                    self.record_audio_sample_rate_var.set(str(rp["audio_sample_rate"]))
+                if "audio_bit_rate" in rp and rp["audio_bit_rate"] is not None:
+                    self.record_audio_bitrate_var.set(str(rp["audio_bit_rate"]))
 
         # 确保模块区启用/禁用状态正确
         self.on_test_mode_changed()
@@ -2228,11 +2244,14 @@ class MonkeyTestGUI:
             getattr(self, "records_dir_var", None),
             getattr(self, "logcat_clear_on_record_start_var", None),
             getattr(self, "delete_tmp_after_record_var", None),
+            getattr(self, "mirror_forward_audio_var", None),
             getattr(self, "mic_use_pc_var", None),
             getattr(self, "pc_dshow_audio_device_var", None),
             getattr(self, "record_max_fps_var", None),
             getattr(self, "record_video_bit_rate_var", None),
             getattr(self, "record_max_size_var", None),
+            getattr(self, "record_audio_sample_rate_var", None),
+            getattr(self, "record_audio_bitrate_var", None),
         ]
         try:
             vars_to_trace.extend(list(self.module_vars.values()))

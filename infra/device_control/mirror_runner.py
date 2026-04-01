@@ -84,7 +84,9 @@ class ScrcpyMirrorRunner:
         adb_path: str,
         scrcpy_path: str,
         window_title: str = "MonkeyAutoTest - 投屏",
-        always_on_top: bool = True,
+        always_on_top: bool = False,
+        no_audio: bool = True,
+        forward_audio: Optional[bool] = None,
         turn_screen_off: bool = False,
         stay_awake: bool = True,
         params: Optional[ScrcpyMirrorParams] = None,
@@ -95,6 +97,13 @@ class ScrcpyMirrorRunner:
         self.scrcpy_path = scrcpy_path
         self.window_title = window_title
         self.always_on_top = always_on_top
+        # 兼容两种调用方式：
+        # - forward_audio=True/False（推荐）
+        # - no_audio=True/False（历史参数）
+        if forward_audio is None:
+            self.no_audio = no_audio
+        else:
+            self.no_audio = not bool(forward_audio)
         self.turn_screen_off = turn_screen_off
         self.stay_awake = stay_awake
         self.params = params or ScrcpyMirrorParams()
@@ -128,6 +137,9 @@ class ScrcpyMirrorRunner:
                 cmd.append("--turn-screen-off")
             if self.always_on_top:
                 cmd.append("--always-on-top")
+            if self.no_audio:
+                # 避免投屏会话接管设备音频，保证待测设备可正常外放。
+                cmd.append("--no-audio")
 
             if self.params.max_fps is not None:
                 cmd.extend(["--max-fps", str(int(self.params.max_fps))])

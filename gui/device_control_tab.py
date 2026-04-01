@@ -142,6 +142,10 @@ def create_device_control_tab_ui(gui: object, parent: tk.Frame) -> None:
     # -------------------------
     mirror_card = gui.create_card(container, "📱 投屏/触控")
 
+    # 投屏音频转发开关：开启后把设备系统音频转发到电脑端播放。
+    if not hasattr(gui, "mirror_forward_audio_var"):
+        setattr(gui, "mirror_forward_audio_var", tk.BooleanVar(value=True))
+
     # Device status row
     sn_row = tk.Frame(mirror_card, bg=UIColors.WHITE)
     sn_row.pack(fill=tk.X, pady=(0, 8))
@@ -203,6 +207,18 @@ def create_device_control_tab_ui(gui: object, parent: tk.Frame) -> None:
     )
     mirror_stop_btn.pack(side=tk.LEFT)
     mirror_stop_btn.config(state="disabled")
+
+    mirror_audio_cb = tk.Checkbutton(
+        mirror_card,
+        text="投屏时转发设备声音到电脑播放（需设备音频权限支持）",
+        variable=getattr(gui, "mirror_forward_audio_var"),
+        bg=UIColors.WHITE,
+        font=UIFONTS.BODY,
+        cursor="hand2",
+        wraplength=430,
+        justify=tk.LEFT,
+    )
+    mirror_audio_cb.pack(anchor="w", padx=0, pady=(2, 8))
 
     # -------------------------
     # 录屏（双路 scrcpy + logcat + ffmpeg 混音）
@@ -325,34 +341,101 @@ def create_device_control_tab_ui(gui: object, parent: tk.Frame) -> None:
     mic_use_pc_cb.config(command=_toggle_dshow_state)
     _toggle_dshow_state()
 
-    # Record params
-    params_frame = tk.Frame(record_card, bg=UIColors.WHITE)
-    params_frame.pack(fill=tk.X, pady=(0, 6))
+    if not hasattr(gui, "record_audio_sample_rate_var"):
+        setattr(gui, "record_audio_sample_rate_var", tk.StringVar(value="44100"))
+    if not hasattr(gui, "record_audio_bitrate_var"):
+        setattr(gui, "record_audio_bitrate_var", tk.StringVar(value="192k"))
+    if not hasattr(gui, "record_audio_sync_offset_ms_var"):
+        setattr(gui, "record_audio_sync_offset_ms_var", tk.StringVar(value="0"))
 
-    max_fps_row = tk.Frame(params_frame, bg=UIColors.WHITE)
-    max_fps_row.pack(fill=tk.X, pady=(0, 6))
-    tk.Label(max_fps_row, text="max_fps(默认30):", font=UIFONTS.BODY, bg=UIColors.WHITE, fg=UIColors.TEXT_SECONDARY).pack(
-        side=tk.LEFT, padx=(0, 10)
-    )
-    max_fps_entry = ttk.Entry(max_fps_row, textvariable=gui.record_max_fps_var, width=8)
-    max_fps_entry.pack(side=tk.LEFT)
+    params_summary_var = tk.StringVar(value="")
 
-    vbr_row = tk.Frame(params_frame, bg=UIColors.WHITE)
-    vbr_row.pack(fill=tk.X, pady=(0, 6))
-    tk.Label(vbr_row, text="video_bit_rate(默认8M):", font=UIFONTS.BODY, bg=UIColors.WHITE, fg=UIColors.TEXT_SECONDARY).pack(
-        side=tk.LEFT, padx=(0, 10)
-    )
-    vbr_entry = ttk.Entry(vbr_row, textvariable=gui.record_video_bit_rate_var)
-    vbr_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+    def _refresh_params_summary() -> None:
+        try:
+            params_summary_var.set(
+                "录屏参数："
+                f"fps={getattr(gui, 'record_max_fps_var').get()}, "
+                f"vbr={getattr(gui, 'record_video_bit_rate_var').get()}, "
+                f"max_size={getattr(gui, 'record_max_size_var').get() or 'auto'}, "
+                f"ar={getattr(gui, 'record_audio_sample_rate_var').get()}, "
+                f"abr={getattr(gui, 'record_audio_bitrate_var').get()}, "
+                f"sync_offset={getattr(gui, 'record_audio_sync_offset_ms_var').get()}ms"
+            )
+        except Exception:
+            pass
 
-    max_size_row = tk.Frame(params_frame, bg=UIColors.WHITE)
-    max_size_row.pack(fill=tk.X, pady=(0, 6))
-    tk.Label(max_size_row, text="max_size(可空):", font=UIFONTS.BODY, bg=UIColors.WHITE, fg=UIColors.TEXT_SECONDARY).pack(
-        side=tk.LEFT, padx=(0, 10)
+    def _open_record_params_dialog() -> None:
+        dlg = tk.Toplevel(gui.root)
+        dlg.title("录屏参数设置")
+        dlg.geometry("520x320")
+        dlg.resizable(False, False)
+        try:
+            dlg.transient(gui.root)
+            dlg.grab_set()
+        except Exception:
+            pass
+
+        body = tk.Frame(dlg, bg=UIColors.WHITE)
+        body.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+
+        def _row(label: str, var: tk.StringVar) -> None:
+            r = tk.Frame(body, bg=UIColors.WHITE)
+            r.pack(fill=tk.X, pady=(0, 8))
+            tk.Label(r, text=label, font=UIFONTS.BODY, bg=UIColors.WHITE, fg=UIColors.TEXT_SECONDARY).pack(
+                side=tk.LEFT, padx=(0, 10)
+            )
+            ttk.Entry(r, textvariable=var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        _row("max_fps(默认30):", getattr(gui, "record_max_fps_var"))
+        _row("video_bit_rate(默认8M):", getattr(gui, "record_video_bit_rate_var"))
+        _row("max_size(可空):", getattr(gui, "record_max_size_var"))
+        _row("audio_sample_rate(默认44100):", getattr(gui, "record_audio_sample_rate_var"))
+        _row("audio_bit_rate(默认192k):", getattr(gui, "record_audio_bitrate_var"))
+        _row("audio_sync_offset_ms(默认0):", getattr(gui, "record_audio_sync_offset_ms_var"))
+
+        tip = tk.Label(
+            body,
+            text="提示：max_size 例如 1280/1920；音频参数影响最终混音输出。",
+            font=UIFONTS.CAPTION,
+            bg=UIColors.WHITE,
+            fg=UIColors.TEXT_SECONDARY,
+            anchor="w",
+            justify=tk.LEFT,
+        )
+        tip.pack(fill=tk.X, pady=(4, 10))
+
+        btns = tk.Frame(body, bg=UIColors.WHITE)
+        btns.pack(fill=tk.X)
+        gui.create_action_button(
+            btns,
+            text="保存并关闭",
+            command=lambda: (dlg.destroy(), _refresh_params_summary()),
+            variant="primary",
+            width=14,
+        ).pack(side=tk.RIGHT)
+
+    params_btn_row = tk.Frame(record_card, bg=UIColors.WHITE)
+    params_btn_row.pack(fill=tk.X, pady=(0, 8))
+    gui.create_action_button(
+        params_btn_row,
+        text="⚙️ 录屏参数设置",
+        command=_open_record_params_dialog,
+        variant="secondary",
+        width=16,
+    ).pack(side=tk.LEFT)
+
+    params_summary_label = tk.Label(
+        record_card,
+        textvariable=params_summary_var,
+        font=UIFONTS.CAPTION,
+        bg=UIColors.WHITE,
+        fg=UIColors.TEXT_SECONDARY,
+        anchor="w",
+        justify=tk.LEFT,
+        wraplength=520,
     )
-    max_size_entry = ttk.Entry(max_size_row, textvariable=gui.record_max_size_var)
-    max_size_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-    ToolTip(max_size_entry, "例如：1280 或 1920（scrcpy 支持格式）。留空则使用默认。")
+    params_summary_label.pack(fill=tk.X, pady=(0, 8))
+    _refresh_params_summary()
 
     record_btn_row = tk.Frame(record_card, bg=UIColors.WHITE)
     record_btn_row.pack(fill=tk.X, pady=(0, 8))
@@ -457,6 +540,8 @@ def _start_mirror(gui: object, mirror_start_btn: tk.Button, mirror_stop_btn: tk.
                 adb_path=str(getattr(gui, "adb_path_var").get() or ""),  # type: ignore[union-attr]
                 scrcpy_path=str(getattr(gui, "scrcpy_path_var").get() or ""),  # type: ignore[union-attr]
                 window_title="MonkeyAutoTest - 投屏",
+                always_on_top=False,
+                forward_audio=bool(getattr(gui, "mirror_forward_audio_var").get()),
                 params=scrcpy_params,
                 log_callback=lambda msg: getattr(gui, "log_queue").put(msg),
             )
@@ -561,6 +646,13 @@ def _start_recording(gui: object, record_start_btn: tk.Button, record_stop_btn: 
                 def _ui() -> None:
                     record_stop_btn.config(state="disabled")
                     record_start_btn.config(state="normal")
+                    session_obj = getattr(gui, "_record_session", None)
+                    fatal_msg = ""
+                    try:
+                        if session_obj and hasattr(session_obj, "get_fatal_error_message"):
+                            fatal_msg = str(session_obj.get_fatal_error_message() or "").strip()
+                    except Exception:
+                        fatal_msg = ""
                     if final_path:
                         # 展示最终路径 + 提供一键打开目录/播放
                         try:
@@ -614,7 +706,14 @@ def _start_recording(gui: object, record_start_btn: tk.Button, record_stop_btn: 
                                 play_btn.config(state="disabled", command=lambda: None)
                         except Exception:
                             pass
-                        gui.update_status("录制结束但合成失败")
+                        gui.update_status("录制失败")
+                        try:
+                            messagebox.showerror(
+                                "录制失败",
+                                fatal_msg or "视频录制异常，已停止录制且未生成最终视频。\n请查看实时日志定位问题。",
+                            )
+                        except Exception:
+                            pass
 
                 try:
                     gui.root.after(0, _ui)
@@ -636,6 +735,9 @@ def _start_recording(gui: object, record_start_btn: tk.Button, record_stop_btn: 
                 package_name=pkg,
                 app_log_config=getattr(gui, "_get_app_log_for_config")(),
                 record_params=params,
+                audio_sample_rate=_safe_int(getattr(gui, "record_audio_sample_rate_var").get(), 44100),  # type: ignore[union-attr]
+                audio_bit_rate=str(getattr(gui, "record_audio_bitrate_var").get() or "192k"),  # type: ignore[union-attr]
+                audio_sync_offset_ms=_safe_int(getattr(gui, "record_audio_sync_offset_ms_var").get(), 0),  # type: ignore[union-attr]
                 run_log_dir=run_log_dir_override,
                 log_callback=lambda msg: getattr(gui, "log_queue").put(msg),
                 on_finished=_on_finished,

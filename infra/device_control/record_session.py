@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import mmap
 import re
@@ -10,7 +11,6 @@ import signal
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-import shutil
 from typing import Any, Callable, Optional
 
 
@@ -110,6 +110,7 @@ def _graceful_stop_ffmpeg_recorder(
 def _start_output_reader(
     popen: subprocess.Popen[bytes],
     log_callback: Callable[[str], None],
+    line_callback: Optional[Callable[[str], None]] = None,
 ) -> threading.Thread:
     def _worker() -> None:
         if not popen.stdout:
@@ -135,6 +136,11 @@ def _start_output_reader(
                     log_callback(line)
                 except Exception:
                     pass
+                if line_callback:
+                    try:
+                        line_callback(line)
+                    except Exception:
+                        pass
 
     t = threading.Thread(target=_worker, daemon=True)
     t.start()
@@ -158,6 +164,132 @@ def _parse_filter_template(template: str) -> list[str]:
     parts = (template or "").strip().split()
     # Fallback: keep original if blank
     return parts or ["*:E", "*:W"]
+
+
+def _resolve_ffprobe_bin(ffmpeg_bin: str) -> Optional[str]:
+    """Prefer ffprobe.exe next to ffmpeg.exe when present."""
+    try:
+        p = Path(ffmpeg_bin)
+        if p.name.lower() == "ffmpeg.exe":
+            cand = p.parent / "ffprobe.exe"
+            if cand.is_file():
+                return str(cand)
+    except Exception:
+        pass
+    return None
+
+
+def _probe_video_and_duration(path: Path, ffmpeg_bin: str) -> tuple[bool, float]:
+    """
+    Return (has_video_stream, duration_seconds).
+    Prefer ffprobe JSON; fallback to parsing `ffmpeg -i` stderr.
+    """
+    ffprobe = _resolve_ffprobe_bin(ffmpeg_bin)
+    if ffprobe:
+        try:
+            r = subprocess.run(
+                [
+                    ffprobe,
+                    "-v",
+                    "quiet",
+                    "-print_format",
+                    "json",
+                    "-show_streams",
+                    "-show_format",
+                    str(path),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=120,
+            )
+            if r.returncode == 0 and r.stdout:
+                data = json.loads(r.stdout.decode("utf-8", errors="replace"))
+                streams = data.get("streams") or []
+                has_video = any(s.get("codec_type") == "video" for s in streams)
+                dur = 0.0
+                try:
+                    dur = float((data.get("format") or {}).get("duration") or 0)
+                except Exception:
+                    dur = 0.0
+                if dur <= 0:
+                    for s in streams:
+                        try:
+                            d2 = float(s.get("duration") or 0)
+                            if d2 > 0:
+                                dur = max(dur, d2)
+                        except Exception:
+                            pass
+                return has_video, max(0.0, dur)
+        except Exception:
+            pass
+
+    try:
+        r = subprocess.run(
+            [ffmpeg_bin, "-hide_banner", "-i", str(path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=120,
+        )
+        err = (r.stderr or b"").decode("utf-8", errors="replace")
+        has_video = bool(re.search(r"Stream\s+#\d+:\d+.*:\s*Video", err, re.I))
+        dur = 0.0
+        m = re.search(r"Duration:\s*(\d+):(\d+):(\d+)(?:\.(\d+))?", err)
+        if m:
+            h, mn, s = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            frac = m.group(4) or ""
+            subsec = 0.0
+            if frac.isdigit():
+                try:
+                    subsec = int(frac) / (10 ** len(frac))
+                except Exception:
+                    subsec = 0.0
+            dur = h * 3600 + mn * 60 + s + subsec
+        return has_video, max(0.0, dur)
+    except Exception:
+        return False, 0.0
+
+
+def _probe_stream_start_time(path: Path, ffmpeg_bin: str, *, codec_type: str) -> float:
+    """Probe first stream start_time for given codec_type (video/audio)."""
+    ffprobe = _resolve_ffprobe_bin(ffmpeg_bin)
+    if ffprobe:
+        try:
+            r = subprocess.run(
+                [
+                    ffprobe,
+                    "-v",
+                    "quiet",
+                    "-print_format",
+                    "json",
+                    "-show_streams",
+                    "-show_format",
+                    str(path),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=120,
+            )
+            if r.returncode == 0 and r.stdout:
+                data = json.loads(r.stdout.decode("utf-8", errors="replace"))
+                streams = data.get("streams") or []
+                for s in streams:
+                    if s.get("codec_type") != codec_type:
+                        continue
+                    try:
+                        st = float(s.get("start_time"))
+                        return st
+                    except Exception:
+                        pass
+                try:
+                    return float((data.get("format") or {}).get("start_time") or 0.0)
+                except Exception:
+                    return 0.0
+        except Exception:
+            pass
+    return 0.0
 
 
 @dataclass(frozen=True)
@@ -196,6 +328,9 @@ class RecordSession:
         pc_dshow_audio_device: str = "",
         app_log_config: Optional[dict[str, Any]] = None,
         record_params: Optional[RecordParams] = None,
+        audio_sample_rate: int = 44100,
+        audio_bit_rate: str = "192k",
+        audio_sync_offset_ms: int = 0,
         log_callback: Optional[Callable[[str], None]] = None,
         on_finished: Optional[Callable[[str], None]] = None,
         post_delay_seconds: float = 5.0,
@@ -218,6 +353,9 @@ class RecordSession:
         self.app_log_config = app_log_config or {}
         self.post_delay_seconds = max(0.5, float(post_delay_seconds))
         self.record_params = record_params or RecordParams(max_fps=30, video_bit_rate="8M")
+        self.audio_sample_rate = max(8000, int(audio_sample_rate or 44100))
+        self.audio_bit_rate = (audio_bit_rate or "192k").strip() or "192k"
+        self.audio_sync_offset_ms = int(audio_sync_offset_ms or 0)
         self.log_callback = log_callback or (lambda _msg: None)
         self.on_finished = on_finished
 
@@ -248,6 +386,7 @@ class RecordSession:
         self._app_log_thread: Optional[threading.Thread] = None
         self._mic_failed_early: bool = False
         self._video_failed_early: bool = False
+        self._fatal_error_message: str = ""
 
         self._p_video: Optional[subprocess.Popen[bytes]] = None
         self._p_sys_audio: Optional[subprocess.Popen[bytes]] = None
@@ -378,7 +517,7 @@ class RecordSession:
             self._emit(f"[record] logcat 抓取启动失败（仍继续 app.log 精准采集）：{e}")
 
         # 2) scrcpy video-only recording（强制 no-audio，保证视频稳定产出）
-        video_cmd: list[str] = [
+        primary_video_cmd: list[str] = [
             scrcpy_bin,
             "--serial",
             self.serial,
@@ -417,11 +556,41 @@ class RecordSession:
         ]
 
         if self.record_params.max_fps is not None:
-            video_cmd.extend(["--max-fps", str(int(self.record_params.max_fps))])
+            primary_video_cmd.extend(["--max-fps", str(int(self.record_params.max_fps))])
         if self.record_params.video_bit_rate:
-            video_cmd.extend(["--video-bit-rate", str(self.record_params.video_bit_rate)])
+            primary_video_cmd.extend(["--video-bit-rate", str(self.record_params.video_bit_rate)])
         if self.record_params.max_size:
-            video_cmd.extend(["--max-size", str(self.record_params.max_size)])
+            primary_video_cmd.extend(["--max-size", str(self.record_params.max_size)])
+        # 主录制优先固定 h264，减少部分设备/ROM 在默认编码策略上的不确定性。
+        primary_video_cmd.extend(["--video-codec=h264"])
+
+        def _build_safe_video_cmd(*, codec: str, max_fps: str, bit_rate: str, max_size: str) -> list[str]:
+            return [
+                scrcpy_bin,
+                "--serial",
+                self.serial,
+                "--no-playback",
+                "--no-control",
+                "--no-audio",
+                f"--video-codec={codec}",
+                "--max-fps",
+                max_fps,
+                "--video-bit-rate",
+                bit_rate,
+                "--max-size",
+                max_size,
+                "--record",
+                str(self._video_tmp_path),
+            ]
+
+        # 多档位降级：优先保证可录到视频轨。
+        video_profiles: list[tuple[str, list[str]]] = [
+            ("primary", primary_video_cmd),
+            ("safe-h264-1280", _build_safe_video_cmd(codec="h264", max_fps="20", bit_rate="4M", max_size="1280")),
+            ("safe-h264-1024", _build_safe_video_cmd(codec="h264", max_fps="15", bit_rate="2M", max_size="1024")),
+            ("safe-h264-720", _build_safe_video_cmd(codec="h264", max_fps="12", bit_rate="1M", max_size="720")),
+            ("safe-h265-1024", _build_safe_video_cmd(codec="h265", max_fps="15", bit_rate="2M", max_size="1024")),
+        ]
 
         # 注意：不要在录屏会话里强制 --stay-awake。
         # 在部分 Android 设备（例如 MIUI/Android 15）上，scrcpy 会尝试写入全局设置
@@ -431,16 +600,49 @@ class RecordSession:
         if adb_env:
             env["ADB"] = adb_env
 
-        self._emit(f"[record] scrcpy(video-only) 命令: {' '.join(video_cmd)}")
-        self._p_video = subprocess.Popen(
-            video_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            cwd=os.getcwd(),
-            env=env,
-            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
-        )
-        self._reader_video = _start_output_reader(self._p_video, self._emit)
+        video_encoding_error_event = threading.Event()
+
+        def _on_video_line(line: str) -> None:
+            low = (line or "").lower()
+            if (
+                "capture/encoding error" in low
+                or "illegalargumentexception" in low
+                or ("retrying with -m" in low and "error" in low)
+            ):
+                video_encoding_error_event.set()
+
+        active_video_profile_idx = 0
+
+        def _start_video_process(cmd: list[str], *, reason: str) -> bool:
+            try:
+                self._emit(f"[record] 启动视频录制({reason}): {' '.join(cmd)}")
+                self._p_video = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    cwd=os.getcwd(),
+                    env=env,
+                    creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+                )
+                self._reader_video = _start_output_reader(self._p_video, self._emit, _on_video_line)
+                return True
+            except Exception as e:
+                self._emit(f"[record] 启动视频录制失败({reason}): {e}")
+                return False
+
+        def _start_video_profile(idx: int, *, reason: str) -> bool:
+            nonlocal active_video_profile_idx
+            if idx < 0 or idx >= len(video_profiles):
+                return False
+            active_video_profile_idx = idx
+            profile_name, cmd = video_profiles[idx]
+            return _start_video_process(cmd, reason=f"{reason}:{profile_name}")
+
+        if not _start_video_profile(0, reason="start"):
+            self._fatal_error_message = "视频录制启动失败：无法启动 scrcpy(video-only)。"
+            self._emit(f"[record] ❌ {self._fatal_error_message}")
+            self._running = False
+            return
 
         self._emit(f"[record] scrcpy(sys-audio) 命令: {' '.join(sys_audio_cmd)}")
         self._p_sys_audio = subprocess.Popen(
@@ -546,10 +748,12 @@ class RecordSession:
                     "dshow",
                     "-i",
                     f"audio={dev}",
+                    "-ar",
+                    str(self.audio_sample_rate),
                     "-c:a",
                     "aac",
                     "-b:a",
-                    "128k",
+                    self.audio_bit_rate,
                     str(self._pc_mic_tmp_path),
                 ]
                 try:
@@ -583,34 +787,80 @@ class RecordSession:
         # 失败探测：持续监听录制期间的进程退出，避免只看“启动早期”导致漏判。
         def _early_exit_watch() -> None:
             checked_video = False
-            tried_video_restart = False
+            exhausted_video_profiles = False
             tried_sys_aac = False
             tried_mic_opus = False
             tried_pc_mic = False
             while self.is_running():
                 time.sleep(0.8)
                 try:
+                    # 实时捕获编码错误：按档位逐级降参重启视频录制。
+                    if video_encoding_error_event.is_set() and not exhausted_video_profiles:
+                        video_encoding_error_event.clear()
+                        self._emit("[record] 检测到视频编码异常，尝试切换到更保守的视频录制参数")
+                        try:
+                            _graceful_stop_scrcpy(
+                                self._p_video,
+                                log_callback=self._emit,
+                                name="scrcpy(video-only)",
+                                wait_seconds=1.5,
+                            )
+                        except Exception:
+                            pass
+                        next_idx = active_video_profile_idx + 1
+                        if next_idx < len(video_profiles):
+                            ok_safe = _start_video_profile(next_idx, reason="encoding-error-fallback")
+                            if not ok_safe:
+                                exhausted_video_profiles = True
+                        else:
+                            exhausted_video_profiles = True
+
+                        if exhausted_video_profiles:
+                            self._fatal_error_message = "视频录制异常：编码失败且保守参数重启失败，已停止录制。"
+                            self._emit(f"[record] ❌ {self._fatal_error_message}")
+                            try:
+                                self.stop()
+                            except Exception:
+                                pass
+                            return
+                except Exception:
+                    pass
+
+                try:
                     if not checked_video and self._p_video and self._p_video.poll() is not None:
                         checked_video = True
                         self._video_failed_early = True
                         self._emit(f"[record] 警告：scrcpy(video) 可能启动失败（exit={self._p_video.returncode}）")
-                        if not tried_video_restart:
-                            tried_video_restart = True
-                            self._emit(
-                                f"[record] 尝试重启 scrcpy(video-only)（避免空 video_tmp）：{' '.join(video_cmd)}"
+                        next_idx = active_video_profile_idx + 1
+                        if next_idx < len(video_profiles):
+                            self._emit("[record] 视频进程异常退出，尝试切换到下一档兼容参数")
+                            _start_video_profile(next_idx, reason="process-exit-fallback")
+                        else:
+                            exhausted_video_profiles = True
+                except Exception:
+                    pass
+
+                # 所有档位都失败且仍无视频轨：终止录制。
+                try:
+                    if exhausted_video_profiles:
+                        ffmpeg_use = getattr(self, "_ffmpeg_bin", None) or self.ffmpeg_path.strip() or "ffmpeg"
+                        has_video2 = False
+                        try:
+                            if self._video_tmp_path and self._video_tmp_path.exists():
+                                has_video2, _ = _probe_video_and_duration(self._video_tmp_path, ffmpeg_use)
+                        except Exception:
+                            has_video2 = False
+
+                        if not has_video2:
+                            self._fatal_error_message = (
+                                "视频录制异常：已尝试所有兼容参数，临时文件仍无视频轨，已停止本次录制。"
                             )
+                            self._emit(f"[record] ❌ {self._fatal_error_message}")
                             try:
-                                self._p_video = subprocess.Popen(
-                                    video_cmd,
-                                    stdout=subprocess.PIPE,
-                                    stderr=subprocess.STDOUT,
-                                    cwd=os.getcwd(),
-                                    env=env,
-                                    creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
-                                )
-                                self._reader_video = _start_output_reader(self._p_video, self._emit)
-                            except Exception as e:
-                                self._emit(f"[record] scrcpy(video-only) 重启失败: {e}")
+                                self.stop()
+                            except Exception:
+                                pass
+                            return
                 except Exception:
                     pass
 
@@ -805,13 +1055,7 @@ class RecordSession:
                 if final:
                     self._emit(f"[record] 录制完成：{final}")
                 else:
-                    # 降级策略：若 mic 缺失/失败，至少输出“仅系统音”的最终 MP4，避免整段录屏无产物
-                    fallback = self._finalize_without_mic()
-                    if fallback:
-                        final = fallback
-                        self._emit(f"[record] 已降级输出（无 mic 混音）：{fallback}")
-                    else:
-                        self._emit("[record] 录制结束但合成失败（可能缺少临时音频）")
+                    self._emit("[record] 录制失败：视频轨异常或 ffmpeg 合成失败，已停止且不做降级输出")
 
                 # 如果切片 0 行，附带 app.log 末尾片段用于排查（不阻塞写入：这里已 stop + join）
                 if sliced_count <= 0:
@@ -1194,6 +1438,36 @@ class RecordSession:
         ffmpeg_bin = getattr(self, "_ffmpeg_bin", None) or self.ffmpeg_path.strip() or "ffmpeg"
 
         final_path.parent.mkdir(parents=True, exist_ok=True)
+
+        has_video, _v_dur = _probe_video_and_duration(video_tmp, ffmpeg_bin)
+        if not has_video:
+            self._fatal_error_message = "视频录制异常：临时视频文件未检测到视频轨，已停止并判定失败。"
+            self._emit(f"[record] ❌ {self._fatal_error_message}")
+            return None
+
+        video_start = _probe_stream_start_time(video_tmp, ffmpeg_bin, codec_type="video")
+        sys_start = (
+            _probe_stream_start_time(sys_audio_file, ffmpeg_bin, codec_type="audio")
+            if sys_audio_file and sys_audio_file.exists()
+            else 0.0
+        )
+        mic_start = (
+            _probe_stream_start_time(mic_file, ffmpeg_bin, codec_type="audio")
+            if mic_file and mic_file.exists()
+            else 0.0
+        )
+
+        def _build_audio_input_args(path: Path, start_time: float) -> list[str]:
+            # 以视频 start_time 作为主时轴基准；额外叠加可调补偿（默认 0ms）。
+            offset = (start_time - video_start) + (float(self.audio_sync_offset_ms) / 1000.0)
+            self._emit(
+                f"[record] audio align: file={path.name}, start={start_time:.3f}, "
+                f"video_start={video_start:.3f}, itsoffset={offset:.3f}s"
+            )
+            return ["-itsoffset", f"{offset:.3f}", "-i", str(path)]
+
+        first_in = ["-i", str(video_tmp)]
+
         # 尝试链路（由强到弱）：
         # 1) sys_audio + mic amix（若两者都存在）
         # 2) sys_audio only
@@ -1202,86 +1476,70 @@ class RecordSession:
         attempts: list[tuple[str, list[str]]] = []
 
         if sys_audio_file and sys_audio_file.exists() and mic_file and mic_file.exists():
-            attempts.append(
-                (
-                    "mix-sys+mic",
-                    [
-                        ffmpeg_bin,
-                        "-y",
-                        "-i",
-                        str(video_tmp),
-                        "-i",
-                        str(sys_audio_file),
-                        "-i",
-                        str(mic_file),
-                        "-filter_complex",
-                        "[1:a][2:a]amix=inputs=2:duration=longest[aout]",
-                        "-map",
-                        "0:v:0",
-                        "-map",
-                        "[aout]",
-                        "-c:v",
-                        "copy",
-                        "-c:a",
-                        "aac",
-                        "-b:a",
-                        "192k",
-                        str(final_path),
-                    ],
-                )
-            )
+            mix_cmd: list[str] = [
+                ffmpeg_bin,
+                "-y",
+                *first_in,
+                *_build_audio_input_args(sys_audio_file, sys_start),
+                *_build_audio_input_args(mic_file, mic_start),
+                "-filter_complex",
+                "[1:a]aresample=async=1[a1];"
+                "[2:a]aresample=async=1[a2];"
+                "[a1][a2]amix=inputs=2:duration=longest:dropout_transition=2[aout]",
+                "-map",
+                "0:v:0",
+                "-map",
+                "[aout]",
+                "-c:v",
+                "copy",
+                "-ar",
+                str(self.audio_sample_rate),
+                "-shortest",
+            ]
+            mix_cmd.extend(["-c:a", "aac", "-b:a", self.audio_bit_rate, str(final_path)])
+            attempts.append(("mix-sys+mic", mix_cmd))
 
         if sys_audio_file and sys_audio_file.exists():
-            attempts.append(
-                (
-                    "sys-only",
-                    [
-                        ffmpeg_bin,
-                        "-y",
-                        "-i",
-                        str(video_tmp),
-                        "-i",
-                        str(sys_audio_file),
-                        "-map",
-                        "0:v:0",
-                        "-map",
-                        "1:a:0",
-                        "-c:v",
-                        "copy",
-                        "-c:a",
-                        "aac",
-                        "-b:a",
-                        "192k",
-                        str(final_path),
-                    ],
-                )
-            )
+            sys_cmd: list[str] = [
+                ffmpeg_bin,
+                "-y",
+                *first_in,
+                *_build_audio_input_args(sys_audio_file, sys_start),
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c:v",
+                "copy",
+                "-af",
+                "aresample=async=1",
+                "-ar",
+                str(self.audio_sample_rate),
+                "-shortest",
+            ]
+            sys_cmd.extend(["-c:a", "aac", "-b:a", self.audio_bit_rate, str(final_path)])
+            attempts.append(("sys-only", sys_cmd))
 
         if mic_file and mic_file.exists():
-            attempts.append(
-                (
-                    "mic-only",
-                    [
-                        ffmpeg_bin,
-                        "-y",
-                        "-i",
-                        str(video_tmp),
-                        "-i",
-                        str(mic_file),
-                        "-map",
-                        "0:v:0",
-                        "-map",
-                        "1:a:0",
-                        "-c:v",
-                        "copy",
-                        "-c:a",
-                        "aac",
-                        "-b:a",
-                        "192k",
-                        str(final_path),
-                    ],
-                )
-            )
+            mic_cmd: list[str] = [
+                ffmpeg_bin,
+                "-y",
+                *first_in,
+                *_build_audio_input_args(mic_file, mic_start),
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c:v",
+                "copy",
+                "-af",
+                "aresample=async=1",
+                "-ar",
+                str(self.audio_sample_rate),
+                "-shortest",
+            ]
+            mic_cmd.extend(["-c:a", "aac", "-b:a", self.audio_bit_rate, str(final_path)])
+            attempts.append(("mic-only", mic_cmd))
 
         attempts.append(
             (
@@ -1329,84 +1587,8 @@ class RecordSession:
 
         return None
 
-    def _finalize_without_mic(self) -> Optional[str]:
-        """当 mic 音频缺失时，降级输出最终 MP4（统一转码音频为 AAC，提升播放器兼容性）。"""
-        if not (self._video_tmp_path and self._final_path):
-            return None
-        try:
-            video_tmp = self._video_tmp_path
-            final_path = self._final_path
-            if not video_tmp.exists() or video_tmp.stat().st_size <= 0:
-                return None
-            final_path.parent.mkdir(parents=True, exist_ok=True)
-
-            ffmpeg_bin = getattr(self, "_ffmpeg_bin", None) or self.ffmpeg_path.strip() or "ffmpeg"
-            # 优先把异常音频流直接剔除，只保留视频轨，保证播放器兼容。
-            cmd_video_only = [
-                ffmpeg_bin,
-                "-y",
-                "-i",
-                str(video_tmp),
-                "-map",
-                "0:v:0",
-                "-c:v",
-                "copy",
-                "-an",
-                str(final_path),
-            ]
-            self._emit(f"[record] 降级封装(ffmpeg-video-only): {' '.join(cmd_video_only)}")
-            rst = subprocess.run(
-                cmd_video_only,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                cwd=os.getcwd(),
-                check=False,
-            )
-            if final_path.exists() and final_path.stat().st_size > 0 and rst.returncode == 0:
-                return str(final_path)
-
-            # 若 copy 失败，退化到视频重编码（最稳妥）
-            cmd_video_transcode = [
-                ffmpeg_bin,
-                "-y",
-                "-i",
-                str(video_tmp),
-                "-map",
-                "0:v:0",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "ultrafast",
-                "-crf",
-                "23",
-                "-an",
-                str(final_path),
-            ]
-            self._emit(f"[record] 降级封装(ffmpeg-video-transcode): {' '.join(cmd_video_transcode)}")
-            rst2 = subprocess.run(
-                cmd_video_transcode,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                cwd=os.getcwd(),
-                check=False,
-            )
-            if final_path.exists() and final_path.stat().st_size > 0 and rst2.returncode == 0:
-                return str(final_path)
-
-            try:
-                tail = (rst2.stderr or b"").decode("utf-8", errors="replace")[-400:]
-                self._emit(f"[record] 降级封装失败，ffmpeg stderr_tail={tail}")
-            except Exception:
-                pass
-
-            # ffmpeg 失败再兜底 copy（尽最大努力保留文件）
-            shutil.copyfile(str(video_tmp), str(final_path))
-            if final_path.exists() and final_path.stat().st_size > 0:
-                self._emit("[record] 警告：降级封装失败，已退回原始拷贝，播放器兼容性可能受限")
-                return str(final_path)
-        except Exception:
-            return None
-        return None
+    def get_fatal_error_message(self) -> str:
+        return (self._fatal_error_message or "").strip()
 
     @staticmethod
     def _append_app_log_tail_for_debug(*, input_path: Path, output_path: Path, max_bytes: int = 200_000) -> None:
